@@ -34,7 +34,15 @@
 
 ## 记录
 
-### 2026-08-09 · 环境就绪：补装 insightface + 文档路径迁移到 carl0
+### 2026-08-09 · git 版本管理引入：首次提交 c742a3f
+- 变更内容：`git init`（分支 main），新增 `.gitignore`（忽略 models/*.pt、face_models/、
+  tests/data/vid/、.mysql/、out/face_db.*、out/video_db.*、tests/data/out/），首次提交 46 个
+  代码/文档/测试文件（7.6M）；README「无 git 关联」说明更新为 git 管理表述。本地身份
+  carl0 用户 carlogao7-pixel <carlogao7@gmail.com>，SSH key（ed25519）已认证 GitHub。
+- 影响面：结构 / 入口
+- 部署注意：克隆后无模型权重与测试视频，需按 INSTALL.md 从上游/zip 重建；`out/fingerprints.json`
+  随库保留（标定基线），face_db/video_db 需重跑生成。
+- 验证：`git status` 干净；`ssh -T git@github.com` 认证成功。
 - 变更内容：ai 环境补装 `insightface==1.0.1`（原环境缺失，人脸链路必需）；全量文档
   （CLAUDE.md / README.md / INSTALL.md / doc/需求文档-开发版.md / .claude/agents/pipeline-assembler.md /
   .claude/skills/face-extract-pipeline/SKILL.md）中的解释器与项目根路径由

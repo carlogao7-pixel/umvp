@@ -59,4 +59,6 @@
 | `models/` | `spaz/custom_model/yolov8n.pt` 等 |
 | `face_models/buffalo_l.zip` | `tinymodel/buffalo_l.zip` |
 
-本包为标准 Python 包拷贝，无 git 关联；与原仓库的同步由手工拷贝维护。
+本包为独立 Python 包，用 git 做版本管理（仓库根即本目录）；大二进制
+（模型权重/测试视频/MySQL 数据）不入库，克隆后按 INSTALL.md 从上游重建。
+与原仓库（spaz/uav）的差异同步仍由手工维护。
