@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 大二进制：不入库（按 INSTALL.md 从上游/zip 重建）----
+# YOLO 模型权重（放 .pt 进目录即入 web_lab 选择，克隆后自行放置）
+models/*.pt
+# InsightFace 模型包（face_models/buffalo_l.zip 可解压重建）
+face_models/
+# 测试视频（tests/data/vid/*.MP4，从原仓库获取）
+tests/data/vid/
+
+# ---- MySQL 运行数据 ----
+.mysql/
+
+# ---- 运行产物（可重建）----
+# 人脸底库 / 视频索引（由注册/扫描生成）
+out/face_db.*
+out/video_db.*
+# 保留 out/fingerprints.json（标定基线，入库）
+# 测试输出（人脸提取链路产物：人脸图 + 标注图）
+tests/data/out/

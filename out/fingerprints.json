@@ -1,0 +1,58 @@
+{
+  "yolo.yolo11m.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 276.3,
+    "latency_ms_gpu": 21.7,
+    "vram_mb": 185.2
+  },
+  "yolo.yolo11n.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 48.3,
+    "latency_ms_gpu": 18.3,
+    "vram_mb": 142.1
+  },
+  "yolo.yolo11s.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 99.6,
+    "latency_ms_gpu": 15.4,
+    "vram_mb": 110.5
+  },
+  "yolo.yolov10s.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 87.4,
+    "latency_ms_gpu": 14.8,
+    "vram_mb": 131.8
+  },
+  "yolo.yolov8n.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 39.2,
+    "latency_ms_gpu": 12.2,
+    "vram_mb": 126.7
+  },
+  "yolo.yolov8s.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 92.7,
+    "latency_ms_gpu": 12.5,
+    "vram_mb": 183.3
+  },
+  "yolo.yolov9t.pt.640": {
+    "note": "yolo imgsz=640",
+    "latency_ms_cpu": 55.9,
+    "latency_ms_gpu": 25.7,
+    "vram_mb": 132.8
+  },
+  "scrfd.640,640": {
+    "note": "scrfd det_size=640,640",
+    "latency_ms_cpu": 99.1
+  },
+  "arcface": {
+    "note": "arcface 512d 单张嵌入",
+    "latency_ms_cpu": 37.1
+  },
+  "_meta": {
+    "date": "2026-08-06 16:27:56",
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "gpu": "cuda",
+    "note": "umvp/resources.py 加载本文件；换机器重跑本脚本即可"
+  }
+}

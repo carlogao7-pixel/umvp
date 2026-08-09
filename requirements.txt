@@ -1,0 +1,20 @@
+# UMVP 独立部署包 Python 依赖
+# 生成环境: conda env `ai`, Python 3.10.20 (本机实测版本)
+# 安装: pip install -r requirements.txt
+
+# ---- 必需：YOLO 目标检测（四模块管道 + test_3modes.py 用）----
+ultralytics==8.4.104        # 自带 torch/torchvision（默认装 CPU 版；GPU 版见 INSTALL.md 可选步骤）
+torch==2.6.0                # 由 ultralytics 自动依赖，显式列出便于控制版本
+torchvision==0.21.0
+
+# ---- 必需：人脸识别链路（FaceDetector / FaceEmbedder / FaceStore）----
+insightface==1.0.1          # 人脸检测(SCRFD)+特征提取(ArcFace)的模型加载器
+onnxruntime==1.23.2         # insightface 的推理后端（onnx）
+numpy==2.2.6                # 向量检索/矩阵运算（FaceStore 零依赖线性检索）
+
+# ---- 必需：通用图像/视频 IO ----
+opencv-python==5.0.0.93     # 提供 cv2（读视频/画框/JPEG 编码）
+requests==2.32.5            # test_3modes.py 调 VLM（OpenAI 兼容端点）
+
+# ---- 传递依赖（ultralytics/insightface 自动带，无需手动装）----
+# pillow, pyyaml, scipy, matplotlib, pandas, tqdm, psutil, py-cpuinfo, requests-oauthlib 等

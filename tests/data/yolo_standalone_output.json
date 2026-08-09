@@ -1,0 +1,496 @@
+{
+  "task": "YOLODetector 单独处理 tests/data/pic 图片，仅识别人（各图独立时间戳 ts=0/10/20）",
+  "params": {
+    "model_path": "/home/carl0/project/umvp/models/yolov8n.pt",
+    "conf": 0.35,
+    "iou": 0.7,
+    "imgsz": 640,
+    "max_det": 300,
+    "classes": [
+      0
+    ],
+    "class_limits": {
+      "0": [
+        1,
+        300
+      ]
+    },
+    "check_interval": 3.0,
+    "roi": false,
+    "filters": "[]（无过滤链）",
+    "device": "cuda:0 (NVIDIA GeForce RTX 3060 Laptop GPU)",
+    "cls_names": {
+      "0": "person"
+    }
+  },
+  "images": [
+    {
+      "image": "人遮挡1.png",
+      "width": 1391,
+      "height": 779,
+      "timestamp_sec": 0.0,
+      "infer_seconds": 4.335,
+      "detections": [
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            915,
+            508,
+            993,
+            672
+          ],
+          "score": 0.8463,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            368,
+            592,
+            435,
+            751
+          ],
+          "score": 0.8319,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            993,
+            492,
+            1063,
+            660
+          ],
+          "score": 0.8104,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            1094,
+            506,
+            1158,
+            658
+          ],
+          "score": 0.8095,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            435,
+            592,
+            518,
+            746
+          ],
+          "score": 0.7933,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            174,
+            588,
+            242,
+            759
+          ],
+          "score": 0.7582,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            729,
+            535,
+            789,
+            692
+          ],
+          "score": 0.7523,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            594,
+            564,
+            660,
+            712
+          ],
+          "score": 0.7257,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            280,
+            585,
+            338,
+            747
+          ],
+          "score": 0.7178,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            228,
+            592,
+            297,
+            749
+          ],
+          "score": 0.6659,
+          "model_path": "yolov8n.pt"
+        }
+      ],
+      "after_filter": {
+        "count": 10,
+        "class_limits": {
+          "0": [
+            1,
+            300
+          ]
+        }
+      },
+      "submit_requests": [
+        {
+          "track_key": 0,
+          "gran": "class",
+          "ref": "full:cls0",
+          "det_count": 10,
+          "dets": [
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                915,
+                508,
+                993,
+                672
+              ],
+              "score": 0.8463
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                368,
+                592,
+                435,
+                751
+              ],
+              "score": 0.8319
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                993,
+                492,
+                1063,
+                660
+              ],
+              "score": 0.8104
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                1094,
+                506,
+                1158,
+                658
+              ],
+              "score": 0.8095
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                435,
+                592,
+                518,
+                746
+              ],
+              "score": 0.7933
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                174,
+                588,
+                242,
+                759
+              ],
+              "score": 0.7582
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                729,
+                535,
+                789,
+                692
+              ],
+              "score": 0.7523
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                594,
+                564,
+                660,
+                712
+              ],
+              "score": 0.7257
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                280,
+                585,
+                338,
+                747
+              ],
+              "score": 0.7178
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                228,
+                592,
+                297,
+                749
+              ],
+              "score": 0.6659
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "image": "人重叠.png",
+      "width": 1404,
+      "height": 790,
+      "timestamp_sec": 10.0,
+      "infer_seconds": 0.018,
+      "detections": [
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            724,
+            410,
+            750,
+            472
+          ],
+          "score": 0.8218,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            752,
+            412,
+            779,
+            473
+          ],
+          "score": 0.7398,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            675,
+            442,
+            700,
+            505
+          ],
+          "score": 0.5963,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            691,
+            408,
+            713,
+            465
+          ],
+          "score": 0.4962,
+          "model_path": "yolov8n.pt"
+        }
+      ],
+      "after_filter": {
+        "count": 4,
+        "class_limits": {
+          "0": [
+            1,
+            300
+          ]
+        }
+      },
+      "submit_requests": [
+        {
+          "track_key": 0,
+          "gran": "class",
+          "ref": "full:cls0",
+          "det_count": 4,
+          "dets": [
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                724,
+                410,
+                750,
+                472
+              ],
+              "score": 0.8218
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                752,
+                412,
+                779,
+                473
+              ],
+              "score": 0.7398
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                675,
+                442,
+                700,
+                505
+              ],
+              "score": 0.5963
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                691,
+                408,
+                713,
+                465
+              ],
+              "score": 0.4962
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "image": "人重叠2.png",
+      "width": 1404,
+      "height": 790,
+      "timestamp_sec": 20.0,
+      "infer_seconds": 0.016,
+      "detections": [
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            705,
+            421,
+            729,
+            481
+          ],
+          "score": 0.6205,
+          "model_path": "yolov8n.pt"
+        },
+        {
+          "track_id": 0,
+          "cls_id": 0,
+          "cls_name": "person",
+          "bbox": [
+            665,
+            423,
+            694,
+            488
+          ],
+          "score": 0.4913,
+          "model_path": "yolov8n.pt"
+        }
+      ],
+      "after_filter": {
+        "count": 2,
+        "class_limits": {
+          "0": [
+            1,
+            300
+          ]
+        }
+      },
+      "submit_requests": [
+        {
+          "track_key": 0,
+          "gran": "class",
+          "ref": "full:cls0",
+          "det_count": 2,
+          "dets": [
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                705,
+                421,
+                729,
+                481
+              ],
+              "score": 0.6205
+            },
+            {
+              "track_id": 0,
+              "cls_id": 0,
+              "bbox": [
+                665,
+                423,
+                694,
+                488
+              ],
+              "score": 0.4913
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
