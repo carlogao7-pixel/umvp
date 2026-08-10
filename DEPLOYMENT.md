@@ -34,6 +34,28 @@
 
 ## 记录
 
+### 2026-08-10 · 配置参数列式化存储：每模块一张参数表 + /api/db/tables 数据浏览
+- 变更内容：`kind='module'` 的命名配置不再整份 JSON 塞进 `presets.params_json`，改为
+  每模块一张参数表 `preset_params_<module_id>`（参数按类型展开为列，int→INT / float→DOUBLE /
+  bool→TINYINT(1) / select→VARCHAR(64) / file→VARCHAR(255) / str→VARCHAR(255) / text→TEXT，
+  主键 preset_id 外键级联删）；`presets` 降级为注册表，module 行 `params_json` 迁移后置空，
+  pipeline 类型仍存 JSON 不受影响。`web_lab/db.py` 新增 `configure_modules()`（启动时注册各模块
+  参数 schema）、参数表自动建表/补列（`SHOW COLUMNS` + `ALTER TABLE ADD COLUMN`，删参数不删列）、
+  旧 JSON 数据幂等迁移、save/load/list 拆列读写与类型强转；`web_lab/server.py` 新增
+  `GET /api/db/tables` 只读快照接口（presets / 各模块参数表 / pipelines / steps，DB 不可用时
+  返回 `{ok:false}` 容错）；`web_lab/index.html` 新增"数据浏览"tab 渲染各表。设计文档
+  `doc/配置参数列式化存储设计.md` 新建，`doc/数据库结构.md`、`web_lab/设计说明.md` 同步。
+- 影响面：DB、入口
+- 部署注意：服务器启动 `init_db()` 幂等建参数表/补列/迁移旧数据，无需手工 DDL；模块参数
+  清单（server.py PARAMS）加参数自动补列、删参数不删列；module 行 params_json 已置空（仅
+  pipeline 行有值）；`/api/db/tables` 只读，增删改仍走 /api/presets* 接口。
+- 验证：DB 层断言回归 36/36 ALL PASS（configure_modules 幂等、参数按类型往返一致、同名覆盖
+  id 不变、未注册模块容错、删除级联、旧数据迁移等）；curl 实测 `/api/db/tables` 结构正确；
+  HTTP save/load/delete 全流程类型往返一致（conf 0.42 float、imgsz 640 int、roi True bool）；
+  旧配置 default1 迁移实测（params_json 置空、6 个参数落入 preset_params_frame_manager）；
+  测试数据已清理（presets 1 行、pipelines 0 行、pipeline_steps 0 行），AUTO_INCREMENT 实测
+  presets=34 / pipelines=10 / pipeline_steps=18。
+
 ### 2026-08-10 · 链路拼装存储：新增 pipelines/pipeline_steps 两表与 /api/pipelines* 接口
 - 变更内容：链路拼装信息由"整份快照"改为"步骤引用模块 preset id + position 顺序"存储：
   `web_lab/db.py` 新增 `pipelines`（name/streams/budget_json/meta_json）与 `pipeline_steps`
