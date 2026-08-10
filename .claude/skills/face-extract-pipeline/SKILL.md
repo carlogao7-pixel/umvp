@@ -41,7 +41,7 @@ user-invocable: true
 ## 怎么用
 
 ```bash
-PY=/home/carloga0/miniconda3/envs/ai/bin/python   # 唯一带 cv2/ultralytics/insightface 的解释器
+PY="conda run -n ai python"   # 便携写法（ai conda 环境解释器，不写机器绝对路径）
 $PY tests/test_face_extract_pipeline.py           # 跑三张测试图，产物在 tests/data/out/faces/
 ```
 

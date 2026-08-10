@@ -28,7 +28,7 @@ UMVP 是什么、能干什么；四模式一句话；人脸链路一句话；web
 
 ## 3. 环境与验证命令（内联）—— 稳定内容已可填
 
-- 唯一解释器：/home/carloga0/miniconda3/envs/ai/bin/python
+- 唯一解释器：conda 环境 `ai`（命令写 `conda run -n ai python ...`，或先 activate 后用 `python`）
 - 回归集：umvp/pipe/test_composer.py 27 断言 / face_embed 7/7 自检 / tests/test_yolo_params.py（真实推理）
 - 三模式实机：tests/test_3modes.py；标定：web_lab/calibrate.py → out/fingerprints.json
 - onnxruntime 警告用 grep -v 过滤；换机重跑标定

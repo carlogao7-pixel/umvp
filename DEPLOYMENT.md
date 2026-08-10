@@ -34,6 +34,23 @@
 
 ## 记录
 
+### 2026-08-10 · 解释器与路径可移植化（跨机器同步铺垫）
+- 变更内容：文档与脚本中的机器绝对路径统一改为便携写法——解释器一律写
+  `conda run -n ai python`（CLAUDE.md / README.md / INSTALL.md / doc/需求文档-开发版.md /
+  .claude/agents/pipeline-assembler.md / .claude/skills/face-extract-pipeline/SKILL.md /
+  web_lab/calibrate.py 用法）；`web_lab/run.sh` 的 PY 解析改为
+  `conda run -n ai which python` 自动定位（失败回退 `command -v python`，仍可用
+  `PY=...` 环境变量显式覆盖）；`tests/data/yolo_standalone_output.json` 的 model_path
+  改为相对路径 `models/yolov8n.pt`。
+- 影响面：配置 / 入口
+- 部署注意：换机移植无需再改解释器路径；目标机需有 conda 环境 `ai`
+  （与 INSTALL.md 场景 B 一致）。
+- 验证：`conda run -n ai python umvp/pipe/test_composer.py` 27/27 断言通过；
+  `conda run -n ai python umvp/face_embed/test_face_embed.py --register-dir
+  umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz` 21/21 自检命中；
+  `bash -n web_lab/run.sh` 语法通过；`web_lab/calibrate.py` py_compile 通过；
+  `conda run -n ai which python` 正常解析出解释器路径。
+
 ### 2026-08-10 · 本机（carloga0）接入 GitHub 仓库并适配环境路径
 - 变更内容：本机 `/home/carloga0/projects/umvp` 接入远端仓库 origin=`https://github.com/carlogao7-pixel/umvp.git`
   （分支 main，首次提交 46 个代码/文档/测试文件，含 `.gitignore`，远端记录见下条）；文档与脚本中
