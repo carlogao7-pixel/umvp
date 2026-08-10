@@ -9,7 +9,8 @@ UMVP 可视化测试台 —— 后端（零新增依赖，stdlib http.server）
   3. GET  /             返回单页前端 index.html
   4. GET/POST /api/presets*   命名配置暂存（MySQL，见 db.py，--no-db 可禁用）
   5. GET/POST /api/pipelines*  链路拼装暂存（步骤引用模块 preset id + 顺序）
-  6. POST /api/pipeline/build | /api/pipeline/agent  链路生成/智能助手（P2/P4 占位壳子）
+  6. GET  /api/db/tables  数据库数据浏览（只读快照：presets 注册表 + 各模块参数表 + 链路表）
+  7. POST /api/pipeline/build | /api/pipeline/agent  链路生成/智能助手（P2/P4 占位壳子）
 
 设计约定（与项目一致）:
   - 模块测试全部复用现有模块代码，不重复实现逻辑；
@@ -1103,6 +1104,17 @@ def _pipelines_list() -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ---------------- 数据库数据浏览（只读快照，见 doc/配置参数列式化存储设计.md §4） ----------------
+
+def _db_tables() -> dict:
+    if not _DB_ENABLED:
+        return {"ok": False, "error": "数据库未启用（--no-db）"}
+    try:
+        return {"ok": True, **db.table_snapshots()}
+    except Exception as e:  # DB 不可用不影响服务器运行
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def _pipeline_save(handler) -> dict:
     if not _DB_ENABLED:
         return {"ok": False, "error": "数据库未启用（--no-db）"}
@@ -1196,6 +1208,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_preset_list(kind))
         elif path == "/api/pipelines":
             self._json(_pipelines_list())
+        elif path == "/api/db/tables":
+            self._json(_db_tables())
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -1295,8 +1309,12 @@ def main() -> None:
         print("[db] MySQL 已禁用（--no-db），presets 接口不可用")
     else:
         try:
+            # 注册各模块参数 schema（参数名+类型 → 列式参数表），须在 init_db 前
+            db.configure_modules(
+                {mid: {k: spec.get("type", "str") for k, spec in m["params"].items()}
+                 for mid, m in MODULES.items()})
             db.init_db()
-            print("[db] MySQL 配置暂存已就绪（presets 表就绪）")
+            print("[db] MySQL 配置暂存已就绪（presets 注册表 + 模块参数表就绪）")
         except Exception as e:
             _DB_ENABLED = False
             print(f"[db] MySQL 不可用，presets 接口将返回错误: {e}")

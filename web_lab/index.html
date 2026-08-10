@@ -110,6 +110,7 @@
   <nav class="tabs">
     <button class="tab-btn active" data-view="module" onclick="switchView('module')">模块测试</button>
     <button class="tab-btn" data-view="designer" onclick="switchView('designer')">链路设计器</button>
+    <button class="tab-btn" data-view="db" onclick="switchView('db')">数据浏览</button>
   </nav>
   <section id="view-module">
     <header>
@@ -159,6 +160,12 @@
       <button id="dg-preset-load">载入</button>
       <button id="dg-preset-delete">删除</button>
     </div>
+  </section>
+  <section id="view-db" hidden>
+    <h2>数据库数据浏览</h2>
+    <p class="desc">只读查看 MySQL 中各表的当前内容：presets 注册表、各模块参数表（列式存储）、链路与步骤。改数据请走"模块测试 / 链路设计器"的暂存界面。</p>
+    <div id="db-summary"></div>
+    <div id="db-content"></div>
   </section>
 </main>
 <script>
@@ -406,8 +413,107 @@ function renderResult(data){
 function switchView(name){
   document.getElementById("view-module").hidden = name !== "module";
   document.getElementById("view-designer").hidden = name !== "designer";
+  document.getElementById("view-db").hidden = name !== "db";
   for (const b of document.querySelectorAll(".tab-btn"))
     b.classList.toggle("active", b.dataset.view === name);
+  if (name === "db") loadDbTables();
+}
+
+// ---- 数据库数据浏览（只读快照，见 doc/配置参数列式化存储设计.md §4）----
+
+let _dbTablesLoaded = false;
+async function loadDbTables(){
+  const box = document.getElementById("db-content");
+  if (!_dbTablesLoaded){
+    box.innerHTML = '<div class="loading">加载中…</div>';
+    _dbTablesLoaded = true;
+  }
+  let data;
+  try{ data = await (await fetch("/api/db/tables")).json(); }
+  catch(e){ box.innerHTML = '<pre class="err">请求失败：' + esc(String(e)) + "</pre>"; return; }
+  if (!data.ok){
+    box.innerHTML = '<pre class="err">' + esc(data.error || "数据库不可用") + "</pre>";
+    return;
+  }
+  renderDbTables(data);
+}
+
+function renderDbTables(data){
+  const summary = document.getElementById("db-summary");
+  const chips = [];
+  chips.push("presets 注册表 " + data.presets.rows.length + " 行");
+  let mp = 0;
+  for (const m of data.modules) mp += m.rows.length;
+  chips.push("模块参数表 " + data.modules.length + " 张 / " + mp + " 行");
+  chips.push("pipelines " + data.pipelines.rows.length + " 行");
+  chips.push("pipeline_steps " + data.steps.rows.length + " 行");
+  summary.innerHTML = '<div class="est-title">📊 表总览</div>' +
+    '<div style="font-size:12.5px;line-height:1.8">' + chips.join("　") + "</div>";
+
+  const box = document.getElementById("db-content");
+  const frag = document.createDocumentFragment();
+  const h3 = document.createElement("h3");
+  h3.style.cssText = "font-size:14px;margin:18px 0 4px;color:var(--accent)";
+  h3.textContent = "presets 注册表（模块配置 + 链路配置的归属与命名）";
+  frag.appendChild(h3);
+  frag.appendChild(makeTable(data.presets));
+
+  for (const m of data.modules){
+    const mod = SCHEMA.modules[m.module_id];
+    const title = document.createElement("h3");
+    title.style.cssText = "font-size:14px;margin:18px 0 4px;color:var(--accent)";
+    title.textContent = "模块参数表：" + (mod ? mod.name : m.module_id)
+      + "（preset_params_" + m.module_id + "，共 " + m.rows.length + " 条）";
+    frag.appendChild(title);
+    frag.appendChild(makeTable(m));
+  }
+
+  const h4 = document.createElement("h3");
+  h4.style.cssText = "font-size:14px;margin:18px 0 4px;color:var(--accent)";
+  h4.textContent = "pipelines 链路";
+  frag.appendChild(h4);
+  frag.appendChild(makeTable(data.pipelines));
+  const h5 = document.createElement("h3");
+  h5.style.cssText = "font-size:14px;margin:18px 0 4px;color:var(--accent)";
+  h5.textContent = "pipeline_steps 链路步骤";
+  frag.appendChild(h5);
+  frag.appendChild(makeTable(data.steps));
+
+  box.innerHTML = "";
+  box.appendChild(frag);
+}
+
+function makeTable(t){
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "overflow:auto;max-width:100%";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const c of t.columns){
+    const th = document.createElement("th");
+    th.textContent = c; hr.appendChild(th);
+  }
+  thead.appendChild(hr); table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  if (!t.rows.length){
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = Math.max(t.columns.length, 1);
+    td.style.color = "var(--dim)"; td.textContent = "（空）";
+    tr.appendChild(td); tbody.appendChild(tr);
+  }
+  for (const r of t.rows){
+    const tr = document.createElement("tr");
+    for (const v of r){
+      const td = document.createElement("td");
+      td.textContent = v === null || v === undefined ? "" : String(v);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return wrap;
 }
 
 async function apiPost(path, body){
