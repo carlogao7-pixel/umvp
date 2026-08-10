@@ -34,6 +34,18 @@
 
 ## 记录
 
+### 2026-08-10 · 本机远端切 SSH 并首次推送同步
+- 变更内容：本机（carloga0）远端地址由 HTTPS `https://github.com/carlogao7-pixel/umvp.git`
+  切换为 SSH `git@github.com:carlogao7-pixel/umvp.git`；生成 ed25519 SSH key
+  （`~/.ssh/id_ed25519`，GitHub 登记名 `carloga0-wsl2`，Authentication Key）并认证成功；
+  首次 `git push -u origin main` 同步两个本地提交（d67019e 适配本机路径 +
+  4b9eb6d 路径可移植化），`main` 与 `origin/main` 对齐。CLAUDE.md 新增
+  「git 协作（多机同步）」小节（提交习惯 / 换机先 pull / 路径可移植说明）。
+- 影响面：配置
+- 部署注意：换机移植后需重新生成/登记 SSH key；HTTPS 克隆也可用但每次 push 要认证。
+- 验证：`ssh -T git@github.com` 输出 `Hi carlogao7-pixel! You've successfully authenticated`；
+  `git status -sb` 显示 `main...origin/main` 无落后超前；工作树干净。
+
 ### 2026-08-10 · 解释器与路径可移植化（跨机器同步铺垫）
 - 变更内容：文档与脚本中的机器绝对路径统一改为便携写法——解释器一律写
   `conda run -n ai python`（CLAUDE.md / README.md / INSTALL.md / doc/需求文档-开发版.md /

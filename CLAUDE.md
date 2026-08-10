@@ -43,6 +43,20 @@ tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链�
   `DEPLOYMENT.md`）在验证后必须向 `DEPLOYMENT.md`「记录」顶部追加一条，格式见该文件；
   纯代码逻辑/文档改动且不影响运行配置的不记。拿不准算不算时，记一条无害。
 
+## git 协作（多机同步）
+
+- **仓库**：GitHub `carlogao7-pixel/umvp`，分支 `main`。本机远端为 SSH 地址
+  `git@github.com:carlogao7-pixel/umvp.git`（2026-08-10 从 HTTPS 切换），SSH key
+  （ed25519，GitHub 上名 `carloga0-wsl2`）已认证，push 无需再输密码。
+- **提交习惯**：小步提交——一个逻辑改动一个 commit（中文信息，说清"为什么"）；
+  按需推送——一个收尾或换机前 `git push` 一次即可，不必改一次推一次。
+  零碎改动可在本地攒几个 commit 后一次推送。
+- **多机同步**：本仓库在 carl0 与 carloga0 两台机器间共用。换机开发前先
+  `git pull` 拉最新，避免两边基于不同状态改产生冲突；改完 `git push`。
+- **路径已可移植**：文档/脚本统一 `conda run -n ai python` + 相对路径，两机
+  无需再手工改路径。`DEPLOYMENT.md` 历史条目里的旧绝对路径是故意保留的历史记录，
+  按"只追加、不修改历史条目"规则不可动。
+
 ## 常用验证命令（cd 到项目根执行）
 
 ```bash
