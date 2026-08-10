@@ -19,5 +19,7 @@ tests/data/vid/
 out/face_db.*
 out/video_db.*
 # 保留 out/fingerprints.json（标定基线，入库）
+# web_lab 后台运行日志（restart.sh 生成）
+out/web_lab.log
 # 测试输出（人脸提取链路产物：人脸图 + 标注图）
 tests/data/out/

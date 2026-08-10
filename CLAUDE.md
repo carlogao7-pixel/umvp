@@ -17,7 +17,8 @@ models/            YOLO 选择池（v8n/s、v9t、v10s、v11n/s/m，COCO person=
                     放 .pt 进目录即出现在 web_lab 模型选择中）
 face_models/       buffalo_l/ 已解压（det_10g.onnx + w600k_r50.onnx 等，人脸模型默认加载路径）
 web_lab/           可视化测试台（server.py 表单/测试/presets/资源估算；db.py MySQL 配置暂存；
-                    calibrate.py 实测标定→out/fingerprints.json；设计说明.md 通俗文档）
+                    calibrate.py 实测标定→out/fingerprints.json；run.sh/stop.sh/restart.sh 启停/重启
+                    脚本，操作手册见 doc/端口与启停手册.md；设计说明.md 通俗文档）
 .claude/skills/    face-extract-pipeline（原分辨率人脸提取链路，user-invocable，WIP 记录）
 doc/               需求文档（业务版/开发版，含分阶段计划 P1-P4）与模块说明
 tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链路 + 视频/截图数据
