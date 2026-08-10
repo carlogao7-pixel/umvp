@@ -8,7 +8,8 @@ UMVP 可视化测试台 —— 后端（零新增依赖，stdlib http.server）
                           {ok, text, images:[{title,data(base64)}], tables:[{title,headers,rows}]}
   3. GET  /             返回单页前端 index.html
   4. GET/POST /api/presets*   命名配置暂存（MySQL，见 db.py，--no-db 可禁用）
-  5. POST /api/pipeline/build | /api/pipeline/agent  链路生成/智能助手（P2/P4 占位壳子）
+  5. GET/POST /api/pipelines*  链路拼装暂存（步骤引用模块 preset id + 顺序）
+  6. POST /api/pipeline/build | /api/pipeline/agent  链路生成/智能助手（P2/P4 占位壳子）
 
 设计约定（与项目一致）:
   - 模块测试全部复用现有模块代码，不重复实现逻辑；
@@ -1091,6 +1092,80 @@ def _preset_delete(handler) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ---------------- 链路拼装暂存（pipelines + pipeline_steps，见 db.py） ----------------
+
+def _pipelines_list() -> dict:
+    if not _DB_ENABLED:
+        return {"ok": False, "error": "数据库未启用（--no-db）"}
+    try:
+        return {"ok": True, "pipelines": db.list_pipelines()}
+    except Exception as e:  # DB 不可用不影响服务器运行
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _pipeline_save(handler) -> dict:
+    if not _DB_ENABLED:
+        return {"ok": False, "error": "数据库未启用（--no-db）"}
+    try:
+        body = _read_json_body(handler)
+        if not isinstance(body, dict):
+            raise TypeError("请求体必须是对象")
+        name = str(body.get("name", "")).strip()
+        steps = body.get("steps")
+        streams = int(body.get("streams") or 1)
+        budget = body.get("budget") or {}
+        meta = body.get("meta") or {}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"ok": False, "error": "请求体必须是合法 JSON 对象"}
+    if not name:
+        return {"ok": False, "error": "链路名不能为空"}
+    if not isinstance(steps, list) or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in steps):
+        return {"ok": False, "error": "steps 必须是 preset id 数组"}
+    if not isinstance(budget, dict) or not isinstance(meta, dict):
+        return {"ok": False, "error": "budget/meta 必须是对象"}
+    try:
+        pid, created = db.save_pipeline(name, steps, streams=streams,
+                                        budget=budget, meta=meta)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, "id": pid, "name": name, "created": created,
+            "note": "链路已保存" if created else "同名链路已覆盖"}
+
+
+def _pipeline_load(handler) -> dict:
+    if not _DB_ENABLED:
+        return {"ok": False, "error": "数据库未启用（--no-db）"}
+    try:
+        body = _read_json_body(handler)
+        if not isinstance(body, dict):
+            raise TypeError("请求体必须是对象")
+        pid = int(body.get("id"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"ok": False, "error": "请求体缺少合法 id"}
+    try:
+        return {"ok": True, "pipeline": db.load_pipeline(pid)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _pipeline_delete(handler) -> dict:
+    if not _DB_ENABLED:
+        return {"ok": False, "error": "数据库未启用（--no-db）"}
+    try:
+        body = _read_json_body(handler)
+        if not isinstance(body, dict):
+            raise TypeError("请求体必须是对象")
+        pid = int(body.get("id"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"ok": False, "error": "请求体缺少合法 id"}
+    try:
+        db.delete_pipeline(pid)
+        return {"ok": True, "deleted": pid}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 # ---------------- HTTP 服务 ----------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -1119,6 +1194,8 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             kind = (qs.get("kind") or ["module"])[0]
             self._json(_preset_list(kind))
+        elif path == "/api/pipelines":
+            self._json(_pipelines_list())
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -1154,6 +1231,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/presets/delete":
             self._json(_preset_delete(self))
+            return
+
+        # ---- 链路拼装暂存（pipelines + pipeline_steps）----
+        if self.path == "/api/pipelines/save":
+            self._json(_pipeline_save(self))
+            return
+        if self.path == "/api/pipelines/load":
+            self._json(_pipeline_load(self))
+            return
+        if self.path == "/api/pipelines/delete":
+            self._json(_pipeline_delete(self))
             return
 
         # ---- 链路生成 / 智能助手（占位壳子，功能在 P2/P4 落地）----
