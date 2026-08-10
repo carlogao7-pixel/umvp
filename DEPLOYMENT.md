@@ -34,6 +34,23 @@
 
 ## 记录
 
+### 2026-08-10 · 新增 web_lab 一键停止/重启脚本与端口操作手册
+- 变更内容：新增 `web_lab/stop.sh`（按端口监听 PID 定位，找不到按进程名兜底，停止 web_lab
+  server；默认连自含 MySQL 一起停，`--keep-mysql` 保留）与 `web_lab/restart.sh`（一键重启：
+  停旧 web 进程→确保自含 MySQL 运行→后台拉起 server，日志写 `out/web_lab.log`，支持
+  `--port/--host/--no-db` 透传与 `--stop-mysql` 连库一起重启）；新增操作文档
+  `doc/端口与启停手册.md`；`.gitignore` 增加 `out/web_lab.log`。`web_lab/run.sh` 行为不变
+  （前台启动）。
+- 影响面：入口
+- 部署注意：换机后脚本自动定位解释器（`conda run -n ai which python`，可用 `PY=` 覆盖）；
+  脚本只按项目 `.mysql/mysql.sock` 特征识别自含 MySQL，不会误停系统 MySQL；
+  MySQL 停止优先 `mysqladmin shutdown`，无权限时自动回退 `kill -TERM`（干净落盘）。
+- 验证：`bash -n web_lab/stop.sh web_lab/restart.sh` 通过；实机跑通五条路径——① `./web_lab/restart.sh`
+  冷启动：MySQL 拉起 + server 后台启动，curl 200，8001/3307 均监听；② `./web_lab/stop.sh` 全停：
+  两端口释放；③ `./web_lab/stop.sh --keep-mysql`：web 停、3307 保留；④ `./web_lab/restart.sh
+  --stop-mysql`：连库重启成功；⑤ `--port 8080` 换端口启动，且不带 `--port` 的 `stop.sh`
+  按进程名定位并停掉 8080 实例。
+
 ### 2026-08-10 · 本机远端切 SSH 并首次推送同步
 - 变更内容：本机（carloga0）远端地址由 HTTPS `https://github.com/carlogao7-pixel/umvp.git`
   切换为 SSH `git@github.com:carlogao7-pixel/umvp.git`；生成 ed25519 SSH key
