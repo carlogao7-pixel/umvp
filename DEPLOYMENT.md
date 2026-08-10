@@ -34,6 +34,23 @@
 
 ## 记录
 
+### 2026-08-10 · 链路拼装存储：新增 pipelines/pipeline_steps 两表与 /api/pipelines* 接口
+- 变更内容：链路拼装信息由"整份快照"改为"步骤引用模块 preset id + position 顺序"存储：
+  `web_lab/db.py` 新增 `pipelines`（name/streams/budget_json/meta_json）与 `pipeline_steps`
+  （pipeline_id/position/preset_id，外键级联与 RESTRICT）两表，新增
+  `list/save/load/delete_pipeline` 访问层函数，`delete_preset` 增加被引用拒绝（报错含链路名）；
+  `web_lab/server.py` 新增 `/api/pipelines` GET 与 `/api/pipelines/save|load|delete` POST 四接口
+  （沿用 DB 不可用时返回 `{ok:false}` 的容错模式）。设计文档 `doc/链路拼装存储设计.md` 新建，
+  `doc/数据库结构.md` 同步新增两表结构。
+- 影响面：DB、入口
+- 部署注意：服务器启动 `init_db()` 幂等自动补建新表，无需手工 DDL；删除被链路引用的模块
+  preset 会被拒绝，需先删除/改引用的链路；`pipeline_steps` 依赖 InnoDB 外键（当前引擎即满足）。
+- 验证：DB 层断言回归 9/9 ALL PASS（init_db 幂等、save/load 全字段一致、同名覆盖 id 不变、
+  引用拒绝含链路名、删链路后级联放行、空/不存在 steps 拒绝、列表倒序、清理干净）；
+  `SHOW CREATE TABLE` 实测两表结构同步进 `doc/数据库结构.md`；curl 实测四接口
+  （list/save/load/delete 正常，错误 id 与非法 steps 返回明确报错）；测试数据已清理
+  （presets 1 行、pipelines 0 行、pipeline_steps 0 行）。
+
 ### 2026-08-10 · 新增 web_lab 一键停止/重启脚本与端口操作手册
 - 变更内容：新增 `web_lab/stop.sh`（按端口监听 PID 定位，找不到按进程名兜底，停止 web_lab
   server；默认连自含 MySQL 一起停，`--keep-mysql` 保留）与 `web_lab/restart.sh`（一键重启：
