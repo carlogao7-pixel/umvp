@@ -250,11 +250,18 @@ def _insert_module_params(cur, tbl: str, preset_id: int, values: dict) -> None:
 
 
 def _upsert_module_params(cur, tbl: str, preset_id: int, values: dict) -> None:
-    """按 preset_id 更新参数行；不存在则插入（同名覆盖 / 迁移用）。"""
-    set_clause = ", ".join(f"`{k}`=%s" for k in values)
-    cur.execute(f"UPDATE {tbl} SET {set_clause} WHERE preset_id=%s",
-                list(values.values()) + [preset_id])
-    if cur.rowcount == 0:
+    """按 preset_id 更新参数行；不存在则插入（同名覆盖 / 迁移用）。
+
+    先查存在性再决定 UPDATE/INSERT：UPDATE 后靠 rowcount 判断会把"参数与旧值
+    完全相同"的覆盖误判为不存在（MySQL 无 CLIENT_FOUND_ROWS 时 UPDATE 相同的
+    值 affected=0），导致重复 INSERT 撞主键。
+    """
+    cur.execute(f"SELECT 1 FROM {tbl} WHERE preset_id=%s", [preset_id])
+    if cur.fetchone():
+        set_clause = ", ".join(f"`{k}`=%s" for k in values)
+        cur.execute(f"UPDATE {tbl} SET {set_clause} WHERE preset_id=%s",
+                    list(values.values()) + [preset_id])
+    else:
         _insert_module_params(cur, tbl, preset_id, values)
 
 
