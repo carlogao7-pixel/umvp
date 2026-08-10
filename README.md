@@ -23,19 +23,19 @@
 直接继承使用，无需新装依赖。所有运行命令使用该解释器：
 
 ```bash
-# 在项目根 /home/carl0/project/umvp 下
+# 在项目根 /home/carloga0/projects/umvp 下
 
 # 1. 纯逻辑测试（不加载模型，最快）→ 27 项断言
-/home/carl0/miniconda/envs/ai/bin/python umvp/pipe/test_composer.py
+/home/carloga0/miniconda3/envs/ai/bin/python umvp/pipe/test_composer.py
 
 # 2. 人脸链路注册+自检（读项目内 face_models/；用 test_imgs 建库并逐条自检 → 7/7 命中）
-/home/carl0/miniconda/envs/ai/bin/python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
+/home/carloga0/miniconda3/envs/ai/bin/python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
 
 # 3. YOLO 推理参数对比（重叠场景截图，真实推理）
-/home/carl0/miniconda/envs/ai/bin/python tests/test_yolo_params.py
+/home/carloga0/miniconda3/envs/ai/bin/python tests/test_yolo_params.py
 
 # 4. 三模式实机测试（YOLO + 三路真实视频 + 大模型研判，需 VLM 端点可达）
-/home/carl0/miniconda/envs/ai/bin/python tests/test_3modes.py
+/home/carloga0/miniconda3/envs/ai/bin/python tests/test_3modes.py
 ```
 
 > 若 `ai` 环境已激活（`conda activate ai`），上述命令简写为 `python ...`。

@@ -1,7 +1,7 @@
 # UMVP 独立部署包 — 安装指南
 
 > 本指南覆盖两种场景：
-> **场景 A（本机现状）**——项目已在 `/home/carl0/project/umvp`，代码与权重齐全，
+> **场景 A（本机现状）**——项目已在 `/home/carloga0/projects/umvp`，代码与权重齐全，
 > 直接继承现有 conda 环境 `ai` 运行，无需任何安装。
 > **场景 B（移植新机器）**——整目录拷贝后从零装依赖，走通验证测试。
 >
@@ -66,15 +66,15 @@ umvp/                                ← 项目根（独立部署包）
 
 ```bash
 # 1) conda 环境存在（含 cv2/ultralytics/insightface/onnxruntime）
-ls /home/carl0/miniconda/envs/ai/bin/python
+ls /home/carloga0/miniconda3/envs/ai/bin/python
 
 # 2) 人脸模型已解压（默认加载路径=项目内，不读 ~/.insightface）
-ls /home/carl0/project/umvp/face_models/buffalo_l/
+ls /home/carloga0/projects/umvp/face_models/buffalo_l/
 #    应看到 det_10g.onnx w600k_r50.onnx 等 5 个文件
 
 # 3) 纯逻辑测试冒烟（27 项断言，不加载模型，秒级完成）
-cd /home/carl0/project/umvp
-/home/carl0/miniconda/envs/ai/bin/python umvp/pipe/test_composer.py
+cd /home/carloga0/projects/umvp
+/home/carloga0/miniconda3/envs/ai/bin/python umvp/pipe/test_composer.py
 ```
 
 通过后即可运行完整验证（见第五节），无需任何安装步骤。
@@ -93,7 +93,7 @@ cd /home/carl0/project/umvp
 
 ```bash
 # 在目标机上，从源机拷贝（示例 scp；也可用 U 盘/共享盘）
-scp -r carl0@<源机>:/home/carl0/project/umvp ./
+scp -r carloga0@<源机>:/home/carloga0/projects/umvp ./
 cd umvp
 ```
 
@@ -159,8 +159,8 @@ ls face_models/buffalo_l/
 ## 四、运行验证（按依赖从小到大）
 
 ```bash
-cd /home/carl0/project/umvp
-PY=/home/carl0/miniconda/envs/ai/bin/python   # 场景 B 换为 conda activate ai 后的 python
+cd /home/carloga0/projects/umvp
+PY=/home/carloga0/miniconda3/envs/ai/bin/python   # 场景 B 换为 conda activate ai 后的 python
 ```
 
 ```bash

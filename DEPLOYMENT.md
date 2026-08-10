@@ -34,6 +34,16 @@
 
 ## 记录
 
+### 2026-08-10 · 本机（carloga0）接入 GitHub 仓库并适配环境路径
+- 变更内容：本机 `/home/carloga0/projects/umvp` 接入远端仓库 origin=`https://github.com/carlogao7-pixel/umvp.git`
+  （分支 main，首次提交 46 个代码/文档/测试文件，含 `.gitignore`，远端记录见下条）；文档与脚本中
+  的解释器/项目根路径由 carl0 机器路径（`/home/carl0/miniconda/envs/ai/bin/python`、
+  `/home/carl0/project/umvp`）改回本机 carloga0 路径（`/home/carloga0/miniconda3/envs/ai/bin/python`、
+  `/home/carloga0/projects/umvp`）。远端历史条目保留原样不改写。
+- 影响面：配置 / 入口
+- 部署注意：换机移植后若 conda 路径不同，以实际解释器为准。
+- 验证：`git status` 干净；`test_composer.py` 27/27 断言通过。
+
 ### 2026-08-09 · git 版本管理引入：首次提交 c742a3f
 - 变更内容：`git init`（分支 main），新增 `.gitignore`（忽略 models/*.pt、face_models/、
   tests/data/vid/、.mysql/、out/face_db.*、out/video_db.*、tests/data/out/），首次提交 46 个

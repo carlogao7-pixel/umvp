@@ -1,7 +1,7 @@
 {
   "task": "YOLODetector 单独处理 tests/data/pic 图片，仅识别人（各图独立时间戳 ts=0/10/20）",
   "params": {
-    "model_path": "/home/carl0/project/umvp/models/yolov8n.pt",
+    "model_path": "/home/carloga0/projects/umvp/models/yolov8n.pt",
     "conf": 0.35,
     "iou": 0.7,
     "imgsz": 640,

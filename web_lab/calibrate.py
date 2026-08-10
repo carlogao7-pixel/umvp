@@ -5,8 +5,8 @@
 分别做 CPU / GPU（若可用）实测：单次推理延迟 + 峰值显存/内存，写入指纹 JSON。
 
 用法：
-    /home/carl0/miniconda/envs/ai/bin/python web_lab/calibrate.py [--out out/fingerprints.json]
-    /home/carl0/miniconda/envs/ai/bin/python web_lab/calibrate.py --gpu-only   # 只标定 GPU
+    /home/carloga0/miniconda3/envs/ai/bin/python web_lab/calibrate.py [--out out/fingerprints.json]
+    /home/carloga0/miniconda3/envs/ai/bin/python web_lab/calibrate.py --gpu-only   # 只标定 GPU
 
 产物结构（与 umvp/resources.py 的 _measured_lookup_key 对齐）：
     {

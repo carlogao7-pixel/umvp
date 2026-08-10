@@ -41,7 +41,7 @@ user-invocable: true
 ## 怎么用
 
 ```bash
-PY=/home/carl0/miniconda/envs/ai/bin/python   # 唯一带 cv2/ultralytics/insightface 的解释器
+PY=/home/carloga0/miniconda3/envs/ai/bin/python   # 唯一带 cv2/ultralytics/insightface 的解释器
 $PY tests/test_face_extract_pipeline.py           # 跑三张测试图，产物在 tests/data/out/faces/
 ```
 

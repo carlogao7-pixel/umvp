@@ -5,7 +5,7 @@ set -e
 SELF="$(cd "$(dirname "$0")" && pwd)"     # web_lab/ 绝对路径
 cd "$SELF"
 ROOT="$(dirname "$SELF")"                  # 项目根（.mysql 数据目录在项目根）
-PY="${PY:-/home/carl0/miniconda/envs/ai/bin/python}"
+PY="${PY:-/home/carloga0/miniconda3/envs/ai/bin/python}"
 
 # 除非显式 --no-db，否则确保项目自含 MySQL 实例已启动（端口 3307，仅绑定本机）
 NO_DB=0

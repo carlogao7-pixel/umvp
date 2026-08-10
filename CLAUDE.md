@@ -1,7 +1,7 @@
 # UMVP 项目指令（CLAUDE.md）
 
 UMVP（统一模块化视觉分析管道）独立部署包。代码 + 权重自包含，本目录即项目根。
-所有 python 命令必须用 `/home/carl0/miniconda/envs/ai/bin/python`（conda 环境 `ai`，
+所有 python 命令必须用 `/home/carloga0/miniconda3/envs/ai/bin/python`（conda 环境 `ai`，
 唯一带 cv2 / ultralytics / insightface / onnxruntime 的解释器）。
 
 ## 项目结构
@@ -46,7 +46,7 @@ tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链�
 ## 常用验证命令（cd 到项目根执行）
 
 ```bash
-PY=/home/carl0/miniconda/envs/ai/bin/python
+PY=/home/carloga0/miniconda3/envs/ai/bin/python
 
 $PY umvp/pipe/test_composer.py            # 纯逻辑 27 断言（不加载模型，秒级）
 $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz   # 人脸注册+自检 7/7
