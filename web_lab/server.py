@@ -965,8 +965,8 @@ MODULES = {
         "desc": "复用 pipe.crop_restore：YOLO 识人 → 裁人 → SCRFD → 原图出脸。",
         "params": PARAMS["extract_faces"], "handler": h_extract_faces},
     "face_monitor": {
-        "name": "视频扫描 FaceMonitor", "group": "视频监控",
-        "desc": "复用 face_scan.face_monitor：抽帧 + 检测 + 嵌入 + 检索全链路。",
+        "name": "视频人脸检索 FaceMonitor", "group": "已完成链路", "hidden": True,
+        "desc": "视频/摄像头人脸监控链路：抽帧 + 检测 + 嵌入 + 检索（在「已完成链路」中选择并运行）。",
         "params": PARAMS["face_monitor"], "handler": h_face_monitor},
 }
 
@@ -1009,6 +1009,7 @@ def _module_estimate(mid: str) -> dict:
 def _schema() -> dict:
     return {"modules": {mid: {"name": m["name"], "group": m["group"],
                               "desc": m["desc"], "params": m["params"],
+                              "hidden": m.get("hidden", False),
                               "estimate": _module_estimate(mid)}
                         for mid, m in MODULES.items()},
             "files": _file_index(),
@@ -1296,6 +1297,63 @@ class Handler(BaseHTTPRequestHandler):
         self._json(result)
 
 
+# ---------------- 已完成链路播种（"视频人脸检索"） ----------------
+# 视频扫描 FaceMonitor 收敛为一条已完成链路：链路 spec（kind='pipeline'，整份 JSON
+# 快照）+ 涉及模块的命名配置（kind='module'，拆列存入各模块参数表）。幂等：presets
+# 按 (kind, name) 唯一，已存在同名则不覆盖（尊重用户编辑）。
+
+_SEED_PIPE_NAME = "视频人脸检索"
+_SEED_MODULES = [
+    ("frame_scheduler", "视频人脸检索·抽帧调度", {
+        "mode": "queue", "scenario": "平稳", "frame_skip": 3, "queue_threshold": 32,
+        "backpressure_multiplier": 2, "max_frame_skip": 0, "adaptive_relax_ratio": 1.2,
+        "adaptive_recover_ratio": 0.5, "fps": 25.0, "n_frames": 30}),
+    ("face_detect", "视频人脸检索·人脸检测", {
+        "device": "auto", "det_thresh": 0.5, "det_size": "640,640",
+        "max_num": 0, "use_crop": True}),
+    ("face_embed", "视频人脸检索·特征提取", {
+        "device": "auto", "det_thresh": 0.5, "det_size": "640,640"}),
+    ("face_store", "视频人脸检索·底库", {
+        "db_path": "out/face_db.npz", "thresh": 0.45, "topk": 5, "device": "auto"}),
+]
+
+
+def _completed_pipeline_spec() -> dict:
+    return {
+        "runner": "face_monitor",  # 运行入口：复用 /api/test/face_monitor 处理器
+        "description": "视频/摄像头人脸监控链路：抽帧调度 → SCRFD 人脸检测 → ArcFace "
+                       "特征提取 → 底库检索命中身份。运行前先在「向量底库 FaceStore」"
+                       "注册并保存底库（out/face_db.npz）。",
+        "streams": 1,
+        "stages": [{"module": mid, "params": params}
+                   for mid, _name, params in _SEED_MODULES],
+        "run_params": {
+            "video": "", "db_path": "out/face_db.npz", "device": "auto",
+            "frame_skip": 3, "queue_threshold": 32, "backpressure_multiplier": 2,
+            "max_frames": 60, "save_dir": "tests/data/out/faces/monitor"},
+    }
+
+
+def _seed_completed_pipeline() -> None:
+    """幂等播种已完成链路：链路 spec + 涉及模块命名配置。失败不影响运行。"""
+    if not _DB_ENABLED:
+        return
+    try:
+        names = {p["name"] for p in db.list_presets("pipeline")}
+        if _SEED_PIPE_NAME not in names:
+            db.save_preset("pipeline", _SEED_PIPE_NAME, "", _completed_pipeline_spec())
+            print(f"[seed] 已完成链路「{_SEED_PIPE_NAME}」已写入数据库")
+    except Exception as e:
+        print(f"[seed] 播种链路失败（不影响运行）: {e}")
+    try:
+        have = {(p["module_id"], p["name"]) for p in db.list_presets("module")}
+        for mid, name, params in _SEED_MODULES:
+            if (mid, name) not in have:
+                db.save_preset("module", name, mid, params)
+    except Exception as e:
+        print(f"[seed] 播种模块配置失败（不影响运行）: {e}")
+
+
 def main() -> None:
     global _DB_ENABLED
     ap = argparse.ArgumentParser(description="UMVP 可视化测试台")
@@ -1314,6 +1372,7 @@ def main() -> None:
                 {mid: {k: spec.get("type", "str") for k, spec in m["params"].items()}
                  for mid, m in MODULES.items()})
             db.init_db()
+            _seed_completed_pipeline()  # 幂等：写入"视频人脸检索"已完成链路
             print("[db] MySQL 配置暂存已就绪（presets 注册表 + 模块参数表就绪）")
         except Exception as e:
             _DB_ENABLED = False

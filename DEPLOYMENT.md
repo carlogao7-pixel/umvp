@@ -34,6 +34,24 @@
 
 ## 记录
 
+### 2026-08-11 · web_lab 结构重构：FaceMonitor 转为已完成链路「视频人脸检索」
+- 变更内容：`face_monitor` 模块入口改为 `hidden: True`、分组归入「已完成链路」并改名
+  「视频人脸检索 FaceMonitor」，不再占用侧栏/设计器模块库位置；顶部 tab 导航删除，链路设计器
+  改为侧栏独立槽位，原位置新增「已完成链路」分组（搜索框 + 列表，可选中并运行）。
+  新增幂等播种 `_seed_completed_pipeline()`：首次启动时向 `presets` 写入 kind=pipeline 的
+  「视频人脸检索」（`params.runner='face_monitor'`，stages 引用 frame_scheduler/face_detect/
+  face_embed/face_store 四模块，run_params 含 video/db_path/device/frame_skip 等 8 项），
+  并写入 4 条「视频人脸检索·*」模块命名配置；DB 禁用（`--no-db`）时跳过不影响启动。
+- 影响面：DB、入口、配置
+- 部署注意：重启 server 后首次启动自动播种（幂等，同名校验已存在则跳过，尊重已有编辑）；
+  底库/视频依赖同 face_monitor 原配置（`out/face_db.npz`、`tests/data/vid/`）；
+  「已完成链路」运行表单走 `/api/test/face_monitor`，参数与运行逻辑不变。
+- 验证：JS 括号平衡 + `node --check` 语法 OK；seed 幂等实测（连续播种 pipeline 1 条 /
+  module 5 条不变，`_DB_ENABLED=False` 无异常）；`/api/presets?kind=pipeline` 含
+  「视频人脸检索」且 runner=face_monitor；`/api/presets?kind=module` 含 4 条
+  「视频人脸检索·*」；冒烟实测 `/api/test/face_monitor`（face1.MP4，读 60 帧/分析 10 帧，
+  5.58s ok）；侧栏/模块库均不含 face_monitor；空/不存在视频返回优雅错误不崩溃。
+
 ### 2026-08-10 · 配置参数列式化存储：每模块一张参数表 + /api/db/tables 数据浏览
 - 变更内容：`kind='module'` 的命名配置不再整份 JSON 塞进 `presets.params_json`，改为
   每模块一张参数表 `preset_params_<module_id>`（参数按类型展开为列，int→INT / float→DOUBLE /
