@@ -1,13 +1,8 @@
----
-name: face-extract-pipeline
-description: 原分辨率人脸提取链路 —— 图片 → YOLO(识别人) → CropRestore(裁人+坐标还原) → SCRFD(识别人脸) → 从原图直接裁出原生分辨率人脸图。当用户需要"从一张图里取出所有人脸、且人脸像素保持原图分辨率"时使用（人重叠/遮挡/小脸场景）。Also for understanding how bbox coordinate mapping between cropped and original images works in this repo.
-user-invocable: true
----
+# 先例：原分辨率人脸提取链路（face-extract-pipeline）
 
-# 原分辨率人脸提取链路（face-extract-pipeline）
-
-> **状态：WIP 记录**（2026-08-05 首版）。只验证过三张静态测试图，很多场景没试过，下文
-> "未验证场景" 一节是诚实清单。本文件目的是把已跑通的链路、改造、坑先记下来，别丢。
+> 层：L4-experience ｜ 读者：总装 / 组装工 ｜ 来源：原 `.claude/skills/face-extract-pipeline/SKILL.md`（2026-08-11 并入知识库 L4）
+> 状态：WIP 记录（2026-08-05 首版）。只验证过三张静态测试图，很多场景没试过，下文
+> "未验证场景"一节是诚实清单。本文件目的是把已跑通的链路、改造、坑先记下来，别丢。
 
 ## 这是什么
 
