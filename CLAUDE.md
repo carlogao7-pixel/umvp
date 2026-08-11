@@ -19,7 +19,9 @@ face_models/       buffalo_l/ 已解压（det_10g.onnx + w600k_r50.onnx 等，�
 web_lab/           可视化测试台（server.py 表单/测试/presets/资源估算；db.py MySQL 配置暂存；
                     calibrate.py 实测标定→out/fingerprints.json；run.sh/stop.sh/restart.sh 启停/重启
                     脚本，操作手册见 doc/端口与启停手册.md；设计说明.md 通俗文档）
-.claude/skills/    face-extract-pipeline（原分辨率人脸提取链路，user-invocable，WIP 记录）
+.claude/skills/    pipeline-assembly 链路拼接知识库（SKILL.md 技能入口 + INDEX.md 分层索引 +
+                   knowledge/ 四层：L1 共享陈述 / L2 总装专属 / L3 组装工专属 / L4 共享经验，
+                   含链路决策表【待定稿】、壳代码骨架、常见坑、face-extract 先例等）
 doc/               需求文档（业务版/开发版，含分阶段计划 P1-P4）与模块说明
 tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链路 + 视频/截图数据
 ```
@@ -34,8 +36,10 @@ tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链�
   由 `web_lab/calibrate.py` 生成）；链路按"每帧平均成本"聚合（VLM 按 check_interval 节流折算、
   人脸嵌入只在命中后折算），显存按常驻+激活拆分，多路外推 + 预算反推建议 frame_skip。
   机器变化（换卡/换机）只需重跑 calibrate.py，代码零改动。
-- **skill**：`.claude/skills/face-extract-pipeline/` 是已跑通链路的 WIP 记录（user-invocable，
-  用 `/face-extract-pipeline` 或 Skill 工具调用）；P3 主手册（vision-pipeline）尚未编写。
+- **skill**：`.claude/skills/pipeline-assembly/` 是链路组成环节的单一知识库（user-invocable，
+  用 `/pipeline-assembly` 或 Skill 工具调用）——总装 / 组装工两个 agent 的提示词只留基础内容，
+  全部所需知识分层存放并由 `INDEX.md` 索引（L1 共享陈述 / L2 总装专属 / L3 组装工专属 /
+  L4 共享经验；face-extract 先例已并入 L4）。
 - **web_lab presets**：命名配置暂存 MySQL（`web_lab/db.py`，惰性连接，`--no-db` 可禁用；
   连接参数 MYSQL_* 环境变量覆盖，缺失不影响启动）。
 - **协作约定**：文档先行（先设计文档后实现）、验证闭环（断言式测试，不接受"看起来对"）；
