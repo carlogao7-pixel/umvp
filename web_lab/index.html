@@ -186,6 +186,8 @@
       <p id="pl-desc" class="desc"></p>
     </header>
     <div id="pl-stages"></div>
+    <h3 id="pl-stage-title" style="font-size:14px;margin:20px 0 4px;color:var(--accent)" hidden>阶段参数（模块级，可调整）</h3>
+    <div id="pl-stage-forms" hidden></div>
     <h3 style="font-size:14px;margin:20px 0 4px;color:var(--accent)">运行参数（可调整，视频必选）</h3>
     <form id="pl-form"></form>
     <button id="pl-run" disabled>运行测试</button>
@@ -870,6 +872,7 @@ async function deletePipelinePreset(){
 let PIPELINES = [];
 let PL_CURRENT = null;
 let PL_RUNNER = null;   // 当前已选链路的运行入口（/api/test/<runner>）
+let PL_SPEC = null;     // 当前已选链路的完整 spec（含 stages/algo_mode），运行时间传给 runner
 
 async function loadPipelines(){
   try{
@@ -913,6 +916,7 @@ function openPipeline(id){
   document.getElementById("pl-title").textContent = p.name;
   document.getElementById("pl-desc").textContent = spec.description || "";
   renderPlStages(spec.stages || []);
+  renderPlStageForms(spec);
   const form = document.getElementById("pl-form");
   form.innerHTML = "";
   // 运行表单参数 schema 来源：spec.run_module（新播种）或回退 spec.runner（旧播种）
@@ -925,6 +929,7 @@ function openPipeline(id){
     form.appendChild(div);
   }
   PL_RUNNER = spec.runner || runMod;
+  PL_SPEC = spec;
   document.getElementById("pl-run").disabled = !runMod;
 }
 
@@ -949,6 +954,31 @@ function renderPlStages(stages){
   box.appendChild(wrap);
 }
 
+// runner=chain 的链路：阶段参数由 _chain_from_spec 从 spec.stages[].params 读取，
+// 这里把每个阶段渲染成可编辑表单（模块 schema 驱动），运行前合并回 spec。
+// 其它 runner（face_monitor / frame_yolo 等）阶段仅供展示，不改动。
+function renderPlStageForms(spec){
+  const title = document.getElementById("pl-stage-title");
+  const box = document.getElementById("pl-stage-forms");
+  box.innerHTML = "";
+  const stages = spec.runner === "chain" ? (spec.stages || []) : [];
+  title.hidden = box.hidden = stages.length === 0;
+  stages.forEach((s, i) => {
+    const m = SCHEMA.modules[s.module];
+    if (!m) return;
+    const d = document.createElement("details");
+    d.className = "param-group"; d.open = i === 0;
+    const sum = document.createElement("summary");
+    sum.textContent = "阶段 " + (i + 1) + " · " + (m.name || s.module);
+    d.appendChild(sum);
+    const inner = document.createElement("div");
+    inner.className = "fields"; inner.id = "pl-stage-" + i;
+    d.appendChild(inner);
+    box.appendChild(d);
+    renderGroupedForm(inner, s.module, s.params || {}, "ps" + i);
+  });
+}
+
 async function runPipeline(){
   const runner = PL_RUNNER || "face_monitor";
   const btn = document.getElementById("pl-run");
@@ -956,10 +986,18 @@ async function runPipeline(){
   const box = document.getElementById("pl-result");
   box.innerHTML = '<div class="loading">⏳ 运行中，请稍候…</div>';
   try{
+    // 深拷贝 spec，把每个阶段可编辑表单的当前值合并回 stages[].params
+    // （_chain_from_spec 运行时读 stages 的 params，改参数即时生效）
+    const spec = JSON.parse(JSON.stringify(PL_SPEC || {}));
+    (spec.stages || []).forEach((s, i) => {
+      const box = document.getElementById("pl-stage-" + i);
+      if (box) s.params = Object.assign({}, s.params || {}, collect(box));
+    });
     const resp = await fetch("/api/test/" + runner, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({params: collect(document.getElementById("pl-form"))})
+      body: JSON.stringify({params: Object.assign(collect(document.getElementById("pl-form")),
+                                                  {spec: spec})})
     });
     renderResult(await resp.json(), box);
   }catch(e){
