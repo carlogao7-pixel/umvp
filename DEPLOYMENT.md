@@ -34,6 +34,26 @@
 
 ## 记录
 
+### 2026-08-14 · 已完成链路新增四模式运行器（runner=chain）
+- 变更内容：`web_lab/server.py` 新增 `PARAMS["chain"]`（feed=script/real 驱动、
+  VLM 回填 action）与隐藏模块 `chain`（按 spec.stages 组装四模块实例的通用运行器
+  `_chain_from_spec` + `h_chain`，装配前用 `_ALGO_EXPECT` 校验 stages 结构与
+  algo_mode 一致）；播种 3 条四模式链路：small_only 驻留告警 / small_yolo_vlm
+  小模型+大模型研判（方案A：忽略 ROI，small_crop/small_full 并为一条）/
+  large_only 纯大模型研判，spec 显式存 `algo_mode`（compose() 分派键）作顶层键。
+  `web_lab/index.html` 运行已完成链路时把完整 spec（含 stages）并入 params 传给
+  `/api/test/chain`。新增 `tests/test_chain_runner.py`（51 断言纯逻辑验证）。
+- 影响面：入口（新运行器 /api/test/chain）、DB（presets 新增 3 条 kind=pipeline
+  链路种子，仅迁移增量）、配置（algo_mode=small_yolo_vlm 新模式，compose() 不识别、
+  仅 chain 运行器用）
+- 部署注意：重启 web_lab 后种子入库（presets 按 (kind,name) 幂等，已存在的
+  small_only/large_only 名称不会覆盖已有同名自定义链路）。compose() 仍只认
+  small_only/small_crop/small_full/large_only 四种模式，small_yolo_vlm 不能用于
+  compose 链路。
+- 验证：`conda run -n ai python tests/test_chain_runner.py`（51 断言通过）；
+  `conda run -n ai python umvp/pipe/test_composer.py`（27 断言通过）；seed 装配
+  脚本（5 条种子名不重复，3 条 chain 种子全部过 `_chain_from_spec`）。
+
 ### 2026-08-12 · 新增已完成链路「帧管理-YOLO识别」+ 链路表单按模块分组折叠
 - 变更内容：`web_lab/server.py` 新增 `PARAMS["frame_yolo"]`（参数按「运行控制 / 帧管理
   FrameManager / YOLO 识别 YOLODetector」三组分组，`group` 字段驱动前端折叠）、

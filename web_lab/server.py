@@ -774,6 +774,153 @@ def h_frame_yolo(p: dict) -> dict:
     return res(text=text, images=images, tables=tables)
 
 
+# ---------------- 四模式链路运行器（runner=chain，模块链路模式） ----------------
+# 已完成链路 spec 以 stages（模块链路）为真相源：各阶段存 web_lab 模块参数，
+# _chain_from_spec 据此组装四模块实例（帧管理→YOLO→VLM→告警，可选阶段），
+# 与 compose() 按 algo_mode 构造等价但不受模式枚举限制（手拼的自定义链路也能跑）。
+
+_ALGO_EXPECT = {  # algo_mode -> stages 应满足的结构（运行前校验，避免反推歧义）
+    "small_only": {"has_yolo": True, "has_vlm": False, "kind": "dwell"},
+    "small_crop": {"has_yolo": True, "has_vlm": True, "kind": "window"},
+    "small_full": {"has_yolo": True, "has_vlm": True, "kind": "window"},
+    # 方案A 合并链路：忽略 ROI 后 small_crop/small_full 并为一条（stages 结构等价）
+    "small_yolo_vlm": {"has_yolo": True, "has_vlm": True, "kind": "window"},
+    "large_only": {"has_yolo": False, "has_vlm": True, "kind": "window"},
+}
+
+
+def _chain_from_spec(spec: dict):
+    """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。不加载模型。"""
+    from pipe.composer import (
+        FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
+        SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
+        filter_confidence, filter_min_size,
+    )
+    stages = spec.get("stages") or []
+    by_mod: dict = {}
+    for s in stages:
+        mid = s.get("module")
+        if mid:
+            by_mod.setdefault(mid, []).append(s.get("params") or {})
+
+    def _one(mid: str) -> dict:
+        return (by_mod.get(mid) or [{}])[0]
+
+    algo_mode = spec.get("algo_mode")
+    if algo_mode:
+        if algo_mode not in _ALGO_EXPECT:
+            raise ValueError(f"未知 algo_mode: {algo_mode}")
+        exp, got = _ALGO_EXPECT[algo_mode], {
+            "has_yolo": "yolo" in by_mod, "has_vlm": "vlm" in by_mod,
+            "kind": _one("alarm").get("kind", "window")}
+        if got != exp:
+            raise ValueError(f"链路 stages 与 algo_mode={algo_mode} 不一致: {got} != {exp}")
+    if "frame_manager" not in by_mod or "alarm" not in by_mod:
+        raise ValueError("链路缺少必需阶段: frame_manager / alarm")
+
+    fp = _one("frame_manager")
+    fm = FrameManager(
+        sampling=fp.get("sampling", SAMPLING_ANALYSIS),
+        frame_skip=_int(fp, "frame_skip", 3),
+        interval_sec=_float(fp, "interval_sec", 3.0),
+        interval_frames=_int(fp, "interval_frames", 30))
+    ap = _one("alarm")
+    alarm = AlarmPolicy(
+        task_id=_int(ap, "task_id", 1),
+        kind=ap.get("kind", "window"),
+        target_actions=_str_list(ap, "target_actions"),
+        smooth_frames=_int(ap, "smooth_frames", 1),
+        hit_ratio=_float(ap, "hit_ratio", 1.0),
+        alarm_cooldown=_float(ap, "alarm_cooldown", 60.0))
+    yolo = None
+    if "yolo" in by_mod:
+        yp = _one("yolo")
+        model = _find_file(yp.get("model_path", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
+        filters = []
+        fc = _float(yp, "filter_conf", 0.0)
+        if fc > 0:
+            filters.append(filter_confidence(fc))
+        ms, ml = _int(yp, "min_short", 0), _int(yp, "min_long", 0)
+        if ms > 0 or ml > 0:
+            filters.append(filter_min_size(ms, ml))
+        yolo = YOLODetector(
+            filters=filters, class_limits=_class_limits(yp.get("class_limits", "")),
+            check_interval=_float(yp, "check_interval", 3.0),
+            roi=_bool(yp, "roi"),
+            model_path=str(model), conf=_float(yp, "conf", 0.35),
+            iou=_float(yp, "iou", 0.7), imgsz=_int(yp, "imgsz", 640),
+            max_det=_int(yp, "max_det", 300), classes=_int_list(yp, "classes", None),
+            device=str(yp.get("device", "")).strip() or None)
+    vlm = None
+    if "vlm" in by_mod:
+        vp = _one("vlm")
+        vlm = VLMAnalyzer(
+            crop_padding=_float(vp, "crop_padding", 0.15),
+            max_resolution=tuple(_int_tuple(vp, "max_resolution", 2) or (1280, 720)),
+            prompt=str(vp.get("prompt", "")))
+    return Pipeline(frame=fm, alarm=alarm, yolo=yolo, vlm=vlm)
+
+
+def h_chain(p: dict) -> dict:
+    """四模式链路运行器：按 spec.stages 组装模块，script/real 驱动逐帧 step()。
+
+    与 h_compose 的差异：不按 algo_mode 的表单字段构造，而是直接消费已完成链路
+    spec 的 stages（模块链路模式），因此链路设计器手拼的自定义链路同样能跑。
+    """
+    from pipe.composer import Detection
+    spec = p.get("spec") or {}
+    if not spec.get("stages"):
+        return res(ok=False, error="链路 spec 缺少 stages（请先载入一条已完成链路）")
+    try:
+        pipe = _chain_from_spec(spec)
+    except ValueError as e:
+        return res(ok=False, error=str(e))
+    mode = spec.get("algo_mode", "")
+    feedback = _bool(p, "vlm_feedback")
+    vlm_action = str(p.get("vlm_action", "fire")).strip() or "fire"
+    log, images = [], []
+
+    def _step_out(tag, subs, al, ts):
+        log.append(f"{tag} → 报送 {len(subs)} 条, 告警 {len(al)} 条")
+        for s in subs:
+            log.append(f"    · {s.ref} (gran={s.gran}, track_key={s.track_key}, 目标数={len(s.dets)})")
+        for e in al:
+            log.append(f"    ⚠ {e.action}")
+        if feedback and pipe.vlm is not None and mode != "small_only":
+            for s in subs:
+                for e in pipe.on_vlm_result(s.track_key, vlm_action, ts):
+                    log.append(f"    ★ VLM({vlm_action}) 命中 → {e.action}")
+
+    if p.get("feed") == "real":
+        if pipe.yolo is None:
+            return res(ok=False, error="该链路无 YOLO 阶段，真实图片驱动仅适用于含 YOLO 的链路")
+        img_path, frame = _load_frame(p)
+        dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
+        canvas = frame.copy()
+        _draw_tracks(canvas, dets)
+        images.append({"title": "YOLO 标注", "data": _img_data_url(canvas)})
+        subs, al = pipe.step(0, 0.0, dets, frame=frame)
+        _step_out(f"真实图片: {img_path.name} (检出 {len(dets)} 个)", subs, al, 0.0)
+    else:
+        script = str(p.get("script", ""))
+        lines = [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
+        for l in lines:
+            parts = [x.strip() for x in re.split(r"[,，\s]+", l) if x.strip()]
+            if len(parts) < 4:
+                continue
+            frame_idx, ts = int(parts[0]), float(parts[1])
+            cls, count = int(parts[2]), int(parts[3])
+            start_track = int(parts[4]) if len(parts) > 4 else 0
+            dets = [Detection(track_id=start_track + t, cls_id=cls, bbox=(10, 10, 100, 200),
+                              score=0.9, model_path="script") for t in range(count)]
+            subs, al = pipe.step(frame_idx, ts, dets)
+            _step_out(f"步: 帧{frame_idx} ts={ts:.1f} cls{cls}×{count}", subs, al, ts)
+    head = f"链路: {spec.get('name') or spec.get('description') or '未命名'}"
+    if mode:
+        head += f" | algo_mode: {mode}"
+    return res(text=head + "\n" + "\n".join(log), images=images)
+
+
 # ---------------- 模块清单（前端表单的"参数即表单"来源） ----------------
 
 PARAMS = {
@@ -948,6 +1095,22 @@ PARAMS = {
                          "help": "默认 0=人"},
         "yolo_device": {"label": "YOLO 设备（空=自动）", "type": "str", "default": "",
                         "help": "如 cpu 或 0"},
+        "vlm_feedback": {"label": "VLM 回填（把 action 喂回告警）", "type": "bool", "default": True,
+                         "help": "把大模型判定的动作喂给告警策略"},
+        "vlm_action": {"label": "回填的 VLM action", "type": "str", "default": "fire",
+                       "help": "回填时使用的动作名"},
+    },
+    "chain": {
+        # 四模式链路的通用运行器（runner=chain）：运行表单只含"驱动"参数，
+        # 链路本体（各阶段模块参数）由已完成链路 spec 的 stages 提供
+        "feed": {"label": "驱动方式", "type": "select", "default": "script",
+                 "options": ["script", "real"],
+                 "help": "script=脚本化检测输入（模拟 YOLO 检出）; real=真实图片+YOLO 推理"},
+        "script": {"label": "脚本（每行: 帧,秒,类别,数量[,起始track]）", "type": "text",
+                   "default": "0,0.0,0,2\n3,1.0,0,1\n6,3.0,0,1",
+                   "help": "small_only 驻留告警用同一起始 track 连续几行模拟驻留"},
+        "image": {"label": "测试图片（real 模式）", "type": "file", "src": "img",
+                  "help": "real 模式用的输入图片"},
         "vlm_feedback": {"label": "VLM 回填（把 action 喂回告警）", "type": "bool", "default": True,
                          "help": "把大模型判定的动作喂给告警策略"},
         "vlm_action": {"label": "回填的 VLM action", "type": "str", "default": "fire",
@@ -1161,6 +1324,11 @@ MODULES = {
         "desc": "视频帧管理 + YOLO 识别链路：抽帧决策 → YOLO 检测/跟踪 → 过滤统计，"
                "输出逐帧时间线与追踪能力评估指标（在「已完成链路」中选择并运行）。",
         "params": PARAMS["frame_yolo"], "handler": h_frame_yolo},
+    "chain": {
+        "name": "四模式链路 chain", "group": "已完成链路", "hidden": True,
+        "desc": "四模式链路的通用运行器：按 spec.stages 组装帧管理/YOLO/VLM/告警并"
+               "逐帧驱动（script 模拟 / real 真实推理）。",
+        "params": PARAMS["chain"], "handler": h_chain},
 }
 
 
@@ -1563,10 +1731,97 @@ def _frame_yolo_pipeline_spec() -> dict:
     }
 
 
+# ---- 四模式链路（方案A：small_crop/small_full 忽略 ROI 合并为 small_yolo_vlm）----
+# 每条链路带 algo_mode 顶层键（compose() 分派键）且每模式全量播种自己的模块
+# 命名配置；运行入口统一 runner=chain（h_chain 按 spec.stages 组装四模块）。
+
+def _chain_spec(algo_mode, name, description, stages, run_params) -> dict:
+    return {
+        "algo_mode": algo_mode,  # compose() 分派键：显式存，运行前按 stages 校验
+        "runner": "chain",  # 运行入口：复用 /api/test/chain 处理器
+        "run_module": "chain",  # 运行表单参数 schema 来源模块
+        "name": name,
+        "description": description,
+        "streams": 1,
+        "stages": [{"module": mid, "params": params} for mid, _name, params in stages],
+        "run_params": run_params,
+    }
+
+
+_CHAIN_RUN_PARAMS = {
+    "feed": "script",
+    "script": "0,0.0,0,2\n3,1.0,0,1\n6,3.0,0,1",  # 驻留演示：track0 在 0s/1s/3s 出现
+    "vlm_feedback": True, "vlm_action": "fire",
+}
+
+_CHAIN_FRAME_STAGE = {  # analysis 抽帧（small_* 用）
+    "sampling": "analysis", "frame_skip": 3, "interval_sec": 3.0,
+    "interval_frames": 30, "n_frames": 20, "ts_step": 1.0}
+_CHAIN_YOLO_STAGE = {  # small_* 用（ROI 统一 false，不区分 crop/full）
+    "model_path": "yolov8n.pt", "conf": 0.35, "iou": 0.7, "imgsz": 640,
+    "max_det": 300, "classes": "0", "device": "", "filter_conf": 0.0,
+    "min_short": 0, "min_long": 0, "class_limits": "0:1,300",
+    "check_interval": 3.0, "roi": False}
+_CHAIN_VLM_STAGE = {  # small_yolo_vlm / large_only 用
+    "crop_padding": 0.15, "max_resolution": "1280,720", "prompt": ""}
+_CHAIN_WINDOW_ALARM = {  # VLM 窗口确认告警
+    "kind": "window", "task_id": 1, "target_actions": "fire,fight",
+    "smooth_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 60.0}
+_CHAIN_DWELL_ALARM = {  # small_only 驻留告警（target_actions 空、smooth_frames=驻留秒数）
+    "kind": "dwell", "task_id": 1, "target_actions": "",
+    "smooth_frames": 2, "hit_ratio": 1.0, "alarm_cooldown": 60.0}
+
+_SEED_CHAIN_SMALL_ONLY_MODULES = [
+    ("frame_manager", "small_only·帧管理", dict(_CHAIN_FRAME_STAGE)),
+    ("yolo", "small_only·YOLO识别", dict(_CHAIN_YOLO_STAGE)),
+    ("alarm", "small_only·驻留告警", dict(_CHAIN_DWELL_ALARM)),
+]
+
+_SEED_CHAIN_SMALL_YOLO_VLM_MODULES = [
+    ("frame_manager", "small_yolo_vlm·帧管理", dict(_CHAIN_FRAME_STAGE)),
+    ("yolo", "small_yolo_vlm·YOLO识别", dict(_CHAIN_YOLO_STAGE)),
+    ("vlm", "small_yolo_vlm·VLM研判", dict(_CHAIN_VLM_STAGE)),
+    ("alarm", "small_yolo_vlm·告警", dict(_CHAIN_WINDOW_ALARM)),
+]
+
+_SEED_CHAIN_LARGE_ONLY_MODULES = [
+    ("frame_manager", "large_only·帧管理",
+     dict(_CHAIN_FRAME_STAGE, sampling="wall_clock")),  # 墙钟秒，interval_sec=报送节拍
+    ("vlm", "large_only·VLM研判", dict(_CHAIN_VLM_STAGE)),
+    ("alarm", "large_only·告警", dict(_CHAIN_WINDOW_ALARM)),
+]
+
+_SEED_CHAIN_NAMES = {
+    "small_only": ("small_only 小模型驻留告警",
+                   "抽帧 → YOLO 识别 → 按 track 驻留秒数告警（无大模型，对应 "
+                   "compose 的 small_only 模式）。脚本驱动：同一起始 track 连续几行模拟驻留。"),
+    "small_yolo_vlm": ("small_yolo_vlm 小模型+大模型研判",
+                       "抽帧 → YOLO 按类报送 → VLM 判定动作 → 窗口确认告警（对应 "
+                       "compose 的 small_crop/small_full，ROI 裁剪/全帧不区分）。"),
+    "large_only": ("large_only 纯大模型研判",
+                   "按墙钟秒抽帧 → 整帧送 VLM 判定 → 窗口确认告警（无小模型，对应 "
+                   "compose 的 large_only 模式）。"),
+}
+
+_SEED_CHAIN_PIPES = [
+    ("small_only", _SEED_CHAIN_SMALL_ONLY_MODULES),
+    ("small_yolo_vlm", _SEED_CHAIN_SMALL_YOLO_VLM_MODULES),
+    ("large_only", _SEED_CHAIN_LARGE_ONLY_MODULES),
+]
+
+
+def _chain_pipeline_spec(mode: str, name: str, modules: list) -> dict:
+    return _chain_spec(mode, name, _SEED_CHAIN_NAMES[mode][1], modules, _CHAIN_RUN_PARAMS)
+
+
 # 播种清单：(链路名, spec 构造器, 阶段模块配置)
 _SEED_PIPES = [
     (_SEED_PIPE_NAME, _completed_pipeline_spec, _SEED_MODULES),
     (_SEED_PIPE_YOLO_NAME, _frame_yolo_pipeline_spec, _SEED_YOLO_STAGES),
+    *[(_SEED_CHAIN_NAMES[mode][0],
+       (lambda m=mode, mods=mods: _chain_pipeline_spec(m, _SEED_CHAIN_NAMES[m][0], mods)),
+       mods)
+      for mode, mods in _SEED_CHAIN_PIPES],
 ]
 
 
