@@ -53,9 +53,9 @@
 
 | 文件 | 内容 |
 |---|---|
-| 10-decision-table.md | 链路决策表（四模式判断矩阵 / 人脸 / 监控，【待定稿】） |
-| 11-pitfalls.md | 常见坑清单 |
-| 12-verified-checklist.md | 已验证 / 未验证清单（每次交付追加） |
+| 10-decision-table.md | 链路决策表（四模式矩阵待定稿；YOLO 参数初值已实测 §1.2） |
+| 11-pitfalls.md | 常见坑清单（含 YOLO 参数调优坑） |
+| 12-verified-checklist.md | 已验证 / 未验证清单（YOLO 参数对比已录入） |
 | 13-worked-example-face.md | face-extract 先例（原 face-extract-pipeline skill 并入） |
 
 ## 维护规则
