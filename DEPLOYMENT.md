@@ -34,6 +34,26 @@
 
 ## 记录
 
+### 2026-08-12 · 新增已完成链路「帧管理-YOLO识别」+ 链路表单按模块分组折叠
+- 变更内容：`web_lab/server.py` 新增 `PARAMS["frame_yolo"]`（参数按「运行控制 / 帧管理
+  FrameManager / YOLO 识别 YOLODetector」三组分组，`group` 字段驱动前端折叠）、
+  `h_frame_yolo` 处理器（按取图节奏抽帧 → YOLO 检测 + 可选 BOTSORT 跟踪 → 过滤统计，
+  输出逐帧时间线、track 汇总与 4 张标注图）与隐藏模块 `frame_yolo`（不占侧栏/模块库）；
+  播种新增第二个 pipeline「帧管理-YOLO识别」（runner=frame_yolo，stages 引用
+  frame_manager/yolo 两模块，run_params 同 frame_yolo 参数）；pipeline spec 新增
+  `run_module` 字段，旧「视频人脸检索」无该字段时前端回退 runner。`web_lab/index.html`
+  已完成链路运行表单改为按参数 `group` 分组渲染为可折叠 `<details>`（`renderGroupedForm`），
+  运行表单 schema 由 `spec.run_module` 指定。
+- 影响面：DB、入口、配置
+- 部署注意：重启 server 后首次启动自动播种（幂等，同名校验已存在则跳过，尊重已有编辑）；
+  「帧管理-YOLO识别」表单 schema 走隐藏模块 frame_yolo，不占用设计器模块库位置；
+  参数分组与折叠纯前端渲染，无需额外部署。
+- 验证：`/api/presets?kind=pipeline` 返回两条链路（帧管理-YOLO识别 runner=frame_yolo、
+  视频人脸检索 runner=face_monitor）；`/` 页面含 renderGroupedForm（grep 命中 2 处）；
+  HTTP 冒烟实测 `POST /api/test/frame_yolo`（横幅1.MP4，读 30 帧/分析 10 帧，
+  检出 80 个=平均 8.0/帧，唯一 track 8 条全部稳定跨≥2 帧，avg 652ms/帧，
+  逐帧时间线 10 行 + track 汇总 8 行 + 4 张标注图，ok=true，7.3s）。
+
 ### 2026-08-11 · web_lab 结构重构：FaceMonitor 转为已完成链路「视频人脸检索」
 - 变更内容：`face_monitor` 模块入口改为 `hidden: True`、分组归入「已完成链路」并改名
   「视频人脸检索 FaceMonitor」，不再占用侧栏/设计器模块库位置；顶部 tab 导航删除，链路设计器

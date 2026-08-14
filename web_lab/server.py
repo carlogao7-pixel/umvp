@@ -170,6 +170,18 @@ def _draw_dets(frame, dets) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
 
 
+def _draw_tracks(frame, dets) -> None:
+    """画带 track_id 的检测框（帧管理-YOLO 链路用；有 track 橙色、无 track 绿色）。"""
+    for d in dets:
+        x1, y1, x2, y2 = d.bbox
+        color = (255, 180, 0) if d.track_id else (0, 255, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = f"t{d.track_id} c{d.cls_id} {d.score:.2f}" if d.track_id \
+            else f"c{d.cls_id} {d.score:.2f}"
+        cv2.putText(frame, label, (x1, max(y1 - 6, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+
 def _parse_vlm_action(content: str) -> str:
     """大模型可能回纯 JSON 或 ```json 包裹，取 result 字段；失败兜底正则。"""
     txt = content.strip()
@@ -649,6 +661,119 @@ def h_face_monitor(p: dict) -> dict:
     return res(text=text, images=images, tables=tables)
 
 
+def h_frame_yolo(p: dict) -> dict:
+    """帧管理 FrameManager → YOLO 识别 YOLODetector 链路的视频评测。
+
+    在固定视频上按取图节奏抽帧，每分析帧跑 YOLO 推理（可选 BOTSORT 跟踪），
+    输出逐帧时间线、track 汇总与识别/追踪能力评估指标，用于对比不同 YOLO
+    模型与参数配置的效果。
+    """
+    from pipe.composer import (
+        FrameManager, YOLODetector, SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK,
+        SAMPLING_FRAME_COUNT, filter_confidence, filter_min_size,
+    )
+    model = _find_file(p.get("model_path", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
+    fm = FrameManager(sampling=p.get("sampling", SAMPLING_ANALYSIS),
+                      frame_skip=_int(p, "frame_skip", 3),
+                      interval_sec=_float(p, "interval_sec", 3.0),
+                      interval_frames=_int(p, "interval_frames", 30))
+    filters = []
+    fc = _float(p, "filter_conf", 0.0)
+    if fc > 0:
+        filters.append(filter_confidence(fc))
+    ms, ml = _int(p, "min_short", 0), _int(p, "min_long", 0)
+    if ms > 0 or ml > 0:
+        filters.append(filter_min_size(ms, ml))
+    yolo = YOLODetector(filters=filters,
+                        class_limits=_class_limits(p.get("class_limits", "")),
+                        check_interval=_float(p, "check_interval", 3.0),
+                        roi=_bool(p, "roi"),
+                        model_path=str(model),
+                        conf=_float(p, "conf", 0.35), iou=_float(p, "iou", 0.7),
+                        imgsz=_int(p, "imgsz", 640), max_det=_int(p, "max_det", 300),
+                        classes=_int_list(p, "classes", None),
+                        device=str(p.get("device", "")).strip() or None)
+    track = _bool(p, "track")
+    vid = _find_file(p.get("video", ""), [VID_DIR])
+    if not vid:
+        return res(ok=False, error="请选择测试视频（视频必选）")
+    max_frames = _int(p, "max_frames", 0)
+    cap = cv2.VideoCapture(str(vid))
+    if not cap.isOpened():
+        cap.release()
+        return res(ok=False, error=f"无法打开视频: {vid}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    read = analyzed = total_det = total_valid = submits_total = 0
+    max_det_once = 0
+    cls_counts: dict = {}
+    track_seen: dict = {}  # track_id -> [出现过的帧号, ...]
+    infer_times = []
+    rows, images = [], []
+    n = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        n += 1
+        if max_frames and n > max_frames:
+            break
+        read += 1
+        ts = n / fps
+        if not fm.wants_frame(n, ts):
+            continue
+        analyzed += 1
+        t0 = time.time()
+        dets = yolo.infer(frame, track=track)
+        infer_times.append(time.time() - t0)
+        valid = yolo.filter_only(dets)
+        submits = yolo.process(n, ts, dets)
+        submits_total += len(submits)
+        total_det += len(dets)
+        total_valid += len(valid)
+        max_det_once = max(max_det_once, len(dets))
+        ids = {d.track_id for d in dets if d.track_id}
+        for d in dets:
+            cls_counts[d.cls_id] = cls_counts.get(d.cls_id, 0) + 1
+            if d.track_id:
+                track_seen.setdefault(d.track_id, []).append(n)
+        per_cls = " ".join(f"c{k}:{sum(1 for d in dets if d.cls_id == k)}"
+                           for k in sorted({d.cls_id for d in dets}))
+        rows.append([n, len(dets), len(valid), len(ids), len(submits), per_cls])
+        if len(images) < 4:
+            canvas = frame.copy()
+            _draw_tracks(canvas, dets)
+            if canvas.shape[1] > 1280:
+                k = 1280 / canvas.shape[1]
+                canvas = cv2.resize(canvas, (1280, int(canvas.shape[0] * k)))
+            images.append({"title": f"帧#{n} 检出 {len(dets)} 个（分析第 {analyzed} 帧）",
+                           "data": _img_data_url(canvas, 70)})
+    cap.release()
+    avg_det = total_det / max(analyzed, 1)
+    avg_ms = (sum(infer_times) / len(infer_times) * 1000) if infer_times else 0.0
+    track_len = [(t, fr) for t, fr in track_seen.items()]
+    track_len.sort(key=lambda kv: len(kv[1]), reverse=True)
+    stable = sum(1 for _t, fr in track_len if len(fr) >= 2)
+    cls_summary = ", ".join(f"cls{k}={v}" for k, v in sorted(cls_counts.items()))
+    text = "\n".join([
+        f"视频: {vid.name} | 模型: {model.name} | 跟踪: {'BOTSORT 开' if track else '关'}",
+        f"读取帧 {read} | 分析帧 {analyzed}（取图率 {analyzed / max(read, 1) * 100:.0f}%）",
+        f"检出目标 {total_det}（平均 {avg_det:.1f}/帧，单帧最多 {max_det_once} 个）",
+        f"过滤后有效 {total_valid} | 报送请求 {submits_total} | 按类累计: {cls_summary}",
+        f"唯一 track 数 {len(track_seen)}（跨≥2帧的稳定 track {stable} 个）",
+        f"平均推理耗时 {avg_ms:.0f}ms/帧（首帧含模型加载）",
+    ])
+    tables = []
+    if rows:
+        tables.append({"title": "逐帧时间线", "headers": ["帧号", "检出", "有效",
+                        "独立track", "报送", "各类别计数"], "rows": rows})
+    if track and track_len:
+        tables.append({"title": "track 汇总（按出现帧数排序）",
+                       "headers": ["track_id", "出现帧数", "首帧", "末帧", "跨度(帧)"],
+                       "rows": [[t, len(fr), fr[0], fr[-1], fr[-1] - fr[0] + 1]
+                                for t, fr in track_len]})
+    return res(text=text, images=images, tables=tables)
+
+
 # ---------------- 模块清单（前端表单的"参数即表单"来源） ----------------
 
 PARAMS = {
@@ -902,24 +1027,87 @@ PARAMS = {
                       "help": "两张脸重叠超过它算同一张，只留一张"},
     },
     "face_monitor": {
-        "video": {"label": "测试视频", "type": "file", "src": "vid",
+        "video": {"label": "测试视频", "type": "file", "src": "vid", "group": "运行控制",
                   "help": "要扫描的视频文件"},
         "db_path": {"label": "底库文件（.npz）", "type": "str", "default": "out/face_db.npz",
-                    "help": "拿视频里的人脸去比对的底库"},
-        "device": {"label": "设备", "type": "select", "default": "auto",
+                    "group": "运行控制", "help": "拿视频里的人脸去比对的底库"},
+        "device": {"label": "设备", "type": "select", "default": "auto", "group": "运行控制",
                    "options": ["auto", "cuda", "cpu"],
                    "help": "auto=自动; cuda=显卡; cpu=CPU"},
-        "frame_skip": {"label": "抽帧间隔（帧）", "type": "int", "default": 3,
-                       "help": "每隔几帧检测一次"},
-        "queue_threshold": {"label": "积压阈值", "type": "int", "default": 32,
-                            "help": "积压超过它放宽抽帧"},
-        "backpressure_multiplier": {"label": "放宽倍数", "type": "int", "default": 2,
-                                    "help": "放宽时抽帧间隔乘以几倍"},
         "max_frames": {"label": "限帧数（0=全部）", "type": "int", "default": 60,
-                       "help": "测试视频为 4K 长视频，建议先限帧"},
-        "save_dir": {"label": "命中帧保存目录", "type": "str",
+                       "group": "运行控制", "help": "测试视频为 4K 长视频，建议先限帧"},
+        "save_dir": {"label": "命中帧保存目录", "type": "str", "group": "运行控制",
                      "default": "tests/data/out/faces/monitor",
                      "help": "命中（在底库中找到的人脸）的帧图存到这里"},
+        "frame_skip": {"label": "抽帧间隔（帧）", "type": "int", "default": 3,
+                       "group": "抽帧调度", "help": "每隔几帧检测一次"},
+        "queue_threshold": {"label": "积压阈值", "type": "int", "default": 32,
+                            "group": "抽帧调度", "help": "积压超过它放宽抽帧"},
+        "backpressure_multiplier": {"label": "放宽倍数", "type": "int", "default": 2,
+                                    "group": "抽帧调度", "help": "放宽时抽帧间隔乘以几倍"},
+    },
+    "frame_yolo": {
+        # 运行控制
+        "video": {"label": "测试视频", "type": "file", "src": "vid", "group": "运行控制",
+                  "help": "要扫描的视频文件"},
+        "max_frames": {"label": "限帧数（0=全部）", "type": "int", "default": 300,
+                       "group": "运行控制", "help": "长视频建议先限帧；0=读到结尾"},
+        "device": {"label": "推理设备（空=自动）", "type": "str", "default": "",
+                   "group": "运行控制", "help": "如 cpu 或 0"},
+        "track": {"label": "启用跟踪（BOTSORT）", "type": "bool", "default": True,
+                  "group": "运行控制",
+                  "help": "开=track_id 跨帧稳定，可评估追踪能力；关=每帧独立检测"},
+        # 帧管理 FrameManager
+        "sampling": {"label": "取图节奏", "type": "select", "default": "analysis",
+                     "group": "帧管理 FrameManager",
+                     "options": ["analysis", "wall_clock", "frame_count"],
+                     "help": "analysis=随抽帧节奏; wall_clock=按墙钟秒; frame_count=按帧数"},
+        "frame_skip": {"label": "抽帧间隔（帧）", "type": "int", "default": 3,
+                       "group": "帧管理 FrameManager",
+                       "help": "每 N 帧取一张（analysis 模式用）"},
+        "interval_sec": {"label": "墙钟间隔（秒）", "type": "float", "default": 3.0,
+                         "group": "帧管理 FrameManager",
+                         "help": "每隔多少秒取一张（wall_clock 模式用）"},
+        "interval_frames": {"label": "帧数间隔（帧）", "type": "int", "default": 30,
+                            "group": "帧管理 FrameManager",
+                            "help": "每隔多少帧取一张（frame_count 模式用）"},
+        # YOLO 识别 YOLODetector
+        "model_path": {"label": "权重模型", "type": "file", "src": "model",
+                       "group": "YOLO 识别 YOLODetector",
+                       "help": "检测权重；不选则用默认 yolov8n.pt"},
+        "conf": {"label": "检出阈值 conf", "type": "float", "default": 0.35,
+                 "group": "YOLO 识别 YOLODetector",
+                 "help": "置信度低于它的框会被丢弃；调高更严格"},
+        "iou": {"label": "NMS 阈值 iou", "type": "float", "default": 0.7,
+                "group": "YOLO 识别 YOLODetector",
+                "help": "重叠超过它的重复框会合并成一个"},
+        "imgsz": {"label": "推理分辨率 imgsz", "type": "int", "default": 640,
+                  "group": "YOLO 识别 YOLODetector",
+                  "help": "送进模型的分辨率；越大越慢，小目标更清楚"},
+        "max_det": {"label": "单帧最多目标 max_det", "type": "int", "default": 300,
+                    "group": "YOLO 识别 YOLODetector",
+                    "help": "一帧最多保留多少个目标"},
+        "classes": {"label": "类别白名单（逗号分隔，空=不限）", "type": "str", "default": "0",
+                    "group": "YOLO 识别 YOLODetector",
+                    "help": "COCO: 0=人, 2=车"},
+        "filter_conf": {"label": "过滤链：置信度下限（0=不启用）", "type": "float",
+                        "default": 0.0, "group": "YOLO 识别 YOLODetector",
+                        "help": "低于它的检出直接丢弃，不参与报送"},
+        "min_short": {"label": "过滤链：短边最小像素（0=不启用）", "type": "int", "default": 0,
+                      "group": "YOLO 识别 YOLODetector",
+                      "help": "目标短边小于它就不报送"},
+        "min_long": {"label": "过滤链：长边最小像素（0=不启用）", "type": "int", "default": 0,
+                     "group": "YOLO 识别 YOLODetector",
+                     "help": "目标长边小于它就不报送"},
+        "class_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
+                         "default": "0:1,300", "group": "YOLO 识别 YOLODetector",
+                         "help": "类别:下限,上限，分号分隔；空=不报送"},
+        "check_interval": {"label": "报送节拍（秒/类）", "type": "float", "default": 3.0,
+                           "group": "YOLO 识别 YOLODetector",
+                           "help": "同一类别每隔几秒才报一次，避免刷屏"},
+        "roi": {"label": "裁剪送审（crop:cls）", "type": "bool", "default": False,
+                "group": "YOLO 识别 YOLODetector",
+                "help": "开=送该类裁剪图; 关=送全帧"},
     },
 }
 
@@ -968,6 +1156,11 @@ MODULES = {
         "name": "视频人脸检索 FaceMonitor", "group": "已完成链路", "hidden": True,
         "desc": "视频/摄像头人脸监控链路：抽帧 + 检测 + 嵌入 + 检索（在「已完成链路」中选择并运行）。",
         "params": PARAMS["face_monitor"], "handler": h_face_monitor},
+    "frame_yolo": {
+        "name": "帧管理-YOLO识别链路", "group": "已完成链路", "hidden": True,
+        "desc": "视频帧管理 + YOLO 识别链路：抽帧决策 → YOLO 检测/跟踪 → 过滤统计，"
+               "输出逐帧时间线与追踪能力评估指标（在「已完成链路」中选择并运行）。",
+        "params": PARAMS["frame_yolo"], "handler": h_frame_yolo},
 }
 
 
@@ -1297,10 +1490,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json(result)
 
 
-# ---------------- 已完成链路播种（"视频人脸检索"） ----------------
-# 视频扫描 FaceMonitor 收敛为一条已完成链路：链路 spec（kind='pipeline'，整份 JSON
-# 快照）+ 涉及模块的命名配置（kind='module'，拆列存入各模块参数表）。幂等：presets
-# 按 (kind, name) 唯一，已存在同名则不覆盖（尊重用户编辑）。
+# ---------------- 已完成链路播种（"视频人脸检索" / "帧管理-YOLO识别"） ----------------
+# 已完成链路收敛为 pipeline 类型的命名配置：链路 spec（kind='pipeline'，整份 JSON
+# 快照，含 runner 运行入口 + run_module 运行表单模块 + stages 阶段描述 + run_params
+# 默认参数）+ 涉及模块的命名配置（kind='module'，拆列存入各模块参数表）。幂等：
+# presets 按 (kind, name) 唯一，已存在同名则不覆盖（尊重用户编辑）。
 
 _SEED_PIPE_NAME = "视频人脸检索"
 _SEED_MODULES = [
@@ -1317,10 +1511,23 @@ _SEED_MODULES = [
         "db_path": "out/face_db.npz", "thresh": 0.45, "topk": 5, "device": "auto"}),
 ]
 
+_SEED_PIPE_YOLO_NAME = "帧管理-YOLO识别"
+_SEED_YOLO_STAGES = [
+    ("frame_manager", "帧管理-YOLO识别·帧管理", {
+        "sampling": "analysis", "frame_skip": 3, "interval_sec": 3.0,
+        "interval_frames": 30, "n_frames": 20, "ts_step": 1.0}),
+    ("yolo", "帧管理-YOLO识别·YOLO识别", {
+        "model_path": "yolov8n.pt", "conf": 0.35, "iou": 0.7, "imgsz": 640,
+        "max_det": 300, "classes": "0", "device": "", "filter_conf": 0.0,
+        "min_short": 0, "min_long": 0, "class_limits": "0:1,300",
+        "check_interval": 3.0, "roi": False}),
+]
+
 
 def _completed_pipeline_spec() -> dict:
     return {
         "runner": "face_monitor",  # 运行入口：复用 /api/test/face_monitor 处理器
+        "run_module": "face_monitor",  # 运行表单参数 schema 来源模块
         "description": "视频/摄像头人脸监控链路：抽帧调度 → SCRFD 人脸检测 → ArcFace "
                        "特征提取 → 底库检索命中身份。运行前先在「向量底库 FaceStore」"
                        "注册并保存底库（out/face_db.npz）。",
@@ -1334,22 +1541,53 @@ def _completed_pipeline_spec() -> dict:
     }
 
 
+def _frame_yolo_pipeline_spec() -> dict:
+    return {
+        "runner": "frame_yolo",  # 运行入口：复用 /api/test/frame_yolo 处理器
+        "run_module": "frame_yolo",  # 运行表单参数 schema 来源模块
+        "description": "帧管理 → YOLO 识别链路：按取图节奏抽帧 → YOLO 检测（可选 "
+                       "BOTSORT 跟踪）→ 过滤统计，输出逐帧时间线、track 汇总与识别/"
+                       "追踪能力评估指标。用于在固定视频上对比不同 YOLO 模型与参数"
+                       "配置的效果（如 8 人横幅视频对比各模型能稳定跟出多少条 track）。",
+        "streams": 1,
+        "stages": [{"module": mid, "params": params}
+                   for mid, _name, params in _SEED_YOLO_STAGES],
+        "run_params": {
+            "video": "", "max_frames": 300, "device": "", "track": True,
+            "sampling": "analysis", "frame_skip": 3, "interval_sec": 3.0,
+            "interval_frames": 30,
+            "model_path": "yolov8n.pt", "conf": 0.35, "iou": 0.7, "imgsz": 640,
+            "max_det": 300, "classes": "0", "filter_conf": 0.0,
+            "min_short": 0, "min_long": 0, "class_limits": "0:1,300",
+            "check_interval": 3.0, "roi": False},
+    }
+
+
+# 播种清单：(链路名, spec 构造器, 阶段模块配置)
+_SEED_PIPES = [
+    (_SEED_PIPE_NAME, _completed_pipeline_spec, _SEED_MODULES),
+    (_SEED_PIPE_YOLO_NAME, _frame_yolo_pipeline_spec, _SEED_YOLO_STAGES),
+]
+
+
 def _seed_completed_pipeline() -> None:
     """幂等播种已完成链路：链路 spec + 涉及模块命名配置。失败不影响运行。"""
     if not _DB_ENABLED:
         return
     try:
         names = {p["name"] for p in db.list_presets("pipeline")}
-        if _SEED_PIPE_NAME not in names:
-            db.save_preset("pipeline", _SEED_PIPE_NAME, "", _completed_pipeline_spec())
-            print(f"[seed] 已完成链路「{_SEED_PIPE_NAME}」已写入数据库")
+        for name, spec_fn, _mods in _SEED_PIPES:
+            if name not in names:
+                db.save_preset("pipeline", name, "", spec_fn())
+                print(f"[seed] 已完成链路「{name}」已写入数据库")
     except Exception as e:
         print(f"[seed] 播种链路失败（不影响运行）: {e}")
     try:
         have = {(p["module_id"], p["name"]) for p in db.list_presets("module")}
-        for mid, name, params in _SEED_MODULES:
-            if (mid, name) not in have:
-                db.save_preset("module", name, mid, params)
+        for _name, _spec_fn, mods in _SEED_PIPES:
+            for mid, name, params in mods:
+                if (mid, name) not in have:
+                    db.save_preset("module", name, mid, params)
     except Exception as e:
         print(f"[seed] 播种模块配置失败（不影响运行）: {e}")
 

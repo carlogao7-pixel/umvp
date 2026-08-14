@@ -26,6 +26,14 @@
   .field{margin-bottom:12px;max-width:720px}
   .field label{display:block;font-size:13px;margin-bottom:4px;color:var(--text)}
   .field .help{font-size:11px;color:var(--dim);margin-top:3px}
+  .param-group{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    margin-bottom:10px;max-width:720px}
+  .param-group summary{cursor:pointer;padding:8px 12px;font-size:13px;font-weight:600;
+    color:var(--accent);user-select:none;list-style:none}
+  .param-group summary::before{content:"▾ ";font-size:11px}
+  .param-group:not([open]) summary::before{content:"▸ "}
+  .param-group summary::-webkit-details-marker{display:none}
+  .param-group .fields{padding:2px 12px 10px}
   input[type=text],input[type=number],select,textarea{width:100%;max-width:520px;background:var(--panel2);
     border:1px solid var(--line);border-radius:6px;color:var(--text);padding:7px 9px;font-size:13px}
   textarea{font-family:ui-monospace,Consolas,monospace;font-size:12px}
@@ -366,6 +374,30 @@ function fillForm(scope, params){
     if (el.dataset.type === "bool") el.checked = !!v;
     else el.value = v === null || v === undefined ? "" : String(v);
   }
+}
+
+function renderGroupedForm(container, moduleId, values, prefix){
+  prefix = prefix || "pl";
+  const mod = SCHEMA.modules[moduleId];
+  if (!mod) return;
+  const groups = {};
+  for (const [pk, s] of Object.entries(mod.params)){
+    const g = s.group || "参数";
+    (groups[g] = groups[g] || []).push([pk, s]);
+  }
+  for (const [gname, list] of Object.entries(groups)){
+    const d = document.createElement("details");
+    d.className = "param-group"; d.open = true;
+    const sum = document.createElement("summary");
+    sum.textContent = gname;
+    d.appendChild(sum);
+    const f = document.createElement("div");
+    f.className = "fields";
+    for (const [pk, s] of list) f.appendChild(field(pk, s, prefix));
+    d.appendChild(f);
+    container.appendChild(d);
+  }
+  fillForm(container, values);
 }
 
 async function run(){
@@ -837,6 +869,7 @@ async function deletePipelinePreset(){
 // ---- 已完成链路（可从数据库载入并运行） ----
 let PIPELINES = [];
 let PL_CURRENT = null;
+let PL_RUNNER = null;   // 当前已选链路的运行入口（/api/test/<runner>）
 
 async function loadPipelines(){
   try{
@@ -882,12 +915,17 @@ function openPipeline(id){
   renderPlStages(spec.stages || []);
   const form = document.getElementById("pl-form");
   form.innerHTML = "";
-  const mod = SCHEMA.modules["face_monitor"];
-  for (const [pk, s] of Object.entries(mod.params)){
-    form.appendChild(field(pk, s, "pl"));
+  // 运行表单参数 schema 来源：spec.run_module（新播种）或回退 spec.runner（旧播种）
+  const runMod = spec.run_module || (SCHEMA.modules[spec.runner] ? spec.runner : null);
+  if (runMod){
+    renderGroupedForm(form, runMod, spec.run_params || {}, "pl");
+  }else{
+    const div = document.createElement("div");
+    div.className = "desc"; div.textContent = "（该链路未提供运行表单）";
+    form.appendChild(div);
   }
-  fillForm(form, spec.run_params || {});
-  document.getElementById("pl-run").disabled = false;
+  PL_RUNNER = spec.runner || runMod;
+  document.getElementById("pl-run").disabled = !runMod;
 }
 
 function renderPlStages(stages){
@@ -912,12 +950,13 @@ function renderPlStages(stages){
 }
 
 async function runPipeline(){
+  const runner = PL_RUNNER || "face_monitor";
   const btn = document.getElementById("pl-run");
   btn.disabled = true; btn.textContent = "运行中…（模型加载首次较慢）";
   const box = document.getElementById("pl-result");
   box.innerHTML = '<div class="loading">⏳ 运行中，请稍候…</div>';
   try{
-    const resp = await fetch("/api/test/face_monitor", {
+    const resp = await fetch("/api/test/" + runner, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({params: collect(document.getElementById("pl-form"))})
