@@ -11,7 +11,7 @@ umvp/pipe/         四模块 + compose() 装配器（FrameManager / YOLODetector
                    + crop_restore.py（CropRestore 原分辨率人脸提取链路：YOLO 识人→裁人→SCRFD 检脸→坐标还原→原图出图）
 umvp/face_detect/  SCRFD 人脸检测 + 5点对齐（FaceDetector，含 test_imgs/）
 umvp/face_embed/   ArcFace 512d 嵌入（FaceEmbedder）+ 向量底库（FaceStore，numpy 线性检索）
-umvp/face_scan/    抽帧决策（FrameScheduler）+ 人脸管道编排（FaceMonitor）
+umvp/face_scan/    人脸管道编排（FaceMonitor，复用 pipe.composer.FrameManager 取帧+背压）
 umvp/resources.py  P1 资源估算（ResourceEstimator：静态公式 + 实测指纹两层，链路聚合/多路外推/预算反推）
 models/            YOLO 选择池（v8n/s、v9t、v10s、v11n/s/m，COCO person=0/car=2；
                     放 .pt 进目录即出现在 web_lab 模型选择中）
@@ -22,7 +22,8 @@ web_lab/           可视化测试台（server.py 表单/测试/presets/资源�
 .claude/skills/    pipeline-assembly 链路拼接知识库（SKILL.md 技能入口 + INDEX.md 分层索引 +
                    knowledge/ 四层：L1 共享陈述 / L2 总装专属 / L3 组装工专属 / L4 共享经验，
                    含链路决策表【待定稿】、壳代码骨架、常见坑、face-extract 先例等）
-doc/               需求文档（业务版/开发版，含分阶段计划 P1-P4）与模块说明
+doc/               需求文档（业务版/开发版）、模块与参数手册（13 模块权威清单）、端口与启停手册、
+                   数据库结构、存储设计、链路组装Agent设计、yolo识别模块专题
 tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链路 + 视频/截图数据
 ```
 

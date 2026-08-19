@@ -34,6 +34,57 @@
 
 ## 记录
 
+### 2026-08-19 · OpenClaude 工具优先级调整：启用 GLM MCP 搜索工具，旧工具降级需确认
+- 变更内容：`/home/carloga0/.openclaude/settings.json` 权限配置调整——清空 `deny` 列表，将 `WebSearch`、`WebFetch`、`mcp__fetch__fetch` 移至 `ask` 列表（用户确认时才允许），新增 4 个 GLM MCP 服务器（zai-mcp-server/web-search-prime/web-reader/zread）无限制运行。
+- 影响面：配置（OpenClaude 全局工具优先级，影响 AI 助手网络搜索能力）
+- 部署注意：换机移植时若复用 OpenClaude 配置，需同步 settings.json；GLM MCP 工具提供更精准技术搜索，旧工具降级为备选。
+- 验证：OpenClaude MCP 状态显示 6 服务器健康；GLM 搜索测试返回精确技术文档，旧工具触发确认提示。
+
+### 2026-08-18 · 抽帧调度并入帧管理：删除 frame_scheduler 模块，帧决策统一走 FrameManager
+- 变更内容：`umvp/face_scan/frame_scheduler.py`（FrameScheduler 抽帧调度）删除，其能力
+  并入 `umvp/pipe/composer.py` 的 FrameManager（sampling=analysis 取帧 + queue/adaptive
+  两种背压：decide / budget / note_inference / reset / current_skip / relaxed /
+  relax_events 均在 FrameManager 上，`face_scan/face_monitor.py` 改为引用 FrameManager）。
+  `web_lab` 侧移除 frame_scheduler 模块注册（PARAMS/MODULES/种子），
+  `umvp/resources.py` MODULE_TYPE 移除其条目；MySQL 侧 `init_db()` 新增
+  `_prune_removed_modules` 幂等清理：先删引用其 preset 的链路步骤（fk_step_preset
+  为 RESTRICT），再删 presets 行（参数行级联），最后 DROP `preset_params_frame_scheduler`。
+- 影响面：DB（presets 中 frame_scheduler 的 `default1` 行与参数表在重启 init_db 时
+  幂等清理）、入口（frame_scheduler 从 web_lab 模块列表移除，只余 12 个模块）、
+  结构（face_scan 不再含 frame_scheduler.py，FaceMonitor 引用 FrameManager）、
+  配置（frame_manager 参数表新增 sampling/mode/scenario/queue_threshold/
+  backpressure_multiplier/max_frame_skip/adaptive_relax_ratio/adaptive_recover_ratio/fps
+  等列，由 `_ensure_module_table` 幂等 ALTER 补齐）
+- 部署注意：重启 web_lab 触发 `init_db()` 自动清理旧表与旧行，无需手工 SQL；
+  已拼链路 spec 中 stages 的 frame_manager 参数名不变（含背压字段），不兼容处仅
+  frame_scheduler 模块本身的下线
+- 验证：`conda run -n ai python umvp/pipe/test_composer.py`（27 断言）、
+  `conda run -n ai python umvp/face_scan/test_face_scan.py`、SQL 查
+  `preset_params_frame_scheduler` 不存在且 presets 无 frame_scheduler 行、
+  frame_manager 参数表新列齐全（见 tests/test_chain_runner.py 21 断言）
+
+### 2026-08-17 · 删除 3 条四模式链路种子，链路统一走拼接；修复 h_chain 视频驱动双重采样
+- 变更内容：`web_lab/server.py` 的 3 条四模式链路种子（small_only 小模型驻留告警 /
+  small_yolo_vlm 小模型+大模型研判 / large_only 纯大模型研判）及其模板
+  （_SEED_CHAIN_* / _chain_pipeline_spec 等）全部删除，`_SEED_PIPES` 仅剩两条旧链路
+  （视频人脸检索 / 帧管理-YOLO识别）；`_chain_from_spec` 装配器、`_ALGO_EXPECT` 校验表、
+  `PARAMS["chain"]`、h_chain 视频驱动保留（后续替代链路仍走 runner=chain 拼接）。
+  同时修复 h_chain 视频驱动双重采样 bug：帧决策先行 `wants_frame` 门控后调
+  `pipe.step()` 会再采样一次（wall_clock/frame_count 等有状态采样第二次返回 False
+  导致 large_only 只分析 1 帧/报送 0 条），改为 `pipe.step(..., force=True)` 跳过
+  step 内重复采样。`tests/test_chain_runner.py` 相应改写为自拼 spec（仅校验断言 +
+  驱动断言，21 断言，不再依赖已删除的种子）。
+- 影响面：DB（presets 删除 3 条 kind=pipeline 链路 + 10 条「*·*」module 行，参数表
+  由外键级联清理）、配置（模式概念改为统一链路拼接重建）、入口（无新增/删除接口）
+- 部署注意：重启 web_lab 不再播种这 3 条链路；旧库中残留行需手工删除（本次执行时
+  已删，现 presets 仅剩 default1 + 两条旧链路及其 module 行，无孤儿参数行）；替代
+  链路后续用 .claude/skills/pipeline-assembly 拼接重建（runner=chain + stages，
+  run_params 用 video/max_frames/vlm_feedback/vlm_action）。
+- 验证：`conda run -n ai python tests/test_chain_runner.py`（21 断言通过）；
+  `curl /api/presets?kind=pipeline` 仅返回两条旧链路；SQL 查 presets 无 3 条模式链路、
+  孤儿参数行 0；h_chain 视频驱动实测 wall_clock 采样报送 1 条（修复前为 0）、
+  frame_count 按间隔报送、small_only 驻留告警触发 dwell:0。
+
 ### 2026-08-14 · 已完成链路新增四模式运行器（runner=chain）
 - 变更内容：`web_lab/server.py` 新增 `PARAMS["chain"]`（feed=script/real 驱动、
   VLM 回填 action）与隐藏模块 `chain`（按 spec.stages 组装四模块实例的通用运行器

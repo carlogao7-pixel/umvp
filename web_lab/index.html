@@ -186,8 +186,6 @@
       <p id="pl-desc" class="desc"></p>
     </header>
     <div id="pl-stages"></div>
-    <h3 id="pl-stage-title" style="font-size:14px;margin:20px 0 4px;color:var(--accent)" hidden>阶段参数（模块级，可调整）</h3>
-    <div id="pl-stage-forms" hidden></div>
     <h3 style="font-size:14px;margin:20px 0 4px;color:var(--accent)">运行参数（可调整，视频必选）</h3>
     <form id="pl-form"></form>
     <button id="pl-run" disabled>运行测试</button>
@@ -489,7 +487,7 @@ function switchView(name){
   if (name === "db") loadDbTables();
 }
 
-// ---- 数据库数据浏览（只读快照，见 doc/配置参数列式化存储设计.md §4）----
+// ---- 数据库数据浏览（只读快照，见 doc/存储设计.md 第一部分）----
 
 let _dbTablesLoaded = false;
 async function loadDbTables(){
@@ -916,17 +914,23 @@ function openPipeline(id){
   document.getElementById("pl-title").textContent = p.name;
   document.getElementById("pl-desc").textContent = spec.description || "";
   renderPlStages(spec.stages || []);
-  renderPlStageForms(spec);
   const form = document.getElementById("pl-form");
   form.innerHTML = "";
-  // 运行表单参数 schema 来源：spec.run_module（新播种）或回退 spec.runner（旧播种）
-  const runMod = spec.run_module || (SCHEMA.modules[spec.runner] ? spec.runner : null);
-  if (runMod){
-    renderGroupedForm(form, runMod, spec.run_params || {}, "pl");
+  let runMod = null;
+  if (spec.runner === "chain"){
+    // chain 链路：运行表单=运行控制(视频输入)+各阶段参数，与旧链路一致
+    renderChainRunForm(form, spec);
+    runMod = spec.run_module || "chain";
   }else{
-    const div = document.createElement("div");
-    div.className = "desc"; div.textContent = "（该链路未提供运行表单）";
-    form.appendChild(div);
+    // 运行表单参数 schema 来源：spec.run_module（新播种）或回退 spec.runner（旧播种）
+    runMod = spec.run_module || (SCHEMA.modules[spec.runner] ? spec.runner : null);
+    if (runMod){
+      renderGroupedForm(form, runMod, spec.run_params || {}, "pl");
+    }else{
+      const div = document.createElement("div");
+      div.className = "desc"; div.textContent = "（该链路未提供运行表单）";
+      form.appendChild(div);
+    }
   }
   PL_RUNNER = spec.runner || runMod;
   PL_SPEC = spec;
@@ -954,16 +958,24 @@ function renderPlStages(stages){
   box.appendChild(wrap);
 }
 
-// runner=chain 的链路：阶段参数由 _chain_from_spec 从 spec.stages[].params 读取，
-// 这里把每个阶段渲染成可编辑表单（模块 schema 驱动），运行前合并回 spec。
-// 其它 runner（face_monitor / frame_yolo 等）阶段仅供展示，不改动。
-function renderPlStageForms(spec){
-  const title = document.getElementById("pl-stage-title");
-  const box = document.getElementById("pl-stage-forms");
-  box.innerHTML = "";
-  const stages = spec.runner === "chain" ? (spec.stages || []) : [];
-  title.hidden = box.hidden = stages.length === 0;
-  stages.forEach((s, i) => {
+// 把模块 schema 的参数平铺渲染到容器（无分组嵌套），值回填用 fillForm。
+function renderModuleFields(container, moduleId, values, prefix){
+  const mod = SCHEMA.modules[moduleId];
+  if (!mod) return;
+  for (const [pk, s] of Object.entries(mod.params)){
+    container.appendChild(field(pk, s, prefix));
+  }
+  fillForm(container, values);
+}
+
+// runner=chain 的链路：运行表单 = 「运行控制(视频输入) + 各阶段模块参数」并入一个表单，
+// 与旧链路（face_monitor / frame_yolo）结构一致。阶段参数由 _chain_from_spec 从
+// spec.stages[].params 读取，运行前前端把各阶段表单当前值合并回 spec。
+function renderChainRunForm(form, spec){
+  // 运行控制组：视频输入 + 限帧 + VLM 回填（chain 模块 schema，group=运行控制）
+  renderGroupedForm(form, "chain", spec.run_params || {}, "pl");
+  // 各阶段模块参数：每个阶段一个组，直接平铺该模块的字段
+  (spec.stages || []).forEach((s, i) => {
     const m = SCHEMA.modules[s.module];
     if (!m) return;
     const d = document.createElement("details");
@@ -974,8 +986,8 @@ function renderPlStageForms(spec){
     const inner = document.createElement("div");
     inner.className = "fields"; inner.id = "pl-stage-" + i;
     d.appendChild(inner);
-    box.appendChild(d);
-    renderGroupedForm(inner, s.module, s.params || {}, "ps" + i);
+    form.appendChild(d);
+    renderModuleFields(inner, s.module, s.params || {}, "ps" + i);
   });
 }
 
@@ -993,11 +1005,12 @@ async function runPipeline(){
       const box = document.getElementById("pl-stage-" + i);
       if (box) s.params = Object.assign({}, s.params || {}, collect(box));
     });
+    const params = collect(document.getElementById("pl-form"));
+    if (runner === "chain") params.feed = "video";  // chain 链路统一真实视频驱动
     const resp = await fetch("/api/test/" + runner, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({params: Object.assign(collect(document.getElementById("pl-form")),
-                                                  {spec: spec})})
+      body: JSON.stringify({params: Object.assign(params, {spec: spec})})
     });
     renderResult(await resp.json(), box);
   }catch(e){

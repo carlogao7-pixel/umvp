@@ -3,7 +3,7 @@
 模块化管道拼接器（重构版）：四模块 + 装配器
 
 按"参数归属模块"重构（用户确认的分工）:
-  1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压（复用 FrameScheduler）
+  1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压（原 FrameScheduler 并入）
   2. YOLODetector  小模型识别 —— 推理参数可调(conf/iou/imgsz/max_det/classes/device) +
                      可插拔过滤链(顺序自定义) + 按识别类型(类别)报送 + 每类数量上下限
   3. VLMAnalyzer   大模型研判 —— 素材准备(crop_padding/缩放/prompt) + 推理
@@ -20,7 +20,7 @@ YOLO 输出粒度（用户定义，2026-08-04 改）:
   说明: per_track（按目标独立报送）已删除；驻留告警(dwell)仍按 track 记首次出现，
         但那是告警策略内部逻辑，不产生报送请求。
 
-依赖: 仅 face_scan.frame_scheduler（复用抽帧+背压）
+依赖: 纯 Python（抽帧+背压已在 FrameManager 内部，不再依赖 face_scan）
 """
 
 from __future__ import annotations
@@ -28,8 +28,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
-
-from face_scan.frame_scheduler import FrameScheduler
 
 _NEG_INF = -1e18  # 首见必送：模拟 spaz 以 unix 时间戳减 0 的语义
 
@@ -75,23 +73,60 @@ SAMPLING_FRAME_COUNT = "frame_count"  # 按帧数（temporal: check_interval × 
 
 @dataclass
 class FrameManager:
-    """取图节奏决策。sampling 决定"按什么取图"，与"为什么取图"解耦。"""
+    """取图节奏决策（2026-08-18 并入原 face_scan.frame_scheduler 的抽帧+背压）。
+
+    sampling 决定"按什么取图"，与"为什么取图"解耦：
+      analysis    —— 随抽帧节奏：每 frame_skip 帧取一张；积压(队列深度)或推理耗时
+                      超过预算时自动放宽抽帧间隔（背压），消化后恢复基础间隔
+      wall_clock  —— 按墙钟秒：每隔 interval_sec 秒取一张
+      frame_count —— 按帧数：每隔 interval_frames 帧取一张
+    """
 
     sampling: str = SAMPLING_ANALYSIS
-    frame_skip: int = 3  # analysis: 抽帧间隔（= extract_frame_rate）
+    frame_skip: int = 3  # analysis: 基础抽帧间隔（= extract_frame_rate）
     interval_sec: float = 3.0  # wall_clock: 秒
     interval_frames: int = 30  # frame_count: 帧数
-    scheduler: Optional[FrameScheduler] = None  # 复用抽帧+背压模块
+    # ---- 背压（原 FrameScheduler 参数，仅 analysis 模式生效） ----
+    queue_threshold: int = 32  # 队列模式：积压深度超过此值触发放宽
+    backpressure_multiplier: int = 2  # 放宽时跳帧间隔放大倍数
+    max_frame_skip: Optional[int] = None  # 放宽上限，默认 base * multiplier * 4
+    adaptive_relax_ratio: float = 1.2  # 自适应：耗时 > 预算 * 此值 -> 放宽
+    adaptive_recover_ratio: float = 0.5  # 自适应：耗时 < 预算 * 此值 -> 恢复
 
     def __post_init__(self) -> None:
-        self.scheduler = self.scheduler or FrameScheduler(frame_skip=self.frame_skip)
+        self.base_skip = max(1, int(self.frame_skip))
+        self.max_skip = self.max_frame_skip or self.base_skip * self.backpressure_multiplier * 4
+        self._skip = self.base_skip
+        self._relaxed = False
+        self._relax_events = 0
+        self._ema_cost = 0.0
         self._last_wall = _NEG_INF
         self._last_frame = _NEG_INF
 
-    def wants_frame(self, frame_idx: int, ts: float) -> bool:
-        """第 frame_idx 帧（时刻 ts）是否需要取图分析。"""
+    # ---------------- 查询状态（analysis 背压） ----------------
+    @property
+    def current_skip(self) -> int:
+        """当前生效的抽帧间隔（积压放宽时会大于 base_skip）。"""
+        return self._skip
+
+    @property
+    def relaxed(self) -> bool:
+        """是否正处于放宽状态。"""
+        return self._relaxed
+
+    @property
+    def relax_events(self) -> int:
+        """累计触发放宽的次数。"""
+        return self._relax_events
+
+    # ---------------- 帧决策 ----------------
+    def wants_frame(self, frame_idx: int, ts: float, pending: Optional[int] = None) -> bool:
+        """第 frame_idx 帧（时刻 ts）是否需要取图分析。
+
+        pending 仅在 analysis 模式下生效（队列积压深度），None 走自适应/纯抽帧。
+        """
         if self.sampling == SAMPLING_ANALYSIS:
-            return self.scheduler.decide(frame_idx, pending=None)
+            return self.decide(frame_idx, pending=pending)
         if self.sampling == SAMPLING_WALL_CLOCK:
             if ts - self._last_wall >= self.interval_sec:
                 self._last_wall = ts
@@ -103,6 +138,58 @@ class FrameManager:
                 return True
             return False
         return False
+
+    def decide(self, frame_count: int, pending: Optional[int] = None) -> bool:
+        """analysis 模式决策（原 FrameScheduler.decide）。
+
+        pending 非 None 时为队列模式：积压超过 queue_threshold 则放大间隔，
+        否则用基础间隔；pending=None 时为自适应/纯抽帧（由 note_inference
+        维护的耗时统计驱动放宽）。
+        """
+        if pending is not None:
+            if pending > self.queue_threshold:
+                self._set_skip(min(self.base_skip * self.backpressure_multiplier, self.max_skip), relax=True)
+            else:
+                self._set_skip(self.base_skip)
+        return frame_count % self._skip == 0
+
+    def budget(self, source_fps: float) -> float:
+        """帧间隔预算（秒）：按当前抽帧间隔，两帧分析之间的可用时间。"""
+        return self._skip / source_fps if source_fps > 0 else 0.0
+
+    # ---------------- 自适应模式的耗时反馈 ----------------
+    def note_inference(self, cost_sec: float, budget_sec: float) -> None:
+        """报告一次推理耗时（秒），自适应模式下据此调整抽帧间隔。
+
+        - cost > budget * adaptive_relax_ratio   : 处理不过来，放宽（间隔放大 multiplier 倍）
+        - cost < budget * adaptive_recover_ratio : 很轻松，逐步恢复基础间隔
+        """
+        if cost_sec < 0:
+            return
+        self._ema_cost = 0.8 * self._ema_cost + 0.2 * cost_sec if self._ema_cost else cost_sec
+        if budget_sec <= 0:
+            return
+        if self._ema_cost > budget_sec * self.adaptive_relax_ratio:
+            self._set_skip(min(self._skip * self.backpressure_multiplier, self.max_skip), relax=True)
+        elif self._ema_cost < budget_sec * self.adaptive_recover_ratio and self._skip > self.base_skip:
+            self._set_skip(max(self.base_skip, self._skip // self.backpressure_multiplier))
+
+    def reset(self) -> None:
+        """回到初始状态（新视频流开始前调用）。"""
+        self._skip = self.base_skip
+        self._relaxed = False
+        self._ema_cost = 0.0
+        self._last_wall = _NEG_INF
+        self._last_frame = _NEG_INF
+
+    # ---------------- 内部 ----------------
+    def _set_skip(self, skip: int, relax: bool = False) -> None:
+        skip = max(1, min(skip, self.max_skip))
+        if skip != self._skip:
+            if relax:
+                self._relax_events += 1
+            self._skip = skip
+            self._relaxed = self._skip > self.base_skip
 
 
 # ---------------- 模块 2: YOLO 识别 ----------------
@@ -344,14 +431,15 @@ class Pipeline:
     infer: Optional[Callable[[dict], str]] = None  # 外部 VLM 推理回调
 
     def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
-             frame=None):
+             frame=None, force: bool = False):
         """处理一帧。返回 (submits, alarms)。
         dets 由拼接层在 wants_frame 为真时做 YOLO 推理提供（无 YOLO 的模式传 None）；
         不传 dets 但配置了 yolo 时，传 frame 由模块自推理（dwell 用 track=True 保持
-        track_id 稳定，其它模式 track=False）。测试只需配置 spec 调参即可。"""
+        track_id 稳定，其它模式 track=False）。force=True 时跳过帧决策检查——
+        供调用方已先行 wants_frame() 门控（如 h_chain 视频驱动）避免重复采样。"""
         submits: List[SubmitRequest] = []
         alarms: List[AlarmEvent] = []
-        if not self.frame.wants_frame(frame_idx, ts):
+        if not force and not self.frame.wants_frame(frame_idx, ts):
             return submits, alarms
         if dets is None and self.yolo is not None and frame is not None:
             dets = self.yolo.infer(frame, track=(self.alarm.kind == ALARM_DWELL))

@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-四模式链路运行器（web_lab runner=chain）纯逻辑验证
+链路运行器（web_lab runner=chain）纯逻辑验证
 
-web_lab 把"已完成链路"按模块链路（stages）存进 presets(kind=pipeline)：
-每个 spec 带显式 algo_mode（compose() 分派键），运行前由 _chain_from_spec 按
-stages 组装四模块实例并校验结构与 algo_mode 一致。本测试：
+web_lab 把"已完成链路"按模块链路（stages）存进 presets(kind=pipeline)，
+运行前由 _chain_from_spec 按 stages 组装 Pipeline 实例；spec 若带 algo_mode
+顶层键则按 _ALGO_EXPECT 校验结构与模式一致。本测试（自拼 spec，不依赖播种）：
 
-  1. 播种断言 —— 3 条四模式链路种子（small_only / small_yolo_vlm / large_only）
-     存在于 server._SEED_PIPES，阶段模块序列与 run_params 正确；
-  2. 装配断言 —— _chain_from_spec 对 3 条种子 spec 产出正确的 Pipeline
-     （模块有无、告警 kind、抽帧节奏、YOLO 参数透传），全部不加载模型；
-  3. 校验断言 —— 未知 algo_mode / stages 与 algo_mode 不一致 / 缺必需阶段
+  1. 校验断言 —— 未知 algo_mode / stages 与 algo_mode 不一致 / 缺必需阶段
      都抛 ValueError；
-  4. 驱动断言 —— 直接喂合成 Detection 驱动 Pipeline.step：
+  2. 驱动断言 —— 直接喂合成 Detection 驱动 Pipeline.step：
      small_only 按 track 驻留告警、small_yolo_vlm 按类报送+VLM 回填窗口告警、
      large_only 按墙钟秒送整帧，含冷却抑制与 action 命中判定。
+
+2026-08-17：原"播种断言/装配断言"部分随 3 条四模式种子链路（small_only /
+small_yolo_vlm / large_only）从 _SEED_PIPES 与 SQL 移除而删除；链路改由
+链路拼接方式重建后，本文件仅验证保留的 _chain_from_spec 装配与驱动逻辑。
 
 运行: ai 环境 python tests/test_chain_runner.py
 """
@@ -47,19 +47,6 @@ def det(track: int = 0, cls: int = 0, score: float = 0.9,
     return Detection(track_id=track, cls_id=cls, bbox=tuple(box), score=score)
 
 
-CHAIN_NAMES = ("small_only 小模型驻留告警",
-               "small_yolo_vlm 小模型+大模型研判",
-               "large_only 纯大模型研判")
-
-
-def chain_seed(name: str) -> tuple:
-    """按链路名从 _SEED_PIPES 取 (name, build, modules)。"""
-    for n, build, mods in server._SEED_PIPES:
-        if n == name:
-            return n, build, mods
-    raise AssertionError(f"种子链路缺失: {name}")
-
-
 def chain_spec(algo_mode: str, stages: list) -> dict:
     """构造最小链路 spec（供驱动测试自拼）。stages 为 (module, params) 对。"""
     return {
@@ -68,46 +55,7 @@ def chain_spec(algo_mode: str, stages: list) -> dict:
     }
 
 
-# ================= 1. 播种断言 =================
-for name in CHAIN_NAMES:
-    n, build, mods = chain_seed(name)
-    spec = build()
-    ok(spec["algo_mode"] in ("small_only", "small_yolo_vlm", "large_only"),
-       f"[1] {name}: algo_mode={spec['algo_mode']}")
-    ok([s["module"] for s in spec["stages"]] == [m[0] for m in mods],
-       f"[1] {name}: stages 模块序列一致")
-    ok(spec["runner"] == "chain" and spec["run_module"] == "chain",
-       f"[1] {name}: runner/run_module=chain")
-    ok(spec["run_params"]["feed"] == "script", f"[1] {name}: run_params 带 script 驱动")
-    ok(len({n for n, _, _ in server._SEED_PIPES}) == len(server._SEED_PIPES),
-       f"[1] {name}: 链路名不重复")
-
-# ================= 2. 装配断言（不加载模型） =================
-spec = chain_seed(CHAIN_NAMES[0])[1]()
-pipe = server._chain_from_spec(spec)
-ok(pipe.yolo is not None and pipe.vlm is None, "[2] small_only: 有 yolo 无 vlm")
-ok(pipe.alarm.kind == ALARM_DWELL, "[2] small_only: 告警 kind=dwell")
-ok(pipe.frame.sampling == SAMPLING_ANALYSIS, "[2] small_only: 抽帧节奏=analysis")
-ok(pipe.alarm.smooth_frames == 2, "[2] small_only: 驻留秒数阈值=2")
-ok(pipe.yolo.class_limits == {0: (1, 300)}, "[2] small_only: class_limits 透传")
-ok(pipe.yolo.roi is False, "[2] small_only: roi=false")
-
-spec = chain_seed(CHAIN_NAMES[1])[1]()
-pipe = server._chain_from_spec(spec)
-ok(pipe.yolo is not None and pipe.vlm is not None, "[2] small_yolo_vlm: 有 yolo+vlm")
-ok(pipe.alarm.kind == ALARM_WINDOW, "[2] small_yolo_vlm: 告警 kind=window")
-ok(pipe.alarm.target_actions == ["fire", "fight"], "[2] small_yolo_vlm: target_actions 透传")
-ok(pipe.yolo.model_path.endswith("yolov8n.pt"), "[2] small_yolo_vlm: 默认模型 yolov8n")
-ok(pipe.yolo.conf == 0.35 and pipe.yolo.imgsz == 640, "[2] small_yolo_vlm: 推理参数透传")
-ok(pipe.vlm.max_resolution == (1280, 720), "[2] small_yolo_vlm: max_resolution 透传")
-
-spec = chain_seed(CHAIN_NAMES[2])[1]()
-pipe = server._chain_from_spec(spec)
-ok(pipe.yolo is None and pipe.vlm is not None, "[2] large_only: 无 yolo 有 vlm")
-ok(pipe.frame.sampling == SAMPLING_WALL_CLOCK, "[2] large_only: 抽帧节奏=wall_clock")
-ok(pipe.alarm.kind == ALARM_WINDOW, "[2] large_only: 告警 kind=window")
-
-# ================= 3. 校验断言 =================
+# ================= 1. 校验断言 =================
 def expect_raise(spec: dict, frag: str) -> None:
     try:
         server._chain_from_spec(spec)
@@ -123,7 +71,7 @@ expect_raise(chain_spec("small_only", stages_ok), "不一致")
 expect_raise(chain_spec("small_yolo_vlm", [("yolo", {}), ("vlm", {}), ("alarm", {})]),
              "缺少必需阶段")
 
-# ================= 4. 驱动断言（合成检测，无模型） =================
+# ================= 2. 驱动断言（合成检测，无模型） =================
 # --- small_only: 驻留告警 + 冷却 ---
 spec = chain_spec("small_only", [
     ("frame_manager", {"sampling": "analysis", "frame_skip": 1}),

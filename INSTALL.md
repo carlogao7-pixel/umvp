@@ -26,8 +26,7 @@ umvp/                                ← 项目根（独立部署包）
 │   │   ├── face_store.py            ← 向量底库：注册/检索/持久化（numpy 线性检索）
 │   │   └── test_face_embed.py       ← 底库注册/查询/自检（--register-dir/--query/--self-check）
 │   └── face_scan/
-│       ├── frame_scheduler.py       ← 抽帧决策器（积压自动放宽，双模式）
-│       ├── face_monitor.py          ← 人脸管道编排（流/视频/摄像头）
+│       ├── face_monitor.py          ← 人脸管道编排（流/视频/摄像头；取帧+背压复用 pipe.composer.FrameManager）
 │       └── test_face_scan.py        ← 视频人脸扫描验证
 ├── models/                        ← YOLO 模型选择池（web_lab 前端自动列出，COCO person=0/car=2）
 │   ├── yolov8n.pt                 ← v8 轻量档（默认，CPU 单帧 ~0.2s）
@@ -51,7 +50,7 @@ umvp/                                ← 项目根（独立部署包）
 ```
 
 依赖关系（模块 → 第三方库）：
-- `pipe/composer.py` → 仅 `face_scan.frame_scheduler`（纯 Python，无第三方）
+- `pipe/composer.py` → 纯 Python（抽帧+背压已内置于 FrameManager，无第三方依赖）
 - `face_detect/face_detector.py` → insightface + onnxruntime + numpy + cv2
 - `face_embed/face_embedder.py` → insightface + onnxruntime + numpy
 - `face_embed/face_store.py` → 仅 numpy

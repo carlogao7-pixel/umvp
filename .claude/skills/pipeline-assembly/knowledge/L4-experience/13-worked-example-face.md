@@ -112,7 +112,7 @@ for f in faces:                       # f.face_img = 原分辨率人脸图
 
 ## 未验证场景（WIP，先记录，别当已支持）
 
-- [ ] 视频流/抽帧链路（FrameScheduler 接入，而非静态图）
+- [ ] 视频流/抽帧链路（FrameManager 接入，而非静态图）
 - [ ] 大规模图片吞吐与内存（当前逐张处理）
 - [ ] 超分模型接入（Real-ESRGAN 级）替代 cv2 放大，以及 4x+ 放大的收益边界
 - [ ] 批处理 detect_batch 的收益验证

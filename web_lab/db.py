@@ -3,7 +3,7 @@
 
 职责：把各模块/链路的命名配置（preset）存进 MySQL，供前端"命名暂存/取用"。
 
-存储模型（2026-08-10 起，详见 doc/配置参数列式化存储设计.md）:
+存储模型（2026-08-10 起，详见 doc/存储设计.md）:
   - presets 保留为"注册表"：id / kind / name / module_id / 时间戳；
   - 每个模块（module_id，如 yolo/vlm）一张参数表 preset_params_<module_id>，
     参数从 JSON 展开为类型化列（由 server.py 启动时 configure_modules 注册 schema）；
@@ -46,7 +46,7 @@ _CFG = {
 _conn = None  # 惰性连接
 
 # 模块参数 schema：module_id -> {参数名: 参数类型}。由 server.py 启动时 configure_modules 注册，
-# db 据此建参数表 / 类型强转（设计见 doc/配置参数列式化存储设计.md）。
+# db 据此建参数表 / 类型强转（设计见 doc/存储设计.md）。
 _SCHEMAS: dict[str, dict[str, str]] = {}
 
 # 参数类型 -> 列类型（类型映射见设计文档 §2.3）
@@ -62,6 +62,10 @@ _SQL_TYPES = {
 
 # 模块标识 / 参数名白名单（防表名/列名注入）
 _MODULE_ID_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+
+# 已下线模块（从产品移除）：init_db 时幂等清理其参数表与 presets 行。
+# 2026-08-18: frame_scheduler 抽帧调度并入 frame_manager（帧管理），模块合并。
+_PRUNED_MODULES = {"frame_scheduler"}
 
 
 def _get_conn():
@@ -101,7 +105,7 @@ _DDLS = [
   UNIQUE KEY uk_kind_name (kind, name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
     # 链路拼装：链路自身字段（streams/budget/meta）+ 有序步骤引用模块 preset
-    # （设计见 doc/链路拼装存储设计.md）
+    # （设计见 doc/存储设计.md）
     """CREATE TABLE IF NOT EXISTS pipelines (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(64) NOT NULL,
@@ -161,6 +165,7 @@ def init_db() -> None:
         for module_id, schema in _SCHEMAS.items():
             _ensure_module_table(cur, module_id, schema)
         _migrate_legacy_module_params(cur)
+        _prune_removed_modules(cur)
 
 
 def _ensure_module_table(cur, module_id: str, schema: dict[str, str]) -> None:
@@ -197,6 +202,25 @@ def _migrate_legacy_module_params(cur) -> None:
         _upsert_module_params(cur, _module_table(module_id), rid,
                               _coerce_params(params, schema))
         cur.execute("UPDATE presets SET params_json='' WHERE id=%s", (rid,))
+
+
+def _prune_removed_modules(cur) -> None:
+    """清理已下线模块（从产品移除）：删其 presets 行与参数表，幂等。
+
+    顺序：先删引用这些 preset 的链路步骤（fk_step_preset 为 RESTRICT，直接删
+    presets 会因被引用而失败），再删 presets 行（参数表行靠 ON DELETE CASCADE
+    级联清掉），最后 DROP 参数表。全程幂等：无行/无表时自然跳过。
+    """
+    if not _PRUNED_MODULES:
+        return
+    for mid in _PRUNED_MODULES:
+        if not _MODULE_ID_RE.match(mid):
+            continue
+        cur.execute("DELETE ps FROM pipeline_steps ps"
+                    " JOIN presets p ON ps.preset_id = p.id"
+                    " WHERE p.kind='module' AND p.module_id=%s", (mid,))
+        cur.execute("DELETE FROM presets WHERE kind='module' AND module_id=%s", (mid,))
+        cur.execute(f"DROP TABLE IF EXISTS `{_module_table(mid)}`")
 
 
 # ---------------- 值转换（保存强转 / 读取还原） ----------------

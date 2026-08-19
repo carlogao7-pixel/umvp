@@ -151,7 +151,7 @@ _STATIC_LATENCY_CPU_MS = {
     "arcface": 10.0,         # ArcFace 单张 CPU
     "facestore_query": 1.0,  # 千级底库检索 <1ms
     "vlm": 0.0,              # 本地只做素材准备；真实推理=远端延迟，标注依赖实测
-    "logic": 0.0,            # 抽帧调度/告警策略，纯逻辑
+    "logic": 0.0,            # 帧管理/告警策略，纯逻辑
 }
 
 # GPU 基线：CLAUDE.md 实测 YOLO GPU ~0.02s/帧；SCRFD/ArcFace 按 CPU 的 8~20 倍加速粗估
@@ -200,7 +200,6 @@ class ResourceEstimator:
 
     # web_lab 模块 id → 资源类型
     MODULE_TYPE = {
-        "frame_scheduler": TYPE_LOGIC,
         "frame_manager": TYPE_LOGIC,
         "yolo": TYPE_YOLO,
         "vlm": TYPE_VLM,

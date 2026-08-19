@@ -244,53 +244,49 @@ def h_frame_manager(p: dict) -> dict:
     sm = p.get("sampling", SAMPLING_ANALYSIS)
     fm = FrameManager(sampling=sm, frame_skip=_int(p, "frame_skip", 3),
                       interval_sec=_float(p, "interval_sec", 3.0),
-                      interval_frames=_int(p, "interval_frames", 30))
+                      interval_frames=_int(p, "interval_frames", 30),
+                      queue_threshold=_int(p, "queue_threshold", 32),
+                      backpressure_multiplier=_int(p, "backpressure_multiplier", 2),
+                      max_frame_skip=_int(p, "max_frame_skip", 0) or None,
+                      adaptive_relax_ratio=_float(p, "adaptive_relax_ratio", 1.2),
+                      adaptive_recover_ratio=_float(p, "adaptive_recover_ratio", 0.5))
     n = _int(p, "n_frames", 20)
     step = _float(p, "ts_step", 1.0)
+    fps = _float(p, "fps", 25.0)
+    mode = p.get("mode", "queue")  # analysis 模式的背压模拟：queue / adaptive
+    scen = p.get("scenario", "平稳")
     takes = 0
     lines = []
+    bp_rows = []
     for i in range(n):
         ts = round(i * step, 2)
-        want = fm.wants_frame(i, ts)
+        pending = None
+        want = False
+        if sm == SAMPLING_ANALYSIS:
+            if mode == "queue":
+                base, wave = 5, 40
+                pending = wave if (scen == "积压浪涌" and 10 <= i <= 15) else base
+            want = fm.wants_frame(i, ts, pending=pending)
+            if mode == "adaptive" and want:
+                cost = (0.1 + 0.5 * i / max(n - 1, 1)) if scen == "耗时渐增" else 0.08
+                fm.note_inference(cost, fm.budget(fps))
+            bp_rows.append([i, "" if pending is None else pending, want,
+                            fm.current_skip, fm.relaxed])
+        else:
+            want = fm.wants_frame(i, ts)
         takes += int(want)
         lines.append(f"帧 {i:>3}  ts={ts:>7.2f}s  →  {'● 取图' if want else '○ 跳过'}")
+    if sm == SAMPLING_ANALYSIS:
+        head = (f"取图节奏: {sm}({mode}) | 场景: {scen} | 共 {n} 帧, 取图 {takes} 帧 "
+                f"({takes / max(n, 1) * 100:.0f}%) | 放宽次数: {fm.relax_events}")
+        table = {"title": "帧决策时间线（抽帧 + 背压）",
+                 "headers": ["帧", "积压深度", "分析?", "当前间隔", "放宽中"],
+                 "rows": [[r[0], r[1], "✓" if r[2] else "·", r[3], "✓" if r[4] else ""]
+                          for r in bp_rows]}
+        return res(text=head + "\n" + "\n".join(lines), tables=[table])
     text = (f"取图节奏: {sm} | 共 {n} 帧, 取图 {takes} 帧 ({takes / max(n, 1) * 100:.0f}%)\n"
             + "\n".join(lines))
     return res(text=text)
-
-
-def h_frame_scheduler(p: dict) -> dict:
-    from face_scan.frame_scheduler import FrameScheduler
-    mode = p.get("mode", "queue")
-    sch = FrameScheduler(frame_skip=_int(p, "frame_skip", 3),
-                         queue_threshold=_int(p, "queue_threshold", 32),
-                         backpressure_multiplier=_int(p, "backpressure_multiplier", 2),
-                         max_frame_skip=_int(p, "max_frame_skip", 0) or None,
-                         adaptive_relax_ratio=_float(p, "adaptive_relax_ratio", 1.2),
-                         adaptive_recover_ratio=_float(p, "adaptive_recover_ratio", 0.5))
-    n = _int(p, "n_frames", 30)
-    fps = _float(p, "fps", 25.0)
-    scen = p.get("scenario", "平稳")
-    rows = []
-    for i in range(n):
-        if mode == "queue":
-            base, wave = 5, 40
-            pending = wave if (scen == "积压浪涌" and 10 <= i <= 15) else base
-            decided = sch.decide(i, pending=pending)
-        else:  # 自适应模式
-            decided = sch.decide(i)
-            cost = (0.1 + 0.5 * i / max(n - 1, 1)) if scen == "耗时渐增" else 0.08
-            if decided:
-                sch.note_inference(cost, sch.budget(fps))
-            pending = None
-        rows.append([i, "" if pending is None else pending, decided,
-                     sch.current_skip, sch.relaxed])
-    table = {"title": "帧决策时间线",
-             "headers": ["帧", "积压深度", "分析?", "当前间隔", "放宽中"],
-             "rows": [[r[0], r[1], "✓" if r[2] else "·", r[3], "✓" if r[4] else ""] for r in rows]}
-    summary = (f"模式: {mode} | 场景: {scen} | 基础间隔: {sch.base_skip} | "
-               f"放宽次数: {sch.relax_events} | 结束间隔: {sch.current_skip}")
-    return res(text=summary, tables=[table])
 
 
 def h_yolo(p: dict) -> dict:
@@ -605,7 +601,7 @@ def h_face_monitor(p: dict) -> dict:
     from face_detect.face_detector import FaceDetector
     from face_embed.face_embedder import FaceEmbedder
     from face_embed.face_store import FaceStore
-    from face_scan.frame_scheduler import FrameScheduler
+    from pipe.composer import FrameManager  # 帧管理：抽帧 + 背压（原 frame_scheduler 并入）
     from face_scan.face_monitor import FaceMonitor
     db = _db_path(p)
     if not db.exists():
@@ -613,9 +609,9 @@ def h_face_monitor(p: dict) -> dict:
     store = FaceStore().load(db)
     det = FaceDetector(device=str(p.get("device", "auto")))
     embedder = FaceEmbedder(device=str(p.get("device", "auto")))
-    sch = FrameScheduler(frame_skip=_int(p, "frame_skip", 3),
-                         queue_threshold=_int(p, "queue_threshold", 32),
-                         backpressure_multiplier=_int(p, "backpressure_multiplier", 2))
+    sch = FrameManager(frame_skip=_int(p, "frame_skip", 3),
+                       queue_threshold=_int(p, "queue_threshold", 32),
+                       backpressure_multiplier=_int(p, "backpressure_multiplier", 2))
     save_dir = Path(str(p.get("save_dir", "tests/data/out/faces/monitor")).strip()
                     or "tests/data/out/faces/monitor")
     if not save_dir.is_absolute():
@@ -891,7 +887,51 @@ def h_chain(p: dict) -> dict:
                 for e in pipe.on_vlm_result(s.track_key, vlm_action, ts):
                     log.append(f"    ★ VLM({vlm_action}) 命中 → {e.action}")
 
-    if p.get("feed") == "real":
+    if p.get("feed") == "video":
+        # 真实视频驱动：按帧管理节奏抽帧 → YOLO 推理（dwell 模式 track=True 保
+        # track_id 稳定）→ 逐步 step()，与旧链路（frame_yolo 等）的视频评测一致。
+        vid = _find_file(p.get("video", ""), [VID_DIR])
+        if not vid:
+            return res(ok=False, error="请选择测试视频（视频必选）")
+        max_frames = _int(p, "max_frames", 0)
+        cap = cv2.VideoCapture(str(vid))
+        if not cap.isOpened():
+            cap.release()
+            return res(ok=False, error=f"无法打开视频: {vid}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        n = analyzed = total_det = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            n += 1
+            if max_frames and n > max_frames:
+                break
+            ts = n / fps
+            if not pipe.frame.wants_frame(n, ts):
+                continue
+            analyzed += 1
+            dets = None
+            if pipe.yolo is not None:
+                dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
+            subs, al = pipe.step(n, ts, dets, frame=frame, force=True)  # 已门控，跳过 step 内重复采样
+            total_det += len(dets or [])
+            _step_out(f"帧{n} ts={ts:.1f}（检出 {len(dets or [])} 个）", subs, al, ts)
+            if len(images) < 4:
+                canvas = frame.copy()
+                _draw_tracks(canvas, dets or [])
+                if canvas.shape[1] > 1280:
+                    k = 1280 / canvas.shape[1]
+                    canvas = cv2.resize(canvas, (1280, int(canvas.shape[0] * k)))
+                images.append({"title": f"帧#{n} 检出 {len(dets or [])} 个（分析第 {analyzed} 帧）",
+                               "data": _img_data_url(canvas, 70)})
+        cap.release()
+        head = f"链路: {spec.get('name') or spec.get('description') or '未命名'} | 视频: {vid.name}"
+        if mode:
+            head += f" | algo_mode: {mode}"
+        head += f" | 读取帧 {n} | 分析帧 {analyzed} | 检出 {total_det} 个"
+        return res(text=head + "\n" + "\n".join(log), images=images)
+    elif p.get("feed") == "real":
         if pipe.yolo is None:
             return res(ok=False, error="该链路无 YOLO 阶段，真实图片驱动仅适用于含 YOLO 的链路")
         img_path, frame = _load_frame(p)
@@ -927,41 +967,35 @@ PARAMS = {
     "frame_manager": {
         "sampling": {"label": "取图节奏", "type": "select", "default": "analysis",
                      "options": ["analysis", "wall_clock", "frame_count"],
-                     "help": "analysis=随抽帧节奏; wall_clock=按墙钟秒; frame_count=按帧数"},
+                     "help": "analysis=随抽帧节奏(含背压); wall_clock=按墙钟秒; frame_count=按帧数"},
         "frame_skip": {"label": "抽帧间隔（帧）", "type": "int", "default": 3,
-                       "help": "每 N 帧取一张（analysis 模式用）"},
+                       "help": "每 N 帧取一张（analysis 模式用，积压时自动放宽）"},
         "interval_sec": {"label": "墙钟间隔（秒）", "type": "float", "default": 3.0,
                          "help": "每隔多少秒取一张（wall_clock 模式用）"},
         "interval_frames": {"label": "帧数间隔（帧）", "type": "int", "default": 30,
                             "help": "每隔多少帧取一张（frame_count 模式用）"},
-        "n_frames": {"label": "模拟帧数", "type": "int", "default": 20,
-                     "help": "模拟播放多少帧，用来观察逐帧取/跳决策"},
-        "ts_step": {"label": "每帧时间步长（秒）", "type": "float", "default": 1.0,
-                    "help": "模拟时间轴：相邻两帧相差几秒"},
-    },
-    "frame_scheduler": {
-        "mode": {"label": "模式", "type": "select", "default": "queue",
+        "mode": {"label": "背压模式（analysis）", "type": "select", "default": "queue",
                  "options": ["queue", "adaptive"],
                  "help": "queue=按积压队列信号放宽; adaptive=按推理耗时自动放宽"},
         "scenario": {"label": "模拟场景", "type": "select", "default": "平稳",
                      "options": ["平稳", "积压浪涌", "耗时渐增"],
                      "help": "queue 模式用「积压浪涌」造高峰；adaptive 用「耗时渐增」"},
-        "frame_skip": {"label": "基础抽帧间隔（帧）", "type": "int", "default": 3,
-                       "help": "默认每几帧取一张；积压时会自动加大"},
         "queue_threshold": {"label": "积压阈值（队列）", "type": "int", "default": 32,
                             "help": "积压超过它就开始放宽抽帧"},
         "backpressure_multiplier": {"label": "放宽倍数", "type": "int", "default": 2,
                                     "help": "放宽时抽帧间隔乘以几倍"},
         "max_frame_skip": {"label": "放宽上限（0=自动）", "type": "int", "default": 0,
-                           "help": "抽帧间隔最多放宽到多少；0=不限"},
+                           "help": "抽帧间隔最多放宽到多少；0=自动(基础×倍数×4)"},
         "adaptive_relax_ratio": {"label": "放宽比例（自适应）", "type": "float", "default": 1.2,
                                  "help": "耗时变长时，间隔乘多少"},
         "adaptive_recover_ratio": {"label": "恢复比例（自适应）", "type": "float", "default": 0.5,
                                    "help": "耗时恢复后，间隔按什么比例回落"},
         "fps": {"label": "视频帧率（预算用）", "type": "float", "default": 25.0,
-                "help": "用来估算每帧的推理时间预算"},
-        "n_frames": {"label": "模拟帧数", "type": "int", "default": 30,
-                     "help": "模拟多少帧的调度过程"},
+                "help": "用来估算每帧的推理时间预算（adaptive 模式用）"},
+        "n_frames": {"label": "模拟帧数", "type": "int", "default": 20,
+                     "help": "模拟播放多少帧，用来观察逐帧取/跳决策"},
+        "ts_step": {"label": "每帧时间步长（秒）", "type": "float", "default": 1.0,
+                    "help": "模拟时间轴：相邻两帧相差几秒"},
     },
     "yolo": {
         "model_path": {"label": "权重模型", "type": "file", "src": "model",
@@ -1101,20 +1135,17 @@ PARAMS = {
                        "help": "回填时使用的动作名"},
     },
     "chain": {
-        # 四模式链路的通用运行器（runner=chain）：运行表单只含"驱动"参数，
-        # 链路本体（各阶段模块参数）由已完成链路 spec 的 stages 提供
-        "feed": {"label": "驱动方式", "type": "select", "default": "script",
-                 "options": ["script", "real"],
-                 "help": "script=脚本化检测输入（模拟 YOLO 检出）; real=真实图片+YOLO 推理"},
-        "script": {"label": "脚本（每行: 帧,秒,类别,数量[,起始track]）", "type": "text",
-                   "default": "0,0.0,0,2\n3,1.0,0,1\n6,3.0,0,1",
-                   "help": "small_only 驻留告警用同一起始 track 连续几行模拟驻留"},
-        "image": {"label": "测试图片（real 模式）", "type": "file", "src": "img",
-                  "help": "real 模式用的输入图片"},
+        # 四模式链路的通用运行器（runner=chain）：运行表单=「视频输入 + 各阶段参数」，
+        # 链路本体（各阶段模块参数）由已完成链路 spec 的 stages 提供，前端运行前并入表单。
+        "video": {"label": "测试视频", "type": "file", "src": "vid", "group": "运行控制",
+                  "help": "要扫描的视频文件"},
+        "max_frames": {"label": "限帧数（0=全部）", "type": "int", "default": 300,
+                       "group": "运行控制", "help": "长视频建议先限帧；0=读到结尾"},
         "vlm_feedback": {"label": "VLM 回填（把 action 喂回告警）", "type": "bool", "default": True,
+                         "group": "运行控制",
                          "help": "把大模型判定的动作喂给告警策略"},
         "vlm_action": {"label": "回填的 VLM action", "type": "str", "default": "fire",
-                       "help": "回填时使用的动作名"},
+                       "group": "运行控制", "help": "回填时使用的动作名"},
     },
     "face_detect": {
         "image": {"label": "测试图片", "type": "file", "src": "img",
@@ -1203,11 +1234,11 @@ PARAMS = {
                      "default": "tests/data/out/faces/monitor",
                      "help": "命中（在底库中找到的人脸）的帧图存到这里"},
         "frame_skip": {"label": "抽帧间隔（帧）", "type": "int", "default": 3,
-                       "group": "抽帧调度", "help": "每隔几帧检测一次"},
+                       "group": "帧管理", "help": "每隔几帧检测一次"},
         "queue_threshold": {"label": "积压阈值", "type": "int", "default": 32,
-                            "group": "抽帧调度", "help": "积压超过它放宽抽帧"},
+                            "group": "帧管理", "help": "积压超过它放宽抽帧"},
         "backpressure_multiplier": {"label": "放宽倍数", "type": "int", "default": 2,
-                                    "group": "抽帧调度", "help": "放宽时抽帧间隔乘以几倍"},
+                                    "group": "帧管理", "help": "放宽时抽帧间隔乘以几倍"},
     },
     "frame_yolo": {
         # 运行控制
@@ -1275,13 +1306,9 @@ PARAMS = {
 }
 
 MODULES = {
-    "frame_scheduler": {
-        "name": "抽帧调度 FrameScheduler", "group": "帧调度",
-        "desc": "复用 face_scan.frame_scheduler：抽帧间隔 + 积压/耗时自动放宽。",
-        "params": PARAMS["frame_scheduler"], "handler": h_frame_scheduler},
     "frame_manager": {
         "name": "帧管理 FrameManager", "group": "管道四模块",
-        "desc": "复用 pipe.composer.FrameManager：三种取图节奏决策。",
+        "desc": "复用 pipe.composer.FrameManager：三种取图节奏 + 积压/耗时背压（原 frame_scheduler 并入）。",
         "params": PARAMS["frame_manager"], "handler": h_frame_manager},
     "yolo": {
         "name": "小模型识别 YOLODetector", "group": "管道四模块",
@@ -1466,7 +1493,7 @@ def _pipelines_list() -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# ---------------- 数据库数据浏览（只读快照，见 doc/配置参数列式化存储设计.md §4） ----------------
+# ---------------- 数据库数据浏览（只读快照，见 doc/存储设计.md 第一部分） ----------------
 
 def _db_tables() -> dict:
     if not _DB_ENABLED:
@@ -1666,10 +1693,12 @@ class Handler(BaseHTTPRequestHandler):
 
 _SEED_PIPE_NAME = "视频人脸检索"
 _SEED_MODULES = [
-    ("frame_scheduler", "视频人脸检索·抽帧调度", {
-        "mode": "queue", "scenario": "平稳", "frame_skip": 3, "queue_threshold": 32,
-        "backpressure_multiplier": 2, "max_frame_skip": 0, "adaptive_relax_ratio": 1.2,
-        "adaptive_recover_ratio": 0.5, "fps": 25.0, "n_frames": 30}),
+    ("frame_manager", "视频人脸检索·帧管理", {
+        "sampling": "analysis", "frame_skip": 3, "interval_sec": 3.0,
+        "interval_frames": 30, "queue_threshold": 32, "backpressure_multiplier": 2,
+        "max_frame_skip": 0, "adaptive_relax_ratio": 1.2,
+        "adaptive_recover_ratio": 0.5, "mode": "queue", "scenario": "平稳",
+        "fps": 25.0, "n_frames": 20, "ts_step": 1.0}),
     ("face_detect", "视频人脸检索·人脸检测", {
         "device": "auto", "det_thresh": 0.5, "det_size": "640,640",
         "max_num": 0, "use_crop": True}),
@@ -1696,9 +1725,9 @@ def _completed_pipeline_spec() -> dict:
     return {
         "runner": "face_monitor",  # 运行入口：复用 /api/test/face_monitor 处理器
         "run_module": "face_monitor",  # 运行表单参数 schema 来源模块
-        "description": "视频/摄像头人脸监控链路：抽帧调度 → SCRFD 人脸检测 → ArcFace "
-                       "特征提取 → 底库检索命中身份。运行前先在「向量底库 FaceStore」"
-                       "注册并保存底库（out/face_db.npz）。",
+        "description": "视频/摄像头人脸监控链路：帧管理（FrameManager 抽帧+背压）→ SCRFD "
+                       "人脸检测 → ArcFace 特征提取 → 底库检索命中身份。运行前先在「向量底库 "
+                       "FaceStore」注册并保存底库（out/face_db.npz）。",
         "streams": 1,
         "stages": [{"module": mid, "params": params}
                    for mid, _name, params in _SEED_MODULES],
@@ -1731,97 +1760,10 @@ def _frame_yolo_pipeline_spec() -> dict:
     }
 
 
-# ---- 四模式链路（方案A：small_crop/small_full 忽略 ROI 合并为 small_yolo_vlm）----
-# 每条链路带 algo_mode 顶层键（compose() 分派键）且每模式全量播种自己的模块
-# 命名配置；运行入口统一 runner=chain（h_chain 按 spec.stages 组装四模块）。
-
-def _chain_spec(algo_mode, name, description, stages, run_params) -> dict:
-    return {
-        "algo_mode": algo_mode,  # compose() 分派键：显式存，运行前按 stages 校验
-        "runner": "chain",  # 运行入口：复用 /api/test/chain 处理器
-        "run_module": "chain",  # 运行表单参数 schema 来源模块
-        "name": name,
-        "description": description,
-        "streams": 1,
-        "stages": [{"module": mid, "params": params} for mid, _name, params in stages],
-        "run_params": run_params,
-    }
-
-
-_CHAIN_RUN_PARAMS = {
-    "feed": "script",
-    "script": "0,0.0,0,2\n3,1.0,0,1\n6,3.0,0,1",  # 驻留演示：track0 在 0s/1s/3s 出现
-    "vlm_feedback": True, "vlm_action": "fire",
-}
-
-_CHAIN_FRAME_STAGE = {  # analysis 抽帧（small_* 用）
-    "sampling": "analysis", "frame_skip": 3, "interval_sec": 3.0,
-    "interval_frames": 30, "n_frames": 20, "ts_step": 1.0}
-_CHAIN_YOLO_STAGE = {  # small_* 用（ROI 统一 false，不区分 crop/full）
-    "model_path": "yolov8n.pt", "conf": 0.35, "iou": 0.7, "imgsz": 640,
-    "max_det": 300, "classes": "0", "device": "", "filter_conf": 0.0,
-    "min_short": 0, "min_long": 0, "class_limits": "0:1,300",
-    "check_interval": 3.0, "roi": False}
-_CHAIN_VLM_STAGE = {  # small_yolo_vlm / large_only 用
-    "crop_padding": 0.15, "max_resolution": "1280,720", "prompt": ""}
-_CHAIN_WINDOW_ALARM = {  # VLM 窗口确认告警
-    "kind": "window", "task_id": 1, "target_actions": "fire,fight",
-    "smooth_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 60.0}
-_CHAIN_DWELL_ALARM = {  # small_only 驻留告警（target_actions 空、smooth_frames=驻留秒数）
-    "kind": "dwell", "task_id": 1, "target_actions": "",
-    "smooth_frames": 2, "hit_ratio": 1.0, "alarm_cooldown": 60.0}
-
-_SEED_CHAIN_SMALL_ONLY_MODULES = [
-    ("frame_manager", "small_only·帧管理", dict(_CHAIN_FRAME_STAGE)),
-    ("yolo", "small_only·YOLO识别", dict(_CHAIN_YOLO_STAGE)),
-    ("alarm", "small_only·驻留告警", dict(_CHAIN_DWELL_ALARM)),
-]
-
-_SEED_CHAIN_SMALL_YOLO_VLM_MODULES = [
-    ("frame_manager", "small_yolo_vlm·帧管理", dict(_CHAIN_FRAME_STAGE)),
-    ("yolo", "small_yolo_vlm·YOLO识别", dict(_CHAIN_YOLO_STAGE)),
-    ("vlm", "small_yolo_vlm·VLM研判", dict(_CHAIN_VLM_STAGE)),
-    ("alarm", "small_yolo_vlm·告警", dict(_CHAIN_WINDOW_ALARM)),
-]
-
-_SEED_CHAIN_LARGE_ONLY_MODULES = [
-    ("frame_manager", "large_only·帧管理",
-     dict(_CHAIN_FRAME_STAGE, sampling="wall_clock")),  # 墙钟秒，interval_sec=报送节拍
-    ("vlm", "large_only·VLM研判", dict(_CHAIN_VLM_STAGE)),
-    ("alarm", "large_only·告警", dict(_CHAIN_WINDOW_ALARM)),
-]
-
-_SEED_CHAIN_NAMES = {
-    "small_only": ("small_only 小模型驻留告警",
-                   "抽帧 → YOLO 识别 → 按 track 驻留秒数告警（无大模型，对应 "
-                   "compose 的 small_only 模式）。脚本驱动：同一起始 track 连续几行模拟驻留。"),
-    "small_yolo_vlm": ("small_yolo_vlm 小模型+大模型研判",
-                       "抽帧 → YOLO 按类报送 → VLM 判定动作 → 窗口确认告警（对应 "
-                       "compose 的 small_crop/small_full，ROI 裁剪/全帧不区分）。"),
-    "large_only": ("large_only 纯大模型研判",
-                   "按墙钟秒抽帧 → 整帧送 VLM 判定 → 窗口确认告警（无小模型，对应 "
-                   "compose 的 large_only 模式）。"),
-}
-
-_SEED_CHAIN_PIPES = [
-    ("small_only", _SEED_CHAIN_SMALL_ONLY_MODULES),
-    ("small_yolo_vlm", _SEED_CHAIN_SMALL_YOLO_VLM_MODULES),
-    ("large_only", _SEED_CHAIN_LARGE_ONLY_MODULES),
-]
-
-
-def _chain_pipeline_spec(mode: str, name: str, modules: list) -> dict:
-    return _chain_spec(mode, name, _SEED_CHAIN_NAMES[mode][1], modules, _CHAIN_RUN_PARAMS)
-
-
 # 播种清单：(链路名, spec 构造器, 阶段模块配置)
 _SEED_PIPES = [
     (_SEED_PIPE_NAME, _completed_pipeline_spec, _SEED_MODULES),
     (_SEED_PIPE_YOLO_NAME, _frame_yolo_pipeline_spec, _SEED_YOLO_STAGES),
-    *[(_SEED_CHAIN_NAMES[mode][0],
-       (lambda m=mode, mods=mods: _chain_pipeline_spec(m, _SEED_CHAIN_NAMES[m][0], mods)),
-       mods)
-      for mode, mods in _SEED_CHAIN_PIPES],
 ]
 
 

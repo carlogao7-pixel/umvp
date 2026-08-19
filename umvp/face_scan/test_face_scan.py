@@ -35,7 +35,7 @@ from face_detect.face_detector import FaceDetector  # noqa: E402
 from face_embed.face_embedder import FaceEmbedder  # noqa: E402
 from face_embed.face_store import FaceStore  # noqa: E402
 from face_scan.face_monitor import FaceMonitor  # noqa: E402
-from face_scan.frame_scheduler import FrameScheduler  # noqa: E402
+from pipe.composer import FrameManager  # noqa: E402  # 帧管理（原 FrameScheduler 并入）
 
 
 def parse_args():
@@ -77,9 +77,9 @@ def main():
     else:
         print(f"[警告] 底库不存在: {db_path}（仅检测，不检索）")
 
-    # 调度器
-    scheduler = FrameScheduler(frame_skip=args.frame_skip,
-                               backpressure_multiplier=args.multiplier)
+    # 调度器（FrameManager analysis 模式 = 抽帧 + 背压）
+    scheduler = FrameManager(frame_skip=args.frame_skip,
+                             backpressure_multiplier=args.multiplier)
     pending_signal = None
     if args.scheduler_mode == "queue":
         # 模拟固定积压深度：每帧都报告 pending 值，验证阈值触发

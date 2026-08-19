@@ -22,7 +22,7 @@ from typing import Callable, Iterator, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from face_scan.frame_scheduler import FrameScheduler
+from pipe.composer import FrameManager  # 帧管理：抽帧 + 背压（2026-08-18 原 FrameScheduler 并入）
 
 
 @dataclass
@@ -60,7 +60,7 @@ class FaceMonitor:
         det,  # FaceDetector 实例
         embedder,  # FaceEmbedder 实例
         store,  # FaceStore 实例（已加载底库）
-        scheduler: Optional[FrameScheduler] = None,
+        scheduler: Optional[FrameManager] = None,
         save_dir: Optional[str] = None,  # 命中帧标注图保存目录（None=不保存）
         pending_signal: Optional[Callable[[], int]] = None,  # 队列模式的积压信号，返回待处理深度
         verbose: bool = True,
@@ -68,7 +68,7 @@ class FaceMonitor:
         self.det = det
         self.embedder = embedder
         self.store = store
-        self.scheduler = scheduler or FrameScheduler(frame_skip=3)
+        self.scheduler = scheduler or FrameManager(frame_skip=3)
         self.save_dir = Path(save_dir) if save_dir else None
         self.pending_signal = pending_signal
         self.verbose = verbose

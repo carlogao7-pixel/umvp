@@ -12,7 +12,7 @@
 | `umvp/pipe/` | 四模块 + `compose()` 装配器（small_only / small_crop / small_full / large_only） |
 | `umvp/face_detect/` | SCRFD 人脸检测 + 5 点对齐裁剪（`FaceDetector`） |
 | `umvp/face_embed/` | ArcFace 512d 嵌入（`FaceEmbedder`）+ 向量底库（`FaceStore`） |
-| `umvp/face_scan/` | 抽帧决策（`FrameScheduler`）+ 人脸管道编排（`FaceMonitor`） |
+| `umvp/face_scan/` | 人脸管道编排（`FaceMonitor`，复用 `pipe.composer.FrameManager` 取帧） |
 | `models/` | YOLO 模型选择池（v8n/s、v9t、v10s、v11n/s/m，COCO person/car，放 .pt 即入选择） |
 | `face_models/` | InsightFace 模型包 `buffalo_l/`（已解压，含 det_10g.onnx / w600k_r50.onnx 等） |
 | `tests/` | 三模式实机测试 + YOLO 参数对比 + 测试视频/图片 |
