@@ -26,6 +26,8 @@
   .field{margin-bottom:12px;max-width:720px}
   .field label{display:block;font-size:13px;margin-bottom:4px;color:var(--text)}
   .field .help{font-size:11px;color:var(--dim);margin-top:3px}
+  .test-divider{margin:18px 0 10px;padding:6px 10px;max-width:720px;border-top:1px dashed var(--dim);
+                font-size:12px;color:var(--dim);background:rgba(127,127,127,.06);border-radius:4px}
   .param-group{background:var(--panel);border:1px solid var(--line);border-radius:8px;
     margin-bottom:10px;max-width:720px}
   .param-group summary{cursor:pointer;padding:8px 12px;font-size:13px;font-weight:600;
@@ -115,12 +117,10 @@
 <aside>
   <h1>UMVP 测试台</h1>
   <div id="groups"></div>
-  <div class="grp">已完成链路</div>
-  <input id="pipe-search" type="text" placeholder="搜索链路…" autocomplete="off">
-  <div id="pipe-list"></div>
   <div class="grp">链路设计器</div>
   <button id="nav-designer" onclick="openDesigner()">链路设计器</button>
   <div class="grp">系统</div>
+  <button id="nav-test" onclick="openTestPage()">链路测试台</button>
   <button id="nav-db" onclick="openDb()">数据浏览</button>
 </aside>
 <main>
@@ -180,17 +180,6 @@
     <div class="tabs" id="db-tabs"></div>
     <div id="db-content"></div>
   </section>
-  <section id="view-pipeline" hidden>
-    <header>
-      <h2 id="pl-title">已完成链路</h2>
-      <p id="pl-desc" class="desc"></p>
-    </header>
-    <div id="pl-stages"></div>
-    <h3 style="font-size:14px;margin:20px 0 4px;color:var(--accent)">运行参数（可调整，视频必选）</h3>
-    <form id="pl-form"></form>
-    <button id="pl-run" disabled>运行测试</button>
-    <div id="pl-result"></div>
-  </section>
 </main>
 <script>
 "use strict";
@@ -204,7 +193,6 @@ async function loadSchema(){
   refreshModulePresets();
   refreshPipelinePresets();
   fetchModulePresets();
-  loadPipelines();
   const ids = Object.keys(SCHEMA.modules).filter(id => !SCHEMA.modules[id].hidden);
   if (ids.length) select(ids[0]);
 }
@@ -235,6 +223,10 @@ function openDb(){
   setNavActive("db");
 }
 
+function openTestPage(){
+  window.location.href = "test.html";
+}
+
 function openDesigner(){
   switchView("designer");
   setNavActive("designer");
@@ -243,29 +235,40 @@ function openDesigner(){
 function setNavActive(id){
   for (const b of document.querySelectorAll("#groups button"))
     b.classList.toggle("active", b.id === "nav-" + id);
-  for (const b of document.querySelectorAll("#pipe-list button"))
-    b.classList.toggle("active", b.id === "pipe-" + id);
   const d = document.getElementById("nav-designer");
   if (d) d.classList.toggle("active", id === "designer");
   const db = document.getElementById("nav-db");
   if (db) db.classList.toggle("active", id === "db");
+  const test = document.getElementById("nav-test");
+  if (test) test.classList.toggle("active", id === "test");
 }
 
 function select(id){
   switchView("module");
   setNavActive(id);
   current = id;
+  modulePresetId = null;
   const m = SCHEMA.modules[id];
   document.getElementById("mod-title").textContent = m.name;
   document.getElementById("mod-desc").textContent = m.desc || "";
   document.getElementById("result").innerHTML = "";
   const form = document.getElementById("form");
   form.innerHTML = "";
-  for (const [pk, spec] of Object.entries(m.params)){
-    form.appendChild(field(pk, spec));
+  // 模块参数 与 测试参数 分区：后者仅本页运行用（不落库、不进链路设计器）
+  const own = [], test = [];
+  for (const [pk, spec] of Object.entries(m.params))
+    (spec.test_only ? test : own).push([pk, spec]);
+  for (const [pk, spec] of own) form.appendChild(field(pk, spec));
+  if (test.length){
+    const div = document.createElement("div");
+    div.className = "test-divider";
+    div.textContent = "▽ 测试参数（仅本页运行用，不存库、不进链路）";
+    form.appendChild(div);
+    for (const [pk, spec] of test) form.appendChild(field(pk, spec));
   }
   renderEstimate(m.estimate);
   document.getElementById("run").disabled = false;
+  refreshModulePresets();
 }
 
 function renderEstimate(est, box){
@@ -354,6 +357,8 @@ function renderInput(pk, spec, prefix){
   }
   el.dataset.name = pk;
   el.dataset.type = spec.type;
+  el.dataset.default = (spec.default !== undefined && spec.default !== null)
+    ? String(spec.default) : "";
   return el;
 }
 
@@ -361,8 +366,11 @@ function collect(scope){
   const out = {};
   (scope || document.getElementById("form")).querySelectorAll("[data-name]").forEach(el => {
     const k = el.dataset.name, t = el.dataset.type;
-    if (t === "bool") out[k] = el.checked;
-    else out[k] = el.value;
+    if (t === "bool"){ out[k] = el.checked; return; }
+    // 空值回落 schema 默认（避免保存出全 None 导致的运行时 0 报送）
+    let v = el.value;
+    if (v === "" ) v = el.dataset.default || "";
+    out[k] = v;
   });
   return out;
 }
@@ -483,7 +491,6 @@ function switchView(name){
   document.getElementById("view-module").hidden = name !== "module";
   document.getElementById("view-designer").hidden = name !== "designer";
   document.getElementById("view-db").hidden = name !== "db";
-  document.getElementById("view-pipeline").hidden = name !== "pipeline";
   if (name === "db") loadDbTables();
 }
 
@@ -615,7 +622,10 @@ async function apiPost(path, body){
 }
 
 // ---- 命名配置：模块视图 ----
+let modulePresetId = null;  // 模块栏当前"载入"的 preset（改参数保存即更新它，id 稳定）
+
 function refreshModulePresets(){
+  const cur = current;
   return fetch("/api/presets?kind=module").then(r => r.json()).then(data => {
     const sel = document.getElementById("preset-select");
     sel.innerHTML = "";
@@ -625,11 +635,18 @@ function refreshModulePresets(){
       sel.appendChild(op);
       return;
     }
-    for (const p of data.presets){
+    const list = data.presets.filter(p => p.module_id === cur);
+    if (!list.length){
+      const op = document.createElement("option");
+      op.textContent = "（无本模块配置）";
+      sel.appendChild(op);
+      return;
+    }
+    for (const p of list){
       const op = document.createElement("option");
       op.value = p.id;
       const m = SCHEMA.modules[p.module_id];
-      op.textContent = "[" + (m ? m.name : p.module_id) + "] " + p.name;
+      op.textContent = (m ? m.name : p.module_id) + " · " + p.name;
       sel.appendChild(op);
     }
   }).catch(() => {});
@@ -637,8 +654,10 @@ function refreshModulePresets(){
 
 async function saveModulePreset(){
   const name = document.getElementById("preset-name").value.trim() || SCHEMA.modules[current].name;
-  const data = await apiPost("/api/presets/save",
-    {kind: "module", name, module_id: current, params: collect()});
+  const payload = {kind: "module", name, module_id: current, params: collect()};
+  if (modulePresetId) payload.preset_id = modulePresetId;  // 有绑定 → 更新该 preset
+  const data = await apiPost("/api/presets/save", payload);
+  if (data.ok && data.id) modulePresetId = data.id;
   alert(data.ok ? (name + "：" + (data.note || "已保存")) : ("保存失败：" + (data.error || "")));
   refreshModulePresets();
 }
@@ -646,9 +665,10 @@ async function saveModulePreset(){
 async function loadModulePreset(){
   const sel = document.getElementById("preset-select");
   if (!sel.value) return;
-  const data = await apiPost("/api/presets/load", {id: parseInt(sel.value)});
+  const data = await apiPost("/api/presets/load", {id: sel.value});
   if (!data.ok){ alert("载入失败：" + (data.error || "")); return; }
   const p = data.preset;
+  modulePresetId = p.id;  // 绑定：改参数保存即更新这条
   if (p.module_id && p.module_id !== current) select(p.module_id);
   fillForm(document.getElementById("form"), p.params);
   try{  // 估算随载入参数更新
@@ -664,7 +684,7 @@ async function loadModulePreset(){
 async function deleteModulePreset(){
   const sel = document.getElementById("preset-select");
   if (!sel.value) return;
-  const data = await apiPost("/api/presets/delete", {id: parseInt(sel.value)});
+  const data = await apiPost("/api/presets/delete", {id: sel.value});
   if (!data.ok) alert("删除失败：" + (data.error || ""));
   refreshModulePresets();
 }
@@ -704,11 +724,11 @@ async function fetchModulePresets(){
   }catch(e){ MODULE_PRESETS = []; }
 }
 
-// 按检索词（配置名/模块名包含）过滤，最多显示 10 条
-function renderStagePresetSel(q, sel){
+// 按检索词（配置名/模块名包含）过滤，且只列出与当前阶段同模块的 preset，最多显示 10 条
+function renderStagePresetSel(q, sel, mid){
   const kw = (q.value || "").trim().toLowerCase();
   const mods = SCHEMA.modules;
-  let list = MODULE_PRESETS;
+  let list = MODULE_PRESETS.filter(p => p.module_id === mid);
   if (kw) list = list.filter(p =>
     p.name.toLowerCase().includes(kw) ||
     (mods[p.module_id] && mods[p.module_id].name.toLowerCase().includes(kw)));
@@ -727,7 +747,7 @@ function renderStagePresetSel(q, sel){
   }
 }
 
-function addStage(mid, params){
+function addStage(mid, params, presetId){
   const m = SCHEMA.modules[mid];
   const el = document.createElement("div");
   el.className = "stage";
@@ -747,20 +767,23 @@ function addStage(mid, params){
   pr.className = "stage-preset";
   pr.innerHTML = '<input type="text" class="sp-q" placeholder="按配置名检索…">' +
     '<select class="sp-sel"></select>' +
-    '<button type="button" data-a="preset-load" title="把选中配置的参数载入本阶段">载入</button>';
+    '<button type="button" data-a="preset-load" title="把选中配置的参数载入本阶段">载入</button>' +
+    '<button type="button" data-a="preset-save" title="把本阶段参数保存为该模块配置（id 稳定）">保存</button>';
   const q = pr.querySelector(".sp-q"), sel = pr.querySelector(".sp-sel");
-  renderStagePresetSel(q, sel);
-  q.addEventListener("input", () => renderStagePresetSel(q, sel));
+  renderStagePresetSel(q, sel, mid);
+  q.addEventListener("input", () => renderStagePresetSel(q, sel, mid));
   el.appendChild(pr);
   if (m){
     const form = document.createElement("div");
     form.className = "stage-form";
-    for (const [pk, spec] of Object.entries(m.params))
+    for (const [pk, spec] of Object.entries(m.params)){
+      if (spec.test_only) continue;  // 测试参数不进链路阶段表单
       form.appendChild(field(pk, spec, "s" + STAGES.length + "-" + pk));
+    }
     el.appendChild(form);
   }
   document.getElementById("dg-stages").appendChild(el);
-  STAGES.push({module: mid, el});
+  STAGES.push({module: mid, el, presetId: presetId || null});
   if (params) fillForm(el, params);
   return el;
 }
@@ -769,11 +792,30 @@ function renderStages(list){
   const box = document.getElementById("dg-stages");
   box.innerHTML = "";
   STAGES = [];
-  for (const s of list || []) addStage(s.module, s.params);
+  for (const s of list || []) addStage(s.module, s.params, s.preset_id);
 }
 
 function snapshot(){
-  return STAGES.map(s => ({module: s.module, params: collect(s.el)}));
+  return STAGES.map(s => ({module: s.module, params: collect(s.el), preset_id: s.presetId}));
+}
+
+async function saveStagePreset(i){
+  const stage = STAGES[i];
+  if (!stage) return;
+  const moduleId = stage.module;
+  const mod = SCHEMA.modules[moduleId];
+  const params = collect(stage.el);
+  // 绑定过 preset → 带 preset_id 定向更新（id 稳定，名称留空由后端沿用原名，不影响链路层）；
+  // 未绑定 → 默认命名为模块名，按"同名覆盖/新建"落库并记录 id。
+  const name = stage.presetId ? "" : (mod ? mod.name : moduleId);
+  const payload = {kind: "module", name, module_id: moduleId, params};
+  if (stage.presetId) payload.preset_id = stage.presetId;
+  const data = await apiPost("/api/presets/save", payload);
+  if (!data.ok){ alert("保存模块参数失败：" + (data.error || "")); return; }
+  stage.presetId = data.id;
+  alert((mod ? mod.name : moduleId) + (data.created ? "：已保存" : "：已覆盖"));
+  dgEstimate();
+  fetchModulePresets();
 }
 
 function dgBuildSpec(){
@@ -820,7 +862,7 @@ async function stubAgent(){
 
 // ---- 命名配置：链路暂存 ----
 function refreshPipelinePresets(){
-  return fetch("/api/presets?kind=pipeline").then(r => r.json()).then(data => {
+  return fetch("/api/pipelines").then(r => r.json()).then(data => {
     const sel = document.getElementById("dg-preset-select");
     sel.innerHTML = "";
     if (!data.ok){
@@ -829,7 +871,7 @@ function refreshPipelinePresets(){
       sel.appendChild(op);
       return;
     }
-    for (const p of data.presets){
+    for (const p of data.pipelines){
       const op = document.createElement("option");
       op.value = p.id; op.textContent = p.name;
       sel.appendChild(op);
@@ -840,189 +882,86 @@ function refreshPipelinePresets(){
 async function savePipelinePreset(){
   const name = document.getElementById("dg-preset-name").value.trim();
   if (!name){ alert("请先填写链路配置名"); return; }
-  const data = await apiPost("/api/presets/save", {kind: "pipeline", name, params: dgBuildSpec()});
-  alert(data.ok ? (name + "：" + (data.note || "已保存")) : ("保存失败：" + (data.error || "")));
+
+  // 每个阶段：有绑定 id → 更新该 preset（id 稳定不新建）；无绑定 → 新建并记下 id。
+  // 命名统一为「链路名 · 模块名」，仅在新建时落库；既有 preset 若名字不一致也顺带归一。
+  // 注意：直接用 STAGES（保有 el / presetId），snapshot() 只返回 {module, params} 会丢失二者。
+  const stages = STAGES;
+  const steps = [];
+  for (const stage of stages){
+    const moduleId = stage.module;
+    const stageEl = stage.el;
+    const params = collect(stageEl);
+    const presetName = (name + " · " + (SCHEMA.modules[moduleId].name || moduleId)).substring(0, 64);
+
+    const payload = {
+      kind: "module",
+      name: presetName,
+      module_id: moduleId,
+      params: params
+    };
+    if (stage.presetId) payload.preset_id = stage.presetId;
+
+    const presetData = await apiPost("/api/presets/save", payload);
+    if (!presetData.ok){
+      alert("保存模块参数失败：" + (presetData.error || ""));
+      return;
+    }
+    stage.presetId = presetData.id;
+    steps.push(presetData.id);
+  }
+
+  // 保存链路（steps 重建引用，不复制参数）
+  const data = await apiPost("/api/pipelines/save", {
+    name: name,
+    steps: steps,
+    streams: parseInt(document.getElementById("dg-streams").value) || 1,
+    budget: {},
+    meta: {description: document.getElementById("dg-scenario").value}
+  });
+
+  if (!data.ok){
+    alert("保存链路失败：" + (data.error || ""));
+    return;
+  }
+
+  alert(name + "：" + (data.note || "已保存"));
   refreshPipelinePresets();
 }
 
 async function loadPipelinePreset(){
   const sel = document.getElementById("dg-preset-select");
   if (!sel.value) return;
-  const data = await apiPost("/api/presets/load", {id: parseInt(sel.value)});
+  const data = await apiPost("/api/pipelines/load", {id: sel.value});
   if (!data.ok){ alert("载入失败：" + (data.error || "")); return; }
-  const spec = data.preset.params || {};
-  renderStages(spec.stages || []);
-  if (spec.streams) document.getElementById("dg-streams").value = spec.streams;
+  
+  const pipeline = data.pipeline;
+  document.getElementById("dg-preset-name").value = pipeline.name || "";
+  document.getElementById("dg-streams").value = pipeline.streams || 1;
   const d = document.getElementById("dg-scenario");
-  if (d) d.value = spec.description || "";
+  if (d) d.value = (pipeline.meta && pipeline.meta.description) || "";
+  
+  // 转换 stages 为前端需要的格式
+  const stages = (pipeline.stages || []).map(s => ({
+    module: s.module_id,
+    params: s.params || {},
+    preset_id: s.preset_id
+  }));
+
+  renderStages(stages);
   dgEstimate();
 }
 
 async function deletePipelinePreset(){
   const sel = document.getElementById("dg-preset-select");
   if (!sel.value) return;
-  const data = await apiPost("/api/presets/delete", {id: parseInt(sel.value)});
+  const data = await apiPost("/api/pipelines/delete", {id: sel.value});
   if (!data.ok) alert("删除失败：" + (data.error || ""));
   refreshPipelinePresets();
 }
 
-// ---- 已完成链路（可从数据库载入并运行） ----
-let PIPELINES = [];
-let PL_CURRENT = null;
-let PL_RUNNER = null;   // 当前已选链路的运行入口（/api/test/<runner>）
-let PL_SPEC = null;     // 当前已选链路的完整 spec（含 stages/algo_mode），运行时间传给 runner
-
-async function loadPipelines(){
-  try{
-    const r = await fetch("/api/presets?kind=pipeline");
-    const d = await r.json();
-    PIPELINES = d.ok ? (d.presets || []).filter(p => p.params && p.params.runner) : [];
-  }catch(e){ PIPELINES = []; }
-  renderPipeList();
-}
-
-function renderPipeList(){
-  const box = document.getElementById("pipe-list");
-  const kw = (document.getElementById("pipe-search").value || "").trim().toLowerCase();
-  const list = kw ? PIPELINES.filter(p => p.name.toLowerCase().includes(kw)) : PIPELINES;
-  box.innerHTML = "";
-  if (!list.length){
-    const div = document.createElement("div");
-    div.style.cssText = "color:var(--dim);font-size:12px;padding:4px 2px";
-    div.textContent = PIPELINES.length ? "（无匹配链路）" : "（数据库暂无链路）";
-    box.appendChild(div);
-    return;
-  }
-  for (const p of list){
-    const b = document.createElement("button");
-    b.id = "pipe-" + p.id;
-    b.textContent = p.name;
-    b.classList.toggle("active", PL_CURRENT !== null && p.id === PL_CURRENT);
-    b.onclick = () => openPipeline(p.id);
-    box.appendChild(b);
-  }
-}
-
-function openPipeline(id){
-  const p = PIPELINES.find(x => x.id === id);
-  if (!p) return;
-  PL_CURRENT = id;
-  switchView("pipeline");
-  setNavActive(id);
-  renderPipeList();
-  const spec = p.params || {};
-  document.getElementById("pl-title").textContent = p.name;
-  document.getElementById("pl-desc").textContent = spec.description || "";
-  renderPlStages(spec.stages || []);
-  const form = document.getElementById("pl-form");
-  form.innerHTML = "";
-  let runMod = null;
-  if (spec.runner === "chain"){
-    // chain 链路：运行表单=运行控制(视频输入)+各阶段参数，与旧链路一致
-    renderChainRunForm(form, spec);
-    runMod = spec.run_module || "chain";
-  }else{
-    // 运行表单参数 schema 来源：spec.run_module（新播种）或回退 spec.runner（旧播种）
-    runMod = spec.run_module || (SCHEMA.modules[spec.runner] ? spec.runner : null);
-    if (runMod){
-      renderGroupedForm(form, runMod, spec.run_params || {}, "pl");
-    }else{
-      const div = document.createElement("div");
-      div.className = "desc"; div.textContent = "（该链路未提供运行表单）";
-      form.appendChild(div);
-    }
-  }
-  PL_RUNNER = spec.runner || runMod;
-  PL_SPEC = spec;
-  document.getElementById("pl-run").disabled = !runMod;
-}
-
-function renderPlStages(stages){
-  const box = document.getElementById("pl-stages");
-  box.innerHTML = "";
-  if (!stages.length){
-    box.innerHTML = '<div class="desc">（无阶段信息）</div>';
-    return;
-  }
-  const wrap = document.createElement("div");
-  wrap.className = "dg-tools";
-  wrap.style.cssText = "flex-wrap:wrap;gap:8px";
-  stages.forEach((s, i) => {
-    const m = SCHEMA.modules[s.module];
-    const chip = document.createElement("span");
-    chip.style.cssText = "background:var(--panel2);border:1px solid var(--line);border-radius:14px;" +
-      "padding:3px 10px;font-size:12px;color:var(--text)";
-    chip.textContent = (i + 1) + ". " + (m ? m.name : s.module);
-    wrap.appendChild(chip);
-  });
-  box.appendChild(wrap);
-}
-
-// 把模块 schema 的参数平铺渲染到容器（无分组嵌套），值回填用 fillForm。
-function renderModuleFields(container, moduleId, values, prefix){
-  const mod = SCHEMA.modules[moduleId];
-  if (!mod) return;
-  for (const [pk, s] of Object.entries(mod.params)){
-    container.appendChild(field(pk, s, prefix));
-  }
-  fillForm(container, values);
-}
-
-// runner=chain 的链路：运行表单 = 「运行控制(视频输入) + 各阶段模块参数」并入一个表单，
-// 与旧链路（face_monitor / frame_yolo）结构一致。阶段参数由 _chain_from_spec 从
-// spec.stages[].params 读取，运行前前端把各阶段表单当前值合并回 spec。
-function renderChainRunForm(form, spec){
-  // 运行控制组：视频输入 + 限帧 + VLM 回填（chain 模块 schema，group=运行控制）
-  renderGroupedForm(form, "chain", spec.run_params || {}, "pl");
-  // 各阶段模块参数：每个阶段一个组，直接平铺该模块的字段
-  (spec.stages || []).forEach((s, i) => {
-    const m = SCHEMA.modules[s.module];
-    if (!m) return;
-    const d = document.createElement("details");
-    d.className = "param-group"; d.open = i === 0;
-    const sum = document.createElement("summary");
-    sum.textContent = "阶段 " + (i + 1) + " · " + (m.name || s.module);
-    d.appendChild(sum);
-    const inner = document.createElement("div");
-    inner.className = "fields"; inner.id = "pl-stage-" + i;
-    d.appendChild(inner);
-    form.appendChild(d);
-    renderModuleFields(inner, s.module, s.params || {}, "ps" + i);
-  });
-}
-
-async function runPipeline(){
-  const runner = PL_RUNNER || "face_monitor";
-  const btn = document.getElementById("pl-run");
-  btn.disabled = true; btn.textContent = "运行中…（模型加载首次较慢）";
-  const box = document.getElementById("pl-result");
-  box.innerHTML = '<div class="loading">⏳ 运行中，请稍候…</div>';
-  try{
-    // 深拷贝 spec，把每个阶段可编辑表单的当前值合并回 stages[].params
-    // （_chain_from_spec 运行时读 stages 的 params，改参数即时生效）
-    const spec = JSON.parse(JSON.stringify(PL_SPEC || {}));
-    (spec.stages || []).forEach((s, i) => {
-      const box = document.getElementById("pl-stage-" + i);
-      if (box) s.params = Object.assign({}, s.params || {}, collect(box));
-    });
-    const params = collect(document.getElementById("pl-form"));
-    if (runner === "chain") params.feed = "video";  // chain 链路统一真实视频驱动
-    const resp = await fetch("/api/test/" + runner, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({params: Object.assign(params, {spec: spec})})
-    });
-    renderResult(await resp.json(), box);
-  }catch(e){
-    box.innerHTML = '<pre class="err">请求失败: ' + e + '</pre>';
-  }
-  btn.disabled = false; btn.textContent = "运行测试";
-}
-
 // ---- 事件绑定 ----
 document.getElementById("run").addEventListener("click", run);
-document.getElementById("pipe-search").addEventListener("input", renderPipeList);
-document.getElementById("pl-run").addEventListener("click", runPipeline);
 document.getElementById("preset-save").addEventListener("click", saveModulePreset);
 document.getElementById("preset-load").addEventListener("click", loadModulePreset);
 document.getElementById("preset-delete").addEventListener("click", deleteModulePreset);
@@ -1041,11 +980,16 @@ document.getElementById("dg-stages").addEventListener("click", e => {
   if (a === "preset-load"){
     const sel = stageEl.querySelector(".sp-sel");
     if (!sel || !sel.value) return;
-    apiPost("/api/presets/load", {id: parseInt(sel.value)}).then(d => {
+    apiPost("/api/presets/load", {id: sel.value}).then(d => {
       if (!d.ok){ alert("载入失败：" + (d.error || "")); return; }
       fillForm(stageEl, d.preset.params);
+      STAGES[i].presetId = d.preset.id;  // 绑定：本阶段后续保存即更新该 preset
       dgEstimate();
     });
+    return;
+  }
+  if (a === "preset-save"){
+    saveStagePreset(i);
     return;
   }
   const list = snapshot();

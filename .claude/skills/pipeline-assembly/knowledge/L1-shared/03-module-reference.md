@@ -2,14 +2,17 @@
 
 > 层：L1-shared ｜ 读者：总装 / 组装工 ｜ 权威源：umvp/pipe/composer.py、umvp/face_*/、umvp/resources.py
 
-## 管道四模块（compose 装配器把 spec 映射为四种模式，模式差异收敛为配置）
+## 管道四模块（产品按 stages 自定义拼接；`compose()` 四模式为代码层兼容封装）
+
+> 注：模块测试页的测试参数（测试图片 / 演示回填 / 事件脚本 / 模拟参数，PARAMS 标
+> `test_only`）不属于模块参数、不落库、不进链路设计器，下表只列模块自身参数。
 
 | 模块 | 作用 | 关键参数（默认值） |
 |---|---|---|
-| FrameManager 帧管理 | 取帧节奏 + 背压 | sampling(analysis/wall_clock/frame_count)、frame_skip(3)、interval_sec(3.0)、n_frames |
-| YOLODetector 小模型 | 框出目标（COCO：0=人 2=车） | model_path、conf(0.35)、iou(0.7)、imgsz(640)、max_det(300)、classes("0")、class_limits("0:1,300")、check_interval(3.0)、roi(裁剪送审) |
-| VLMAnalyzer 大模型 | 语义研判 + 素材准备 | crop_padding(0.15)、max_resolution("1280,720")、prompt、ref(crop:cls0/full:cls0/full:global)、vlm_endpoint、vlm_model(qwen3-vl-32b) |
-| AlarmPolicy 告警 | 判定 + 冷却 | kind(window/dwell/inspection)、target_actions("fire,fight")、smooth_frames、hit_ratio(1.0)、alarm_cooldown(60.0) |
+| FrameManager 帧管理 | 取帧节奏 + 背压 | sampling(analysis/wall_clock/frame_count)、frame_skip(3)、interval_sec(3.0)、interval_frames(30)、queue_threshold(32)、backpressure_multiplier(2)、adaptive_relax_ratio(1.2)、adaptive_recover_ratio(0.5) |
+| YOLODetector 小模型 | 框出目标（COCO：0=人 2=车） | model_path、conf(0.35)、iou(0.7)、imgsz(640)、max_det(300)、classes("0")、class_limits("0:1,300")、check_interval(3.0)、roi(裁剪送审)、track_change_only(仅在 track_id 变化时报送) |
+| VLMAnalyzer 大模型 | 语义研判 + 素材准备 | crop_padding(0.15)、max_resolution("1280,720")、prompt、ref(crop:cls0/full:cls0/full:global)、use_real_vlm、vlm_endpoint、vlm_model(qwen3-vl-32b) |
+| AlarmPolicy 告警 | 判定 + 冷却 | kind(window/dwell/inspection)、target_actions("fire,fight")、smooth_frames、hit_ratio(1.0)、alarm_cooldown(60.0)、cooldown_by_action(按警情类型独立冷却) |
 
 ## 人脸链路
 

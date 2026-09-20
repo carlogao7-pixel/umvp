@@ -14,7 +14,8 @@
 | `conda run -n ai python umvp/pipe/test_composer.py` | 纯逻辑 27 断言 | 秒级 |
 | `conda run -n ai python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz` | 人脸注册 + 自检 7/7 | 秒级 |
 | `conda run -n ai python tests/test_yolo_params.py` | YOLO 参数对比（真实推理，yolov8n.pt） | 约 1 分钟 |
-| `conda run -n ai python tests/test_3modes.py` | 三模式实机（需 VLM 端点可达） | 约 3.5 分钟 |
+| `conda run -n ai python tests/test_police_uav_pipeline.py` | 唯一保留链路（警用无人机）逻辑断言（不加载模型） | 秒级 |
+| `conda run -n ai python tests/test_police_uav_video.py` | 警用链路端到端（真实 YOLO + mock VLM） | 约 1 分钟 |
 | `conda run -n ai python umvp/resources.py` | 资源估算自检（不联网） | 秒级 |
 | `conda run -n ai python tests/test_face_extract_pipeline.py` | 人脸提取链路 27 断言 | 秒级 |
 
@@ -27,4 +28,4 @@
 
 - onnxruntime 会打印大量 `VerifyOutputSizes` / `Expected shape` 形状警告（SCRFD 动态 batch
   正常现象）和 `Duplicate provider` 警告，均不影响结果，验证时可用 `grep -v` 过滤。
-- 真实推理 / 长任务前告知预计耗时（YOLO 秒级、三模式分钟级）。
+- 真实推理 / 长任务前告知预计耗时（YOLO 秒级、端到端链路分钟级）。

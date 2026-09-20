@@ -9,6 +9,11 @@
     参数从 JSON 展开为类型化列（由 server.py 启动时 configure_modules 注册 schema）；
   - kind='pipeline' 仍是整份 JSON 快照（params_json），结构不固定不适合列式。
 
+ID 规则（2026-09-20 起，见 doc/数据库结构.md）:
+  - presets.id / pipelines.id 不再用自增整数，改"模块前缀 + 4 位序号"的业务编号，
+    如 YOLO0001 / FM0001 / PIPE0001；新建时按前缀自动递增；
+  - init_db 检测到旧整数 schema 时自动 DROP 全部相关表并重建（播种数据可再生）。
+
 设计约定（与 web_lab 一致）:
   - 惰性连接：首次调用才建立连接，服务器启动不依赖 MySQL；
   - pymysql 缺失或连接失败时函数抛异常，由 server.py 统一转 {ok:false, error}，
@@ -22,10 +27,12 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import os
 import re
+import threading
 
 # pymysql 缺失时不阻断导入（server.py 依旧可启动，DB 接口返回明确错误）
 try:
@@ -45,6 +52,10 @@ _CFG = {
 
 _conn = None  # 惰性连接
 
+# DB 访问全局锁：ThreadingHTTPServer 多线程共享单条 pymysql 连接（连接非线程安全，
+# 并发读会 Packet sequence wrong / read of closed file），所有 DB 操作在锁内串行执行。
+_LOCK = threading.RLock()
+
 # 模块参数 schema：module_id -> {参数名: 参数类型}。由 server.py 启动时 configure_modules 注册，
 # db 据此建参数表 / 类型强转（设计见 doc/存储设计.md）。
 _SCHEMAS: dict[str, dict[str, str]] = {}
@@ -63,9 +74,57 @@ _SQL_TYPES = {
 # 模块标识 / 参数名白名单（防表名/列名注入）
 _MODULE_ID_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
-# 已下线模块（从产品移除）：init_db 时幂等清理其参数表与 presets 行。
+# 业务 ID：模块前缀（前缀 + 4 位序号，如 YOLO0001）。新模块加进 MODULES 后在此登记前缀。
+_ID_PREFIXES = {
+    "frame_manager": "FM",
+    "yolo": "YOLO",
+    "vlm": "VLM",
+    "alarm": "AL",
+    "face_detect": "FDET",
+    "face_embed": "FEMB",
+    "face_store": "FSTO",
+    "extract_faces": "EXTF",
+}
+_PIPELINE_PREFIX = "PIPE"  # 链路（pipelines 表 / kind='pipeline' 的 preset）
+_PRESET_ID_RE = re.compile(r"^[A-Z]{2,4}\d{4}$")  # 合法业务 ID 形如 YOLO0001
+
+# 已下线/不落库模块（不注册参数 schema、不建参数表）：init_db 时幂等清理其参数表
+# 与 presets 行。
 # 2026-08-18: frame_scheduler 抽帧调度并入 frame_manager（帧管理），模块合并。
-_PRUNED_MODULES = {"frame_scheduler"}
+# 2026-09-20: compose/utest 为历史遗留空表，一并清理。
+# 2026-09-20(二): chain/face_monitor/frame_yolo 为 web 端隐藏运行器（运行入口，
+# 非产品模块），参数 preset 统一不落库，空参数表清理。
+_PRUNED_MODULES = {"frame_scheduler", "compose", "utest",
+                   "chain", "face_monitor", "frame_yolo"}
+
+
+def _preset_prefix(module_id: str) -> str:
+    """模块的业务 ID 前缀；未登记的模块取 module_id 前 4 字符大写兜底。"""
+    return _ID_PREFIXES.get(module_id) or module_id[:4].upper()
+
+
+def _next_preset_id(cur, module_id: str) -> str:
+    """按模块前缀分配下一个 preset 业务 ID（YOLO0001 → YOLO0002…）。锁内调用。"""
+    prefix = _preset_prefix(module_id)
+    cur.execute("SELECT id FROM presets WHERE id LIKE %s", (prefix + "%",))
+    mx = 0
+    for (v,) in cur.fetchall():
+        m = re.fullmatch(rf"{prefix}(\d+)", str(v))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return f"{prefix}{mx + 1:04d}"
+
+
+def _next_pipeline_id(cur) -> str:
+    """分配下一个链路业务 ID（PIPE0001 → PIPE0002…）。锁内调用。"""
+    prefix = _PIPELINE_PREFIX
+    cur.execute("SELECT id FROM pipelines WHERE id LIKE %s", (prefix + "%",))
+    mx = 0
+    for (v,) in cur.fetchall():
+        m = re.fullmatch(rf"{prefix}(\d+)", str(v))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return f"{prefix}{mx + 1:04d}"
 
 
 def _get_conn():
@@ -81,21 +140,31 @@ def _get_conn():
     return _conn
 
 
+@contextlib.contextmanager
 def _cursor():
+    """持锁借出 cursor：with 存续期间独占连接，退出时释放锁（DB 操作串行化）。"""
     global _conn
-    try:
-        conn = _get_conn()
-        conn.ping(reconnect=True)  # 缓存连接已断开时自动重连（否则 execute 阶段才报错）
-        return conn.cursor()
-    except Exception:
-        # 重连失败（MySQL 未启动等）：重置连接，换全新连接再试一次；仍失败则抛出由调用方处理
-        _conn = None
-        return _get_conn().cursor()
+    with _LOCK:
+        try:
+            conn = _get_conn()
+            conn.ping(reconnect=True)  # 缓存连接已断开时自动重连
+        except Exception:
+            # 重连失败（MySQL 未启动等）：重置连接，换全新连接再试；仍失败则抛出由调用方处理
+            _conn = None
+            conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            yield cur
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
 
 _DDLS = [
     """CREATE TABLE IF NOT EXISTS presets (
-  id INT AUTO_INCREMENT PRIMARY KEY,
+  id VARCHAR(24) NOT NULL PRIMARY KEY,
   kind ENUM('module','pipeline') NOT NULL DEFAULT 'module',
   name VARCHAR(64) NOT NULL,
   module_id VARCHAR(32) NOT NULL DEFAULT '',
@@ -107,7 +176,7 @@ _DDLS = [
     # 链路拼装：链路自身字段（streams/budget/meta）+ 有序步骤引用模块 preset
     # （设计见 doc/存储设计.md）
     """CREATE TABLE IF NOT EXISTS pipelines (
-  id INT AUTO_INCREMENT PRIMARY KEY,
+  id VARCHAR(24) NOT NULL PRIMARY KEY,
   name VARCHAR(64) NOT NULL,
   streams INT NOT NULL DEFAULT 1,
   budget_json TEXT NOT NULL,
@@ -118,15 +187,35 @@ _DDLS = [
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
     """CREATE TABLE IF NOT EXISTS pipeline_steps (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  pipeline_id INT NOT NULL,
+  pipeline_id VARCHAR(24) NOT NULL,
   position INT NOT NULL,
-  preset_id INT NOT NULL,
+  preset_id VARCHAR(24) NOT NULL,
   UNIQUE KEY uk_pipeline_position (pipeline_id, position),
   KEY idx_preset (preset_id),
   CONSTRAINT fk_step_pipeline FOREIGN KEY (pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE,
   CONSTRAINT fk_step_preset FOREIGN KEY (preset_id) REFERENCES presets(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
 ]
+
+
+def _legacy_id_schema(cur) -> bool:
+    """检测 presets.id 是否还是旧的自增整数 schema（需 DROP 重建）。"""
+    cur.execute("SELECT COLUMN_TYPE FROM information_schema.COLUMNS"
+                " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='presets' AND COLUMN_NAME='id'")
+    row = cur.fetchone()
+    return bool(row and str(row[0]).lower().startswith("int"))
+
+
+def _drop_legacy_tables(cur) -> None:
+    """DROP 全部配置相关表（presets/pipelines/pipeline_steps/preset_params_*）。
+
+    仅在检测到旧整数 ID schema 时调用：表内均为播种/测试数据（服务器启动会重新
+    播种唯一保留链路），重建后即迁移到前缀编号 schema。幂等。
+    """
+    cur.execute("SHOW TABLES")
+    for (t,) in cur.fetchall():
+        if t in ("presets", "pipelines", "pipeline_steps") or str(t).startswith("preset_params_"):
+            cur.execute(f"DROP TABLE `{t}`")
 
 
 def configure_modules(schemas: dict[str, dict[str, str]] | None) -> None:
@@ -154,16 +243,23 @@ def _module_table(module_id: str) -> str:
 
 
 def init_db() -> None:
-    """建表（幂等）+ 迁移旧 JSON 数据。服务器启动时调用一次。
+    """建表（幂等）+ 旧 schema 自动重建 + 迁移旧 JSON 数据。服务器启动时调用一次。
 
-    建三张主表后，为每个已注册模块 ensure 参数表（缺列自动 ALTER 补列），
-    再把历史 kind='module' 的 params_json 拆入对应参数表并清空（幂等）。
+    先检测旧整数 ID schema：存在则 DROP 全部配置表（数据可再生）重建为前缀编号
+    schema；然后为每个已注册模块 ensure 参数表（缺列自动 ALTER 补列），再把历史
+    kind='module' 的 params_json 拆入对应参数表并清空（幂等）。
     """
     with _cursor() as cur:
+        cur.execute("SELECT 1 FROM information_schema.TABLES"
+                    " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='presets'")
+        if cur.fetchone() and _legacy_id_schema(cur):
+            _drop_legacy_tables(cur)
+            print("[db] 检测到旧整数 ID schema，已 DROP 重建为前缀编号 schema")
         for ddl in _DDLS:
             cur.execute(ddl)
         for module_id, schema in _SCHEMAS.items():
             _ensure_module_table(cur, module_id, schema)
+        _prune_stale_columns(cur)
         _migrate_legacy_module_params(cur)
         _prune_removed_modules(cur)
 
@@ -173,7 +269,7 @@ def _ensure_module_table(cur, module_id: str, schema: dict[str, str]) -> None:
     tbl = _module_table(module_id)
     cols = ", ".join(f"`{k}` {t}" for k, t in schema.items())
     cur.execute(f"""CREATE TABLE IF NOT EXISTS {tbl} (
-  preset_id INT NOT NULL PRIMARY KEY,
+  preset_id VARCHAR(24) NOT NULL PRIMARY KEY,
   {cols},
   CONSTRAINT fk_pp_{module_id} FOREIGN KEY (preset_id) REFERENCES presets(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
@@ -202,6 +298,22 @@ def _migrate_legacy_module_params(cur) -> None:
         _upsert_module_params(cur, _module_table(module_id), rid,
                               _coerce_params(params, schema))
         cur.execute("UPDATE presets SET params_json='' WHERE id=%s", (rid,))
+
+
+def _prune_stale_columns(cur) -> None:
+    """删掉模块参数表里已不在注册 schema 中的列（幂等）。
+
+    列随 schema 双向收敛：加参数自动补列（_ensure_module_table），参数下线/
+    标记 test_only 不落库后，其历史列在此自动删除（2026-09-20 起，原"删参数
+    不删列（保守）"约定作废——配置数据可再生，一致性优先）。
+    """
+    for module_id, schema in _SCHEMAS.items():
+        tbl = _module_table(module_id)
+        cur.execute(f"SHOW COLUMNS FROM {tbl}")
+        stale = {r[0] for r in cur.fetchall()} - set(schema.keys()) - {"preset_id"}
+        for k in stale:
+            cur.execute(f"ALTER TABLE {tbl} DROP COLUMN `{k}`")
+            print(f"[db] {tbl} 清理废弃列: {k}")
 
 
 def _prune_removed_modules(cur) -> None:
@@ -266,14 +378,14 @@ def _restore_params(values: dict, schema: dict[str, str]) -> dict:
     return out
 
 
-def _insert_module_params(cur, tbl: str, preset_id: int, values: dict) -> None:
+def _insert_module_params(cur, tbl: str, preset_id: str, values: dict) -> None:
     cols = ", ".join(f"`{k}`" for k in values)
     ph = ", ".join(["%s"] * len(values))
     cur.execute(f"INSERT INTO {tbl} (preset_id, {cols}) VALUES (%s, {ph})",
                 [preset_id] + list(values.values()))
 
 
-def _upsert_module_params(cur, tbl: str, preset_id: int, values: dict) -> None:
+def _upsert_module_params(cur, tbl: str, preset_id: str, values: dict) -> None:
     """按 preset_id 更新参数行；不存在则插入（同名覆盖 / 迁移用）。
 
     先查存在性再决定 UPDATE/INSERT：UPDATE 后靠 rowcount 判断会把"参数与旧值
@@ -300,7 +412,7 @@ def list_presets(kind: str = "module") -> list[dict]:
             "SELECT id, name, module_id, params_json FROM presets"
             " WHERE kind=%s ORDER BY updated_at DESC, id DESC", (kind,))
         rows = cur.fetchall()
-        params_map: dict[int, dict] = {}
+        params_map: dict[str, dict] = {}
         if kind == "module":
             by_module: dict[str, list[int]] = {}
             for rid, _n, module_id, _pj in rows:
@@ -333,65 +445,91 @@ def list_presets(kind: str = "module") -> list[dict]:
     return out
 
 
-def save_preset(kind: str, name: str, module_id: str, params: dict) -> tuple[int, bool]:
-    """保存命名配置；同名覆盖旧配置。返回 (id, 是否新建)。
+def save_preset(kind: str, name: str, module_id: str, params: dict,
+                preset_id: str | None = None) -> tuple[str, bool]:
+    """保存命名配置；同名覆盖旧配置。返回 (业务 id 如 YOLO0001, 是否新建)。
 
+    新建时按模块前缀自动编号（YOLO0001→YOLO0002…；pipeline 类型用 PIPE 前缀）。
+    给定 preset_id 时按 id 定向更新（保持 id 稳定，链路上游引用不漂移，不新建）；
+    且名称留空时沿用原配置名（连名字都不改，只覆盖参数），供链路设计器"单模块保存"
+    复用——改完参数保存回同一 preset，id 不变、链路层引用不受影响。
+    否则沿用"同 kind+name 覆盖或新建"（模块库首存场景）。
     module 类型：事务内 upsert 注册表行（params_json 置空）+ 参数表行（拆列）；
     pipeline 类型：整份 params 存 params_json（结构不固定，不适合列式）。
     """
     name = (name or "").strip()
-    if not name:
-        raise ValueError("配置名不能为空")
     if len(name) > 64:
         raise ValueError("配置名过长（最多 64 字符）")
-    conn = _get_conn()
-    cur = conn.cursor()
-    try:
-        conn.ping(reconnect=True)
-        conn.begin()
-        cur.execute("SELECT id FROM presets WHERE kind=%s AND name=%s", (kind, name))
-        row = cur.fetchone()
-        if kind == "module":
-            schema = _SCHEMAS.get(module_id)
-            if not schema:
-                raise ValueError(f"模块参数 schema 未注册: {module_id}")
-            values = _coerce_params(params, schema)
-            tbl = _module_table(module_id)
-            if row:
-                pid = row[0]
-                cur.execute("UPDATE presets SET module_id=%s, params_json='' WHERE id=%s",
-                            (module_id, pid))
-                _upsert_module_params(cur, tbl, pid, values)
-                created = False
+    if preset_id is not None and not _PRESET_ID_RE.match(preset_id):
+        raise ValueError(f"非法配置 ID（应为前缀+4位序号，如 YOLO0001）: {preset_id!r}")
+    with _LOCK:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            conn.ping(reconnect=True)
+            conn.begin()
+            if preset_id is not None:
+                # 定向更新：保持 id 稳定（链路上游引用不漂移）。先确认存在并校验类型。
+                cur.execute("SELECT kind, name FROM presets WHERE id=%s", (preset_id,))
+                prow = cur.fetchone()
+                if prow is None:
+                    raise ValueError(f"配置不存在: id={preset_id}")
+                if kind == "module" and prow[0] != "module":
+                    raise ValueError(f"id={preset_id} 不是模块配置（kind={prow[0]}）")
+                if kind == "pipeline" and prow[0] != "pipeline":
+                    raise ValueError(f"id={preset_id} 不是链路配置（kind={prow[0]}）")
+                # 没写名称 → 沿用原名：仅覆盖参数，名字与 id 都稳定，不影响链路层
+                if not name and prow[1]:
+                    name = prow[1]
+                row = (preset_id,)
             else:
-                cur.execute("INSERT INTO presets (kind, name, module_id, params_json)"
-                            " VALUES (%s, %s, %s, '')", (kind, name, module_id))
-                pid = cur.lastrowid
-                _insert_module_params(cur, tbl, pid, values)
-                created = True
-        else:
-            params_json = json.dumps(params, ensure_ascii=False)
-            if row:
-                pid = row[0]
-                cur.execute("UPDATE presets SET params_json=%s WHERE id=%s",
-                            (params_json, pid))
-                created = False
+                if not name:
+                    raise ValueError("配置名不能为空")
+                cur.execute("SELECT id FROM presets WHERE kind=%s AND name=%s", (kind, name))
+                row = cur.fetchone()
+            if not name:
+                raise ValueError("配置名不能为空")
+            if kind == "module":
+                schema = _SCHEMAS.get(module_id)
+                if not schema:
+                    raise ValueError(f"模块参数 schema 未注册: {module_id}")
+                values = _coerce_params(params, schema)
+                tbl = _module_table(module_id)
+                if row:
+                    pid = row[0]
+                    cur.execute("UPDATE presets SET module_id=%s, name=%s, params_json=''"
+                                " WHERE id=%s", (module_id, name, pid))
+                    _upsert_module_params(cur, tbl, pid, values)
+                    created = False
+                else:
+                    pid = _next_preset_id(cur, module_id)
+                    cur.execute("INSERT INTO presets (id, kind, name, module_id, params_json)"
+                                " VALUES (%s, %s, %s, %s, '')", (pid, kind, name, module_id))
+                    _insert_module_params(cur, tbl, pid, values)
+                    created = True
             else:
-                cur.execute("INSERT INTO presets (kind, name, module_id, params_json)"
-                            " VALUES (%s, %s, '', %s)", (kind, name, params_json))
-                pid = cur.lastrowid
-                created = True
-        conn.commit()
-        return pid, created
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
+                params_json = json.dumps(params, ensure_ascii=False)
+                if row:
+                    pid = row[0]
+                    cur.execute("UPDATE presets SET params_json=%s WHERE id=%s",
+                                (params_json, pid))
+                    created = False
+                else:
+                    pid = _next_preset_id(cur, "pipeline")
+                    cur.execute("INSERT INTO presets (id, kind, name, module_id, params_json)"
+                                " VALUES (%s, %s, %s, '', %s)", (pid, kind, name, params_json))
+                    created = True
+            conn.commit()
+            return pid, created
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
-def load_preset(preset_id: int) -> dict:
-    """按 id 取回配置：{id, kind, name, module_id, params}。不存在抛 ValueError。
+def load_preset(preset_id: str) -> dict:
+    """按业务 id 取回配置：{id, kind, name, module_id, params}。不存在抛 ValueError。
 
     module 类型从参数表组装 params；pipeline 类型解析 params_json。
     """
@@ -419,7 +557,7 @@ def load_preset(preset_id: int) -> dict:
             "params": params}
 
 
-def delete_preset(preset_id: int) -> None:
+def delete_preset(preset_id: str) -> None:
     """删除配置；不存在也不报错（幂等）。被链路引用时拒绝（引用完整性）。"""
     with _cursor() as cur:
         cur.execute("SELECT p.name FROM pipeline_steps ps"
@@ -446,7 +584,7 @@ def list_pipelines() -> list[dict]:
         cur.execute("SELECT id, name, streams, budget_json, meta_json, updated_at"
                     " FROM pipelines ORDER BY updated_at DESC, id DESC")
         rows = cur.fetchall()
-        steps: dict[int, list[dict]] = {}
+        steps: dict[str, list[dict]] = {}
         cur.execute("SELECT ps.pipeline_id, ps.position, ps.preset_id, p.module_id"
                     " FROM pipeline_steps ps JOIN presets p ON p.id = ps.preset_id"
                     " ORDER BY ps.pipeline_id, ps.position")
@@ -461,12 +599,13 @@ def list_pipelines() -> list[dict]:
     return out
 
 
-def save_pipeline(name: str, preset_ids: list[int], streams: int = 1,
-                  budget: dict | None = None, meta: dict | None = None) -> tuple[int, bool]:
-    """保存链路（步骤引用模块 preset）；同名覆盖。返回 (id, 是否新建)。
+def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
+                  budget: dict | None = None, meta: dict | None = None) -> tuple[str, bool]:
+    """保存链路（步骤引用模块 preset）；同名覆盖。返回 (业务 id 如 PIPE0001, 是否新建)。
 
     preset_ids 的顺序即链路步骤顺序（position 0..n-1）；事务内重建 steps，
     保证 pipelines 与 pipeline_steps 原子一致。步骤只能引用 kind='module' 的配置。
+    新建时按 PIPE 前缀自动编号。
     """
     name = (name or "").strip()
     if not name:
@@ -477,47 +616,49 @@ def save_pipeline(name: str, preset_ids: list[int], streams: int = 1,
         raise ValueError("链路至少需要一个模块步骤")
     budget_json = json.dumps(budget or {}, ensure_ascii=False)
     meta_json = json.dumps(meta or {}, ensure_ascii=False)
-    conn = _get_conn()
-    cur = conn.cursor()
-    try:
-        conn.ping(reconnect=True)
-        # 校验步骤引用的 preset 存在且为 module 类型（放事务外，避免无用锁占位）
-        placeholders = ",".join(["%s"] * len(preset_ids))
-        cur.execute(f"SELECT id, kind FROM presets WHERE id IN ({placeholders})",
-                    tuple(preset_ids))
-        found = {rid: kind for rid, kind in cur.fetchall()}
-        for rid in preset_ids:
-            if rid not in found:
-                raise ValueError(f"步骤引用的配置不存在: id={rid}")
-            if found[rid] != "module":
-                raise ValueError(f"步骤只能引用模块配置（kind='module'），id={rid} 是 {found[rid]}")
-        conn.begin()
-        cur.execute("SELECT id FROM pipelines WHERE name=%s", (name,))
-        row = cur.fetchone()
-        if row:
-            pid = row[0]
-            cur.execute("UPDATE pipelines SET streams=%s, budget_json=%s, meta_json=%s"
-                        " WHERE id=%s", (streams, budget_json, meta_json, pid))
-            cur.execute("DELETE FROM pipeline_steps WHERE pipeline_id=%s", (pid,))
-            created = False
-        else:
-            cur.execute("INSERT INTO pipelines (name, streams, budget_json, meta_json)"
-                        " VALUES (%s, %s, %s, %s)", (name, streams, budget_json, meta_json))
-            pid = cur.lastrowid
-            created = True
-        for position, preset_id in enumerate(preset_ids):
-            cur.execute("INSERT INTO pipeline_steps (pipeline_id, position, preset_id)"
-                        " VALUES (%s, %s, %s)", (pid, position, preset_id))
-        conn.commit()
-        return pid, created
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
+    with _LOCK:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            conn.ping(reconnect=True)
+            # 校验步骤引用的 preset 存在且为 module 类型（放事务外，避免无用锁占位）
+            placeholders = ",".join(["%s"] * len(preset_ids))
+            cur.execute(f"SELECT id, kind FROM presets WHERE id IN ({placeholders})",
+                        tuple(preset_ids))
+            found = {rid: kind for rid, kind in cur.fetchall()}
+            for rid in preset_ids:
+                if rid not in found:
+                    raise ValueError(f"步骤引用的配置不存在: id={rid}")
+                if found[rid] != "module":
+                    raise ValueError(f"步骤只能引用模块配置（kind='module'），id={rid} 是 {found[rid]}")
+            conn.begin()
+            cur.execute("SELECT id FROM pipelines WHERE name=%s", (name,))
+            row = cur.fetchone()
+            if row:
+                pid = row[0]
+                cur.execute("UPDATE pipelines SET streams=%s, budget_json=%s, meta_json=%s"
+                            " WHERE id=%s", (streams, budget_json, meta_json, pid))
+                cur.execute("DELETE FROM pipeline_steps WHERE pipeline_id=%s", (pid,))
+                created = False
+            else:
+                pid = _next_pipeline_id(cur)
+                cur.execute("INSERT INTO pipelines (id, name, streams, budget_json, meta_json)"
+                            " VALUES (%s, %s, %s, %s, %s)",
+                            (pid, name, streams, budget_json, meta_json))
+                created = True
+            for position, preset_id in enumerate(preset_ids):
+                cur.execute("INSERT INTO pipeline_steps (pipeline_id, position, preset_id)"
+                            " VALUES (%s, %s, %s)", (pid, position, preset_id))
+            conn.commit()
+            return pid, created
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
-def load_pipeline(pipeline_id: int) -> dict:
+def load_pipeline(pipeline_id: str) -> dict:
     """按 id 取回完整链路：{id, name, streams, budget, meta, stages}。
 
     stages 为有序步骤 [{position, preset_id, module_id, params}]，可直接生成
@@ -535,7 +676,7 @@ def load_pipeline(pipeline_id: int) -> dict:
                     " WHERE ps.pipeline_id=%s ORDER BY ps.position", (pid,))
         steps = cur.fetchall()  # (position, preset_id, module_id)
         # 按 module_id 分组，批量取各步骤的参数（模块参数表）
-        params_map: dict[int, dict] = {}
+        params_map: dict[str, dict] = {}
         by_module: dict[str, list[tuple[int, int]]] = {}
         for position, preset_id, module_id in steps:
             by_module.setdefault(module_id, []).append((position, preset_id))
@@ -560,7 +701,7 @@ def load_pipeline(pipeline_id: int) -> dict:
             "stages": stages}
 
 
-def delete_pipeline(pipeline_id: int) -> None:
+def delete_pipeline(pipeline_id: str) -> None:
     """删除链路（steps 级联删除）；不存在也不报错（幂等）。"""
     with _cursor() as cur:
         cur.execute("DELETE FROM pipeline_steps WHERE pipeline_id=%s", (pipeline_id,))

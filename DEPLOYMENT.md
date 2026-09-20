@@ -34,6 +34,194 @@
 
 ## 记录
 
+### 2026-09-20 · 测试台新增视频信息预估 + 落盘上限 200 张
+- 变更内容：① 新增 GET `/api/video/info?name=` 接口（cv2 读分辨率/帧率/总帧数/时长）；
+  test.html 选视频/换链路/改时间段/限帧后，信息条实时显示分辨率与"按链路帧管理
+  frame_skip 预计分析 N 帧"（frame_skip 取所选链路 frame_manager 阶段参数，前端缓存）。
+  ② h_pipeline_run 落盘上限：单次测试最多保存 200 张图（原图/标注图/人脸图共用
+  计数，参数 max_saved_images 可覆盖）；超限跳过写盘、时间线记一条提示、结果头
+  汇总"落盘 N 张（超上限跳过 M 张）"。
+- 影响面：入口（新增 API 路由）/ 配置（落盘行为变化）
+- 部署注意：无新增依赖；重启 web_lab 生效。
+- 验证：/api/video/info?name=traffic.MP4 返回 3840×2160@29.97fps/1832 帧/61.1s；
+  max_saved_images=3 跑 450 帧链路 → 目录恰 3 张图、汇总"落盘 3 张（超上限跳过
+  27 张）"、时间线含上限提示；test.html JS 语法通过。
+
+### 2026-09-20 · 测试参数与模块参数分离：不落库、不进链路设计器
+- 变更内容：① server.py PARAMS 为各模块测试参数标记 `"test_only": true`（frame_manager
+  的 mode/scenario/fps/n_frames/ts_step、yolo 的 image/ts、vlm 的 image(新增，修真实
+  调用无法选图)/ref/gran/track_key/bbox/det_count、alarm 的 timeline、face_detect 的
+  image、face_embed 的 image/det_thresh/det_size、face_store 的 action/register_dir/
+  image/name、extract_faces 的 image）；② configure_modules 注册 schema 时过滤
+  test_only → 这些参数不再有库列；③ db.py 新增 `_prune_stale_columns`：init_db 时
+  幂等 DROP 模块参数表中已不在注册 schema 的列（列随 schema 双向收敛，替代原
+  "删参数不删列"约定）；④ index.html 模块测试页分区展示（"测试参数（仅本页运行用，
+  不存库、不进链路）"分隔块），链路设计器阶段表单过滤 test_only。
+- 影响面：DB（模块参数表删列）/ 结构
+- 部署注意：换机拉代码重启 web_lab 即自动清理废弃列（幂等）；预设中测试参数不再
+  持久化，载入 preset 后测试区回默认值（预期行为）。
+- 验证：重启后 SHOW COLUMNS——frame_manager/yolo/vlm/face_store 等表的测试列已删，
+  presets 8 行与 PIPE0001 引用不变；保存 preset 带 image/ts 额外键→落库自动剔除
+  （load 返回键集仅模块参数）；/api/schema 带 test_only 标记；traffic.MP4 90 帧链路
+  端到端无回归；index.html JS 语法检查通过。
+
+### 2026-09-20 · 清理运行器空参数表（chain/face_monitor/frame_yolo 不再落库）
+- 变更内容：① server.py 启动注册参数 schema 时按 `hidden` 过滤——只注册 8 个产品模块，
+  web 隐藏运行器（chain/face_monitor/frame_yolo，另有无参数的 pipeline_run）是运行入口
+  而非产品模块，不再建参数表、参数 preset 不落库（保存报"schema 未注册"）；
+  ② db.py `_PRUNED_MODULES` 追加这三个模块，init_db 幂等 DROP 其空表与残留行；
+  `_ID_PREFIXES` 移除对应的 FMON/FYLO/CHN。库内 3 张 0 行空表
+  （preset_params_chain / preset_params_face_monitor / preset_params_frame_yolo）已删除，
+  参数表收敛为 8 张（每产品模块一张、各 1 行）。
+- 影响面：DB / 结构
+- 部署注意：换机拉代码重启 web_lab 即自动清理（幂等）；运行器模块本身保留
+  （/api/schema 仍 12 个模块，test 页运行不受影响）。
+- 验证：重启后 SHOW TABLES = 3 主表 + 8 参数表，presets 8 行 / pipelines 1 行不变；
+  /api/schema 12 模块正常；/api/db/tables 参数表页签只剩 8 个产品模块；
+  对 chain 保存 preset 返回明确报错。
+
+### 2026-09-20 · 工作区整理简化：DB 业务 ID（YOLO0001 式）+ 唯一保留链路 + 播种收敛
+- 变更内容：① `web_lab/db.py` schema 变更——presets.id / pipelines.id 从自增整数改为
+  "前缀+4 位序号"业务编号（FM/YOLO/VLM/AL/FDET/FEMB/FSTO/EXTF/FMON/FYLO/CHN + PIPE，
+  前缀表见 `_ID_PREFIXES`），新建自动按前缀递增；pipeline_steps.preset_id 同步改
+  VARCHAR(24)；`init_db()` 检测到旧整数 schema 自动 DROP 全部配置表重建（播种数据可再生）。
+  ② 播种收敛到 server.py `_seed_pipeline()` 一处：唯一保留「警用无人机链路」PIPE0001
+  （步骤 FM0001→YOLO0001→VLM0001→AL0001，实调参数 imgsz=1280/conf=0.25/use_real_vlm=1）+
+  人脸四模块默认 preset（FDET0001/FEMB0001/FSTO0001/EXTF0001）；原 server 双链路种子、
+  tests/police_uav_config.py、tests/face_dedup_config.py 移除；删除重复实现
+  tests/test_video_face_dedup.py。③ 清理死代码：/db_admin.html 路由、_db_monitor/_db_query
+  （另一套连不上库的连接参数）。④ 文档：doc/modules/ 每模块一篇（8 模块+链路，含参数/
+  输入/输出字段），删《模块与参数手册.md》，重写《数据库结构.md》。
+- 影响面：DB / 入口（删除 2 个测试配置脚本与 2 个死路由）/ 结构（doc/modules/）
+- 部署注意：换机拉代码后**重启 web_lab 即自动迁移**（旧库 DROP 重建 + 重新播种，无需
+  手工操作；确认 MySQL 3307 在运行）；test.html 链路下拉里 pipeline_id 已是 PIPE0001。
+- 验证：重启后 SHOW TABLES + presets 恰 8 行（FM0001/YOLO0001/VLM0001/AL0001/
+  FDET0001/FEMB0001/FSTO0001/EXTF0001）、pipelines 恰 1 行 PIPE0001（4 步）；API 实测
+  presets save（自动 YOLO0002）/load/delete、定向更新（YOLO0001 参数覆盖 id 不变）、
+  pipelines save/load/delete 全通过；traffic.MP4 150 帧端到端跑通（开 vlm_feedback：
+  真实 VLM 研判返回"交警类"并成警）；test_composer.py 27 断言 + test_police_uav_pipeline.py
+  全过。
+
+### 2026-08-26 · 警用无人机链路 YOLO 参数调整 + 清理空白 frame_manager 孤儿
+- 变更内容：① 链路 10（警用无人机）yolo 步骤引用的 preset 85 参数落库更新为
+  imgsz=1280、conf=0.25（iou=0.6、roi=false、class_limits="0:2,300;2:1,300" 同步补齐），
+  用预定定向更新（preset_id=85，id 稳定，链路引用不漂移）；② 清理空白孤儿 preset 99
+  （frame_manager「警用无人机链路 · 帧管理 FrameManager」，参数全空 0/14，未被任何链路
+  引用——前次保存 bug 残留）。
+- 影响面：DB（preset 85 参数更新、preset 99 删除）、配置（链路 10 yolo 阈值生效）
+- 部署注意：web_lab 已重启；链路 10 引用 84/85/86/87，yolo=85（imgsz 1280 / conf 0.25）；
+  其余未引用有值 preset 为模块库默认/历史，保留不动。
+- 验证：`/api/presets/load {id:85}` imgsz=1280、conf=0.25；`/api/pipelines/load {id:10}`
+  步骤 84/85/86/87；全表扫描未引用且全空条 = 无。
+
+### 2026-08-26 · 清理空白配置 + 链路设计器"载入"下拉按模块过滤
+- 变更内容：① `web_lab/index.html` `renderStagePresetSel(q, sel, mid)` 加 `mid` 参数，
+  阶段级"载入"下拉只列与当前阶段同模块的 preset（此前列出全部模块，误选会填错参数）；
+  ② 数据清理：删除 4 条空白无意义 preset——100(yolo 0/16)、101(vlm 0/12)、
+  102(alarm 0/8)（前次 bug 生成的未填参孤儿）、76(compose 空 schema 0/0)；
+  把链路 10（警用无人机）步骤从 bug 产物 99/100/101/102 重整回完整的 84/85/86/87。
+- 影响面：DB（删 4 条空白 preset；链路 10 步骤引用复位）、配置（设计器载入下拉
+  只显示本模块配置，避免错选）
+- 部署注意：web_lab 已重启生效；未删除"有值但未引用"的（88-91 (配置扩展)、99 等）
+  与「*·默认」模块种子——非空白、且部分被模块库"载入默认"使用，保留以免丢配置；
+  preset 85 名字仍为"小模型识别 YOLODetector"（模块栏未填名时的默认），功能正常。
+- 验证：`node --check` 通过；`/api/pipelines/load {id:10}` 步骤引用 84/85/86/87、
+  yolo imgsz=1280（保留你调过的值）已复位；presets 无 id 100/101/102/76。
+
+### 2026-08-26 · 修改链路/模块参数"同步落库"：预设定向更新，不再产生冗余
+- 变更内容：修复"链路设计器/模块栏改参数后未落库"且重复生成 preset 的问题。
+  根因：`savePipelinePreset` 每次保存都按「链路名·模块名」新建 preset，与链路
+  pipeline_steps 实际引用的既有 preset（如 `警用无人机_YOLO识别`=85）名字对不上，
+  导致两套 id、引用漂移、旧 preset 变孤儿，改 A 库边引用 B。方案：改参数=更新引用的
+  那条 preset（id 稳定），绝不为既有阶段新建。
+  - `web_lab/db.py`：`save_preset` 新增可选 `preset_id`——给定则按 id 定向更新
+    （校验存在与 kind，UPDATE 该行 + 参数表 upsert，id 不变）；未给则沿用同名覆盖/新建。
+  - `web_lab/server.py`：`_preset_save` 读取并透传 `preset_id`。
+  - `web_lab/index.html`：设计器 `STAGES` 每阶段带 `presetId`（`addStage`/`renderStages`/
+    `loadPipelinePreset` 传递，阶段级"载入"绑定选中 preset id）；`savePipelinePreset`
+    有 `presetId` 则定向更新、无则新建并记 id；模块栏 `loadModulePreset`/`saveModulePreset`
+    增加 `modulePresetId` 跟踪（载入后改参保存即更新该 preset），切换模块时重置。
+- 影响面：DB（preset 更新语义不变更 schema；链路 10 的 yolo 步骤已从缺参孤儿 preset
+  100 重整为引用完整 preset 85，参数齐全）、配置（改参数落库到引用那条，链路引用稳定）
+- 部署注意：web_lab 已重启；既有冗余孤儿 preset 未删（可后续清理），但不再新增；
+  模块栏/设计器载入某 preset 后改参保存，即更新该 preset，不再出现"改了不生效"。
+- 验证：`py_compile` + `node --check` 通过；`preset_id=85` 定向更新 imgsz 960→id 不变、
+  落库 960→reset 640；yolo preset 总数 6 不变（不新建）；链路 10 载出 yolo 步骤
+  引用 preset 85、imgsz=640 参数完整（此前为 import 100 全 None）。
+
+### 2026-08-26 · 修复 web 端编辑模块时偶发"数据库不可用"（DB 连接的线程安全）
+- 变更内容：`web_lab/db.py` 修复多线程共享单条 pymysql 连接导致的并发错乱
+  （根因：ThreadingHTTPServer 每请求开新线程，前端 loadSchema 一次并发 3 个 presets
+  请求打在全局单例 `_conn` 上，连接非线程安全 → `Packet sequence number wrong` /
+  `read of closed file` → 接口 ok:false → 前端显示"数据库不可用"）。新增全局
+  `_LOCK = threading.RLock()`；`_cursor()` 改为 `@contextlib.contextmanager` 上下文
+  管理器（with 存续期间持锁独占连接，退出释放，现有调用点零改动）；`save_preset`/
+  `save_pipeline` 两个直连 conn.cursor() 的函数事务体包进 `with _LOCK:`。
+- 影响面：DB（访问层串行化，不含锁外长事务；DB 操作均为短查询/短事务，串行开销可忽略）
+- 部署注意：web_lab 已重启生效；不影响表结构与连接参数，无迁移。
+- 验证：并发回归——修复前 12 并发 3 失败（Packet sequence wrong），修复后 20 并发
+  0 失败；`/api/pipelines` 读正常（ok:true，2 条）；`py_compile` 通过。
+
+### 2026-08-26 · 测试台通用化：支持人脸链（无 alarm）+ 结果区 JSON 分行与动态过滤
+- 变更内容：`web_lab/server.py` ① `_chain_from_spec` 放宽必需阶段——alarm 不再强制
+  （含 face_embed 的人脸链无告警阶段，占位 inspection 策略），frame_manager 仍必需；
+  ② `h_pipeline_run` 新增人脸链分支：含 face_embed 阶段时惰性加载 FaceDetector/
+  FaceEmbedder/CropRestore，按帧管理节奏走 `extract_faces`（YOLO 识人→SCRFD 检脸→
+  坐标还原）→ ArcFace 嵌入 → 与已收集身份余弦去重（阈值取 face_embed 阶段 thresh，
+  默认 0.55）→ 新身份记 kind=face 事件（data=FaceResult.to_dict+best_sim）+ 原分辨率
+  人脸落盘/出图（≤36 张）；重复记 kind=info。③ timeline 事件全部支持 data 字段
+  （submit/vlm/alarm 亦带结构化数据）；④ 字符串参数清洗提升为模块级 `_str_param`。
+  `web_lab/test.html` 结果区通用化：日志条目附带 data 时以分行 JSON（pre.log-json）
+  展示；过滤器动态生成——按本次 timeline 出现的 kind 决定显示"仅 VLM 报送/仅告警/
+  仅新人脸"选项（人脸链不显示告警项，告警链不显示人脸项）。
+- 影响面：配置（人脸链可直接在测试台运行；face_detect/face_embed 阶段参数
+  det_thresh/det_size/upscale/margin/min_person_short/dedup_iou/thresh 参与运行）
+- 部署注意：web_lab 已重启；人脸去重阈值默认 0.55，同人跨帧相似度偏低时可调大
+  face_embed 阶段 thresh（阈值高=更倾向判为新身份）。
+- 验证：链路 11（视频人脸去重提取）face1.MP4 全视频：178 分析帧、新身份 31、
+  重复丢弃 170、31 张人脸图（best_sim 边缘样本可见去重工作正常）；链路 10
+  （警用无人机）traffic.MP4 前 120 帧：submit 2 / vlm 2 / alarm 1（描述完整），
+  两链路事件分布与过滤器预期一致。
+
+### 2026-08-25 · 链路测试接入真实 VLM 调用（use_real_vlm）+ 解析兼容 alert_type
+- 变更内容：`web_lab/server.py` 的 `h_pipeline_run` 支持 VLM 真实研判——从链路 vlm 阶段
+  参数读 `use_real_vlm/vlm_endpoint/vlm_model/vlm_key`（vlm 模块 schema 原有字段，此前
+  仅模块单测用），开启后每条报送经 `VLMAnalyzer.prepare` + 新增 `_vlm_material()`
+  （crop:* 按该类首目标 bbox 外扩裁剪 / full:* 整帧）送真实端点，action 喂
+  `on_vlm_result` 判告警；关闭则维持模拟回填（vlm_action 字符串）。配套：
+  `_parse_vlm_action` 兼容 `result/alert_type/action` 三字段（警用链路 prompt 返回
+  alert_type，原只认 result 必然解析失败）；`_vlm_real` 对 DB 还原的 None 参数防護；
+  VLM 调用失败记日志继续不中断测试。DB 侧：链路 10（警用无人机）vlm preset 86
+  已更新 `use_real_vlm=true`，并清理该链路重复的 4 个 stages（84-91 → 84-87）。
+- 影响面：配置（链路 vlm 阶段 use_real_vlm=true 时测试真实调用端点，网络慢时测试
+  时长随报送数增长）、DB（preset 86 覆盖更新、链路 10 steps 重建）
+- 部署注意：web_lab 已重启生效；真实调用走 `http://117.42.21.253:8000/v1/chat/completions`
+  （vlm 阶段参数可覆盖），无 key；测试时长 = 报送数 × 单次 VLM 耗时，调大 frame_skip/
+  check_interval 可减少报送。
+- 验证：`py_compile` 过；图片模式冒烟（链路 10 + 人遮挡1.png）：检出 14、报送 2 条
+  （cls0×10 / cls2×4）、真实 VLM 返回"无异常"×2、正常场景不告警（行为正确）；
+  preset 86 use_real_vlm=true 读回确认；链路 10 steps=84-87 无重复。
+
+### 2026-08-25 · 修复链路测试三连错（stages 解析 / module_id / device "None"）+ 测试台去重复抽帧
+- 变更内容：`web_lab/server.py` 修复链路测试（`h_pipeline_run` → `_chain_from_spec`）三处错误：
+  ① spec 解析——原从 `pipeline_data.get("spec")` 读取，但 `db.load_pipeline` 返回
+  `{id, name, streams, budget, meta, stages}`，改为直接按返回值构建 spec；
+  ② stages 字段名——`s.get("module")` 改为 `s.get("module_id")`（db 返回结构）；
+  ③ device "None" 报错（根因）——DB 参数表空列经 `_restore_params` 还原为 Python
+  `None`，`str(None).strip()` 得字符串 `"None"` 传给 torch 报
+  `device string: None`；`_chain_from_spec` 新增 `_s()` 清洗（None/空串 → 默认值），
+  覆盖 device/sampling/kind/prompt/model_path/class_limits；`umvp/pipe/composer.py`
+  的 `YOLODetector.infer` 同时显式传 device（已配置时）。
+  另：测试台 `frame_skip` 与链路内部 FrameManager 双重抽帧，删除测试台侧参数
+  （`web_lab/test.html` 输入框与 JS 读取、server 端 h_pipeline_run 读取），
+  取图节奏统一由链路设计器帧管理模块控制。
+- 影响面：配置（链路测试参数去 frame_skip；DB 空列参数回落默认值不再变成 "None"）
+- 部署注意：web_lab 已重启生效；GPU 用户在链路设计器 YOLO 模块 device 填 `0`。
+- 验证：`conda run -n ai python /tmp/opencode/test_chain_device.py`（None 参数组装：
+  device=None/sampling=analysis/vlm.prompt=""，全断言过）；
+  `umvp/pipe/test_composer.py` 27/27；`POST /api/test/pipeline_run {pipeline_id:10}`
+  走到"请指定测试视频"（组装成功）；test.html 无 frame_skip 残留。
+
 ### 2026-08-19 · OpenClaude 工具优先级调整：启用 GLM MCP 搜索工具，旧工具降级需确认
 - 变更内容：`/home/carloga0/.openclaude/settings.json` 权限配置调整——清空 `deny` 列表，将 `WebSearch`、`WebFetch`、`mcp__fetch__fetch` 移至 `ask` 列表（用户确认时才允许），新增 4 个 GLM MCP 服务器（zai-mcp-server/web-search-prime/web-reader/zread）无限制运行。
 - 影响面：配置（OpenClaude 全局工具优先级，影响 AI 助手网络搜索能力）

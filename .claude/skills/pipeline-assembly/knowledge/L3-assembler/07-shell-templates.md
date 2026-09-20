@@ -7,6 +7,11 @@
 `p.vlm.prepare(req, frame)` → payload；`p.vlm.analyze(payload, infer)` → action；
 `p.on_vlm_result(track_key, action, ts)` → alarms。
 
+> 2026-09-20 现状：产品链路走「模块自定义拼接」——链路由 pipelines + pipeline_steps
+> 存"模块 preset 引用 + 顺序"，web_lab 运行入口 `_chain_from_spec(stages)` 按 stages
+> 组装模块。下文的 `compose(spec)` 四模式封装保留作独立脚本/回归测试兼容（`test_composer.py`
+> 仍覆盖），新链路优先按 stages 组装。
+
 ## 3.1 驱动壳（帧循环）
 
 ```python

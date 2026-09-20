@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UMVP 链路测试台</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#161d2e; --panel2:#1c2538; --line:#2a3550;
+    --text:#dbe4f5; --dim:#8a97b5; --accent:#4f8cff; --ok:#3fca8c; --warn:#ffb454; --err:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;height:100vh}
+  
+  aside{width:220px;min-width:220px;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:16px 8px}
+  aside h1{font-size:14px;margin:0 8px 12px;color:var(--accent);letter-spacing:1px}
+  aside button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--text);
+    padding:6px 8px;margin:2px 0;border-radius:6px;cursor:pointer;font-size:13px}
+  aside button:hover{background:var(--panel2)}
+  aside button.active{background:var(--accent);color:#fff}
+  
+  main{flex:1;overflow-y:auto;padding:16px 20px 80px;min-width:0}
+  
+  .section{margin-bottom:16px}
+  .section-title{font-size:13px;color:var(--accent);margin:0 0 8px;font-weight:600}
+  
+  .control-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:900px}
+  .control-grid .field{grid-column:span 1}
+  .control-grid .full{grid-column:span 2}
+  
+  .field{margin-bottom:8px}
+  .field label{display:block;font-size:12px;margin-bottom:3px;color:var(--text)}
+  .field .help{font-size:10px;color:var(--dim);margin-top:2px}
+  
+  input[type=text],input[type=number],select,textarea{width:100%;max-width:480px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:6px;color:var(--text);padding:5px 8px;font-size:12px}
+  input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+  
+  .btn-row{display:flex;gap:8px;margin-top:12px}
+  button{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px;font-weight:500}
+  button:hover{background:var(--accent);color:#fff}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button.primary:hover{background:#3a76e6}
+  button.stop{background:var(--err);color:#fff;border-color:var(--err)}
+  button.stop:hover{background:#e05a5a}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  
+  .video-container{position:relative;background:#000;border-radius:8px;overflow:hidden;margin-bottom:16px;
+    border:1px solid var(--line)}
+  .video-container video{width:100%;max-height:500px;display:block}
+  .video-overlay{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.7);
+    padding:8px 12px;display:flex;gap:12px;align-items:center;font-size:12px}
+  .time-display{color:#fff;font-family:monospace}
+  
+  .results-container{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  
+  .log-panel{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:12px;height:400px;overflow-y:auto}
+  .log-panel h3{margin:0 0 8px;font-size:12px;color:var(--accent);
+    display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .log-panel h3 select{background:var(--panel);border:1px solid var(--line);
+    color:var(--text);border-radius:5px;padding:3px 8px;font-size:12px}
+  .log-entry{font-family:ui-monospace,Consolas,monospace;font-size:11px;
+    line-height:1.6;margin:4px 0;padding:3px 6px;border-radius:3px;white-space:pre-wrap;word-break:break-all}
+  .log-entry.frame{color:#4fc3f7;background:rgba(79,195,247,0.1)}
+  .log-entry.det{color:#81c784;background:rgba(129,199,132,0.1)}
+  .log-entry.alarm{color:#ffb74d;background:rgba(255,183,77,0.1)}
+  .log-entry.error{color:#ef5350;background:rgba(239,83,80,0.1)}
+  .log-entry.kind-frame{color:#4fc3f7;background:rgba(79,195,247,0.12);margin-top:10px;font-weight:600}
+  .log-entry.kind-submit{color:#81c784;background:rgba(129,199,132,0.1)}
+  .log-entry.kind-vlm{color:#ba68c8;background:rgba(186,104,200,0.12)}
+  .log-entry.kind-alarm{color:#ffb74d;background:rgba(255,183,77,0.15);font-weight:600}
+  .log-entry.kind-fail{color:#ef5350;background:rgba(239,83,80,0.1)}
+  .log-entry.kind-face{color:#4dd0e1;background:rgba(77,208,225,0.12);font-weight:600}
+  .log-entry.kind-info{color:var(--dim);opacity:.75}
+  .log-json{margin:4px 0 0 12px;padding:4px 8px;font-family:ui-monospace,Consolas,monospace;
+    font-size:10.5px;line-height:1.5;color:#a5d6a7;background:rgba(0,0,0,0.25);
+    border-left:2px solid var(--line);white-space:pre;overflow-x:auto}
+  
+  .images-panel{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:12px;height:400px;overflow-y:auto}
+  .images-panel h3{margin:0 0 8px;font-size:12px;color:var(--accent)}
+  .image-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+  .image-item{position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:6px;overflow:hidden}
+  .image-item img{width:100%;height:100px;object-fit:cover;display:block}
+  .image-item .label{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.7);
+    color:#fff;font-size:10px;padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  
+  .status-bar{position:fixed;bottom:0;left:220px;right:0;background:var(--panel);
+    border-top:1px solid var(--line);padding:8px 16px;display:flex;gap:20px;align-items:center;font-size:12px}
+  .status-item{display:flex;align-items:center;gap:6px}
+  .status-item .label{color:var(--dim)}
+  .status-item .value{color:var(--text);font-weight:500}
+  .status-item.running .value{color:var(--ok)}
+  .status-item.stopped .value{color:var(--err)}
+  
+  .progress-bar{width:200px;height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+  .progress-bar .fill{height:100%;background:var(--accent);transition:width 0.3s}
+  
+  .param-box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px}
+  .param-box summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--accent);list-style:none}
+  .param-box summary::-webkit-details-marker{display:none}
+  .param-box summary::before{content:"▾ ";margin-right:4px;font-size:10px}
+  .param-box:not([open]) summary::before{content:"▸ "}
+  .param-box .params{margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+  .video-info{font-size:12px;color:var(--dim);padding:6px 10px;margin-top:4px;
+              background:rgba(127,127,127,.08);border-radius:6px;line-height:1.7}
+  .video-info b{color:var(--accent);font-weight:600}
+</style>
+</head>
+<body>
+
+<aside>
+  <h1>链路测试台</h1>
+  <button class="active" onclick="setPage('video')">视频测试</button>
+  <button onclick="setPage('image')">图片测试</button>
+</aside>
+
+<main>
+  <section class="section">
+    <h2 class="section-title">媒体选择</h2>
+    <div class="control-grid">
+      <div class="field">
+        <label>测试视频</label>
+        <select id="video_select" onchange="loadVideo()">
+          <option value="">选择视频...</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>测试图片</label>
+        <select id="image_select" onchange="loadImage()">
+          <option value="">选择图片...</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>测试链路</label>
+        <select id="pipeline_select" onchange="updateVideoInfo()">
+          <option value="">选择链路...</option>
+        </select>
+      </div>
+    </div>
+    <div class="video-info" id="video_info">选择视频后显示分辨率与预计处理帧数</div>
+  </section>
+
+  <section class="section">
+    <h2 class="section-title">视频控制</h2>
+    <div class="video-container">
+      <video id="video_player" controls></video>
+      <div class="video-overlay">
+        <span class="time-display" id="time_display">00:00:00</span>
+        <span>|</span>
+        <span id="frame_display">帧: 0</span>
+      </div>
+    </div>
+    
+    <div class="control-grid">
+      <div class="field">
+        <label>起始时间 (秒)</label>
+        <input type="number" id="start_time" min="0" step="1" value="0" oninput="updateVideoInfo()">
+      </div>
+      <div class="field">
+        <label>结束时间 (秒)</label>
+        <input type="number" id="end_time" min="0" step="1" placeholder="不填为视频结尾" oninput="updateVideoInfo()">
+      </div>
+      <div class="field">
+        <label>最大处理帧数</label>
+        <input type="number" id="max_frames" min="0" step="1" value="100" oninput="updateVideoInfo()">
+      </div>
+    </div>
+    
+    <details class="param-box">
+      <summary>高级参数</summary>
+      <div class="params">
+        <div class="control-grid">
+          <div class="field">
+            <label>VLM 回填</label>
+            <input type="checkbox" id="vlm_feedback" checked>
+          </div>
+          <div class="field">
+            <label>回填动作</label>
+            <input type="text" id="vlm_action" value="fire">
+          </div>
+          <div class="field">
+            <label>输出目录</label>
+            <input type="text" id="output_dir" value="tests/data/out/test_pipeline">
+          </div>
+          <div class="field">
+            <label>图片格式</label>
+            <select id="image_format">
+              <option value="jpg">JPG</option>
+              <option value="png">PNG</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </details>
+    
+    <div class="btn-row">
+      <button class="primary" id="start_btn" onclick="startTest()">开始测试</button>
+      <button class="stop" id="stop_btn" onclick="stopTest()" disabled>停止测试</button>
+      <button onclick="clearResults()">清空结果</button>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2 class="section-title">实时结果</h2>
+    <div class="results-container">
+      <div class="log-panel">
+        <h3>
+          处理日志
+          <select id="log_filter" onchange="applyLogFilter()">
+            <option value="all">全部</option>
+            <option value="vlm">仅 VLM 报送</option>
+            <option value="alarm">仅告警</option>
+          </select>
+        </h3>
+        <div id="log_container"></div>
+      </div>
+      <div class="images-panel">
+        <h3>输出图片</h3>
+        <div class="image-grid" id="image_container"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="status-bar">
+  <div class="status-item" id="status_state">
+    <span class="label">状态:</span>
+    <span class="value">空闲</span>
+  </div>
+  <div class="status-item">
+    <span class="label">已处理:</span>
+    <span class="value" id="status_processed">0</span>
+    <span class="label">帧</span>
+  </div>
+  <div class="status-item">
+    <span class="label">检测数:</span>
+    <span class="value" id="status_detections">0</span>
+  </div>
+  <div class="status-item">
+    <span class="label">告警数:</span>
+    <span class="value" id="status_alarms">0</span>
+  </div>
+  <div class="progress-bar">
+    <div class="fill" id="progress_fill" style="width:0%"></div>
+  </div>
+</div>
+
+<script>
+let isRunning = false;
+let processedCount = 0;
+let detectionCount = 0;
+let alarmCount = 0;
+
+async function init() {
+  await loadSchema();
+}
+
+async function loadSchema() {
+  const resp = await fetch('/api/schema');
+  const data = await resp.json();
+  
+  const videoSelect = document.getElementById('video_select');
+  videoSelect.innerHTML = '<option value="">选择视频...</option>';
+  data.files.vid.forEach(f => {
+    videoSelect.innerHTML += `<option value="${f}">${f}</option>`;
+  });
+  
+  const imageSelect = document.getElementById('image_select');
+  imageSelect.innerHTML = '<option value="">选择图片...</option>';
+  data.files.img.forEach(f => {
+    imageSelect.innerHTML += `<option value="${f}">${f}</option>`;
+  });
+  
+  await loadPipelines();
+}
+
+async function loadPipelines() {
+  const resp = await fetch('/api/pipelines');
+  const data = await resp.json();
+  const select = document.getElementById('pipeline_select');
+  select.innerHTML = '<option value="">选择链路...</option>';
+  
+  if (data.ok && data.pipelines) {
+    data.pipelines.forEach(p => {
+      select.innerHTML += `<option value="${p.id}">${p.name}</option>`;
+    });
+  }
+}
+
+async function loadVideo() {
+  const videoName = document.getElementById('video_select').value;
+  if (!videoName) {
+    document.getElementById('video_player').src = '';
+    videoInfoCache = null;
+    updateVideoInfo();
+    return;
+  }
+  document.getElementById('video_player').src = `/files/videos/${videoName}`;
+  // 拉取视频元信息（分辨率/帧率/总帧数），供处理量预估
+  try{
+    const resp = await fetch('/api/video/info?name=' + encodeURIComponent(videoName));
+    const data = await resp.json();
+    videoInfoCache = data.ok ? data : null;
+  }catch(e){ videoInfoCache = null; }
+  updateVideoInfo();
+}
+
+// ---- 视频信息 + 帧管理处理量预估 ----
+let videoInfoCache = null;      // /api/video/info 结果
+const pipelineSkipCache = {};   // pipeline_id -> frame_skip（链路帧管理阶段）
+
+async function updateVideoInfo() {
+  const box = document.getElementById('video_info');
+  if (!box) return;
+  const pid = document.getElementById('pipeline_select').value;
+
+  // 链路变化时取该链路帧管理阶段的抽帧间隔（缓存）
+  if (pid && pipelineSkipCache[pid] === undefined){
+    try{
+      const resp = await fetch('/api/pipelines/load', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: pid})
+      });
+      const data = await resp.json();
+      let skip = null;
+      if (data.ok){
+        const fm = (data.pipeline.stages || []).find(s => s.module_id === 'frame_manager');
+        skip = fm && fm.params && fm.params.frame_skip ? Number(fm.params.frame_skip) : null;
+      }
+      pipelineSkipCache[pid] = skip;
+    }catch(e){ pipelineSkipCache[pid] = null; }
+  }
+
+  const info = videoInfoCache;
+  if (!info){
+    box.innerHTML = pid && pipelineSkipCache[pid]
+      ? `链路帧管理 frame_skip=<b>${pipelineSkipCache[pid]}</b>（选视频后显示完整预估）`
+      : '选择视频后显示分辨率与预计处理帧数';
+    return;
+  }
+
+  // 处理范围：按表单 start/end/max_frames 截取（与后端口径一致）
+  const fps = info.fps || 25;
+  const startF = Math.max(0, Math.round((parseFloat(document.getElementById('start_time').value) || 0) * fps));
+  const endInput = parseFloat(document.getElementById('end_time').value);
+  const endF = endInput > 0 ? Math.min(Math.round(endInput * fps), info.total_frames) : info.total_frames;
+  const maxF = parseInt(document.getElementById('max_frames').value) || 0;
+  let windowFrames = Math.max(0, endF - startF);
+  let capped = false;
+  if (maxF > 0 && maxF < windowFrames){ windowFrames = maxF; capped = true; }
+
+  const skip = (pid && pipelineSkipCache[pid]) || 3;
+  const analyzed = windowFrames > 0 ? Math.floor((windowFrames - 1) / skip) + 1 : 0;
+
+  box.innerHTML =
+    `分辨率 <b>${info.width}×${info.height}</b> @ ${info.fps}fps ｜ 时长 ${info.duration_sec}s / 共 <b>${info.total_frames}</b> 帧<br>` +
+    `处理范围 ${startF}–${startF + windowFrames} 帧${capped ? '（受最大处理帧数限制）' : ''}` +
+    ` ｜ 帧管理 frame_skip=<b>${skip}</b> → 预计分析 <b>${analyzed}</b> 帧`;
+}
+
+async function loadImage() {
+  const imageName = document.getElementById('image_select').value;
+  if (!imageName) return;
+  await runSingleImageTest(imageName);
+}
+
+function setPage(page) {
+  document.querySelectorAll('aside button').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+}
+
+async function startTest() {
+  const videoName = document.getElementById('video_select').value;
+  const pipelineId = document.getElementById('pipeline_select').value;
+  
+  if (!videoName || !pipelineId) {
+    alert('请先选择测试视频和链路');
+    return;
+  }
+  
+  isRunning = true;
+  updateUIState();
+  
+  const params = {
+    video: videoName,
+    max_frames: parseInt(document.getElementById('max_frames').value) || 0,
+    start_time: parseFloat(document.getElementById('start_time').value) || 0,
+    end_time: document.getElementById('end_time').value ? parseFloat(document.getElementById('end_time').value) : 0,
+    vlm_feedback: document.getElementById('vlm_feedback').checked,
+    vlm_action: document.getElementById('vlm_action').value,
+    output_dir: document.getElementById('output_dir').value,
+    image_format: document.getElementById('image_format').value,
+    pipeline_id: pipelineId
+  };
+  
+  addLogEntry('开始测试: ' + JSON.stringify(params, null, 2), 'frame');
+  
+  try {
+    const resp = await fetch('/api/test/pipeline_run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({params})
+    });
+    
+    const result = await resp.json();
+    
+    if (result.ok) {
+      addLogEntry('测试完成: ' + result.text, 'frame');
+      renderTimeline(result.timeline);
+      
+      if (result.images) {
+        result.images.forEach(img => {
+          addResultImage(img.data, img.title);
+        });
+      }
+      
+      if (result.tables) {
+        result.tables.forEach(table => {
+          addLogEntry('表格: ' + table.title, 'det');
+        });
+      }
+    } else {
+      addLogEntry('测试失败: ' + (result.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    addLogEntry('请求失败: ' + e.message, 'error');
+  }
+  
+  isRunning = false;
+  updateUIState();
+}
+
+function stopTest() {
+  if (isRunning) {
+    isRunning = false;
+    addLogEntry('测试已停止', 'error');
+    updateUIState();
+  }
+}
+
+async function runSingleImageTest(imageName) {
+  const pipelineId = document.getElementById('pipeline_select').value;
+  if (!pipelineId) {
+    alert('请先选择测试链路');
+    return;
+  }
+  
+  addLogEntry('测试图片: ' + imageName, 'frame');
+  
+  const params = {
+    image: imageName,
+    vlm_feedback: document.getElementById('vlm_feedback').checked,
+    vlm_action: document.getElementById('vlm_action').value,
+    pipeline_id: pipelineId
+  };
+  
+  try {
+    const resp = await fetch('/api/test/pipeline_run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({params})
+    });
+    
+    const result = await resp.json();
+    
+    if (result.ok) {
+      addLogEntry('图片测试完成: ' + result.text, 'frame');
+      
+      if (result.images) {
+        result.images.forEach(img => {
+          addResultImage(img.data, img.title);
+        });
+      }
+    } else {
+      addLogEntry('图片测试失败: ' + (result.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    addLogEntry('请求失败: ' + e.message, 'error');
+  }
+}
+
+function addLogEntry(text, type = '') {
+  const container = document.getElementById('log_container');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + type;
+  entry.textContent = text;
+  container.appendChild(entry);
+  container.scrollTop = container.scrollHeight;
+}
+
+// 结构化逐条渲染（来自后端 result.timeline），kind: frame/submit/vlm/alarm/fail/face/info
+let lastTimeline = [];
+
+const KIND_FILTERS = [
+  {value: 'vlm',   label: '仅 VLM 报送', needs: ['vlm', 'submit']},
+  {value: 'alarm', label: '仅告警',      needs: ['alarm']},
+  {value: 'face',  label: '仅新人脸',    needs: ['face']},
+];
+
+function rebuildFilterOptions() {
+  const sel = document.getElementById('log_filter');
+  const kinds = new Set(lastTimeline.map(i => i.kind));
+  const prev = sel.value;
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = 'all'; all.textContent = '全部';
+  sel.appendChild(all);
+  for (const f of KIND_FILTERS) {
+    if (f.needs.some(k => kinds.has(k))) {
+      const op = document.createElement('option');
+      op.value = f.value; op.textContent = f.label;
+      sel.appendChild(op);
+    }
+  }
+  sel.value = [...sel.options].some(o => o.value === prev) ? prev : 'all';
+}
+
+function renderTimeline(timeline) {
+  lastTimeline = timeline || [];
+  rebuildFilterOptions();
+  const container = document.getElementById('log_container');
+  container.innerHTML = '';
+  const filter = document.getElementById('log_filter').value;
+  for (const item of lastTimeline) {
+    if (!shouldShow(item.kind, filter)) continue;
+    const entry = document.createElement('div');
+    entry.className = 'log-entry kind-' + item.kind;
+    const head = document.createElement('div');
+    head.textContent = `[${(item.ts || 0).toFixed(1)}s 帧#${item.frame}] ${item.text}`;
+    entry.appendChild(head);
+    if (item.data && typeof item.data === 'object' && Object.keys(item.data).length) {
+      const pre = document.createElement('pre');
+      pre.className = 'log-json';
+      pre.textContent = JSON.stringify(item.data, null, 2);
+      entry.appendChild(pre);
+    }
+    container.appendChild(entry);
+  }
+  container.scrollTop = container.scrollHeight;
+}
+
+function shouldShow(kind, filter) {
+  if (filter === 'vlm') return kind === 'vlm' || kind === 'submit' || kind === 'fail';
+  if (filter === 'alarm') return kind === 'alarm';
+  if (filter === 'face') return kind === 'face';
+  return true; // all
+}
+
+function applyLogFilter() {
+  if (lastTimeline.length) renderTimeline(lastTimeline);
+}
+
+function addResultImage(dataUrl, title) {
+  const container = document.getElementById('image_container');
+  const item = document.createElement('div');
+  item.className = 'image-item';
+  item.innerHTML = `
+    <img src="${dataUrl}" alt="${title}">
+    <div class="label">${title}</div>
+  `;
+  container.appendChild(item);
+  processedCount++;
+  updateStats();
+}
+
+function clearResults() {
+  document.getElementById('log_container').innerHTML = '';
+  document.getElementById('image_container').innerHTML = '';
+  lastTimeline = [];
+  processedCount = 0;
+  detectionCount = 0;
+  alarmCount = 0;
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('status_processed').textContent = processedCount;
+  document.getElementById('status_detections').textContent = detectionCount;
+  document.getElementById('status_alarms').textContent = alarmCount;
+}
+
+function updateUIState() {
+  const startBtn = document.getElementById('start_btn');
+  const stopBtn = document.getElementById('stop_btn');
+  const statusState = document.getElementById('status_state');
+  
+  if (isRunning) {
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    statusState.className = 'status-item running';
+    statusState.querySelector('.value').textContent = '运行中';
+  } else {
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusState.className = 'status-item stopped';
+    statusState.querySelector('.value').textContent = '空闲';
+  }
+}
+
+document.getElementById('video_player').addEventListener('timeupdate', () => {
+  const video = document.getElementById('video_player');
+  const currentTime = video.currentTime;
+  const frame = Math.floor(currentTime * 25);
+  
+  const minutes = Math.floor(currentTime / 60);
+  const seconds = Math.floor(currentTime % 60);
+  const ms = Math.floor((currentTime % 1) * 100);
+  
+  document.getElementById('time_display').textContent = 
+    `${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}:${String(ms).padStart(2,'0')}`;
+  document.getElementById('frame_display').textContent = `帧: ${frame}`;
+});
+
+init();
+</script>
+</body>
+</html>

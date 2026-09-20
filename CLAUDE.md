@@ -7,32 +7,45 @@ UMVP（统一模块化视觉分析管道）独立部署包。代码 + 权重自�
 ## 项目结构
 
 ```
-umvp/pipe/         四模块 + compose() 装配器（FrameManager / YOLODetector / VLMAnalyzer / AlarmPolicy）
+umvp/pipe/         四模块 + Pipeline 装配器（FrameManager / YOLODetector / VLMAnalyzer / AlarmPolicy）
                    + crop_restore.py（CropRestore 原分辨率人脸提取链路：YOLO 识人→裁人→SCRFD 检脸→坐标还原→原图出图）
 umvp/face_detect/  SCRFD 人脸检测 + 5点对齐（FaceDetector，含 test_imgs/）
 umvp/face_embed/   ArcFace 512d 嵌入（FaceEmbedder）+ 向量底库（FaceStore，numpy 线性检索）
 umvp/face_scan/    人脸管道编排（FaceMonitor，复用 pipe.composer.FrameManager 取帧+背压）
 umvp/resources.py  P1 资源估算（ResourceEstimator：静态公式 + 实测指纹两层，链路聚合/多路外推/预算反推）
 models/            YOLO 选择池（v8n/s、v9t、v10s、v11n/s/m，COCO person=0/car=2；
-                    放 .pt 进目录即出现在 web_lab 模型选择中）
+                     放 .pt 进目录即出现在 web_lab 模型选择中）
 face_models/       buffalo_l/ 已解压（det_10g.onnx + w600k_r50.onnx 等，人脸模型默认加载路径）
-web_lab/           可视化测试台（server.py 表单/测试/presets/资源估算；db.py MySQL 配置暂存；
-                    calibrate.py 实测标定→out/fingerprints.json；run.sh/stop.sh/restart.sh 启停/重启
-                    脚本，操作手册见 doc/端口与启停手册.md；设计说明.md 通俗文档）
+web_lab/           可视化测试台（server.py 表单/测试/presets/资源估算/链路运行；db.py MySQL 配置暂存；
+                     calibrate.py 实测标定→out/fingerprints.json；run.sh/stop.sh/restart.sh 启停/重启
+                     脚本，操作手册见 doc/端口与启停手册.md；test.html 链路测试台）
 .claude/skills/    pipeline-assembly 链路拼接知识库（SKILL.md 技能入口 + INDEX.md 分层索引 +
-                   knowledge/ 四层：L1 共享陈述 / L2 总装专属 / L3 组装工专属 / L4 共享经验，
-                   含链路决策表【待定稿】、壳代码骨架、常见坑、face-extract 先例等）
-doc/               需求文档（业务版/开发版）、模块与参数手册（13 模块权威清单）、端口与启停手册、
-                   数据库结构、存储设计、链路组装Agent设计、yolo识别模块专题
-tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链路 + 视频/截图数据
+                    knowledge/ 四层：L1 共享陈述 / L2 总装专属 / L3 组装工专属 / L4 共享经验，
+                    含链路决策表【待定稿】、壳代码骨架、常见坑、face-extract 先例等）
+doc/               需求文档（业务版/开发版）、端口与启停手册、数据库结构、存储设计、
+                    链路组装Agent设计、yolo识别模块专题
+doc/modules/       模块参数文档（每模块一篇：参数/输入/输出字段；8 个模块 + 警用无人机链路）
+tests/             警用链路测试 + YOLO 参数对比 + 人脸提取链路 + 视频/截图数据
 ```
 
 ## 关键约定
 
 - **人脸模型路径**：默认项目内 `face_models/buffalo_l/`（代码按 `__file__` 相对定位），
   不依赖 `~/.insightface`；`FaceDetector(model_root=...)` / `FaceEmbedder(model_root=...)` 可覆盖。
-- **四种模式收敛为配置**：small_only / small_crop / small_full / large_only 差异全在
-  compose spec，不写分支代码。报送粒度=按识别类型（class_limits），dwell 按 track 记驻留。
+- **唯一保留链路**：仅保留「警用无人机链路」（帧管理→YOLO→VLM研判→告警，PIPE0001），
+  其余链路与播种数据已于 2026-09-20 清理；播种收敛在 server.py `_seed_pipeline()`
+  一处（幂等，同名跳过），每模块恰一份参数 preset。
+- **数据库业务 ID**：presets/pipelines 主键为"前缀+4 位序号"（YOLO0001/FM0001/PIPE0001…），
+  新建按前缀自动递增（前缀表见 db.py `_ID_PREFIXES`）；旧整数 schema 由 init_db 检测后
+  自动 DROP 重建并重新播种（换机拉代码重启即迁移）。
+- **测试参数不落库**：模块测试页专用参数（测试图片/演示回填/事件脚本/模拟参数）在
+  server.py PARAMS 标 `"test_only": true`——不注册 DB schema、不落库、不进链路设计器
+  （新增此类参数务必打标；机制见 doc/数据库结构.md §3.5）。模块参数表列随 schema
+  双向收敛（加参数补列、删参数/转 test_only 自动删列）。
+- **测试台落盘上限**：链路运行落盘图片默认上限 200 张（`max_saved_images` 可覆盖），
+  超限跳过写盘并在时间线/结果头提示；选视频后 test.html 显示分辨率与预计分析帧数
+  （`GET /api/video/info`，按链路 frame_manager.frame_skip 折算）。
+- **自定义链路**：支持用户通过链路设计器自定义组合四模块，不预设分析模式。报送粒度=按识别类型（class_limits），dwell 按 track 记驻留。
 - **资源估算（P1）**：`ResourceEstimator` 静态公式估算优先被实测指纹覆盖（`out/fingerprints.json`，
   由 `web_lab/calibrate.py` 生成）；链路按"每帧平均成本"聚合（VLM 按 check_interval 节流折算、
   人脸嵌入只在命中后折算），显存按常驻+激活拆分，多路外推 + 预算反推建议 frame_skip。
@@ -69,9 +82,10 @@ tests/             三模式实机测试 + YOLO 参数对比 + 人脸提取链�
 PY="conda run -n ai python"   # 便携：ai conda 环境解释器（或先 conda activate ai 后用 python）
 
 $PY umvp/pipe/test_composer.py            # 纯逻辑 27 断言（不加载模型，秒级）
+$PY tests/test_police_uav_pipeline.py     # 唯一保留链路（警用无人机）逻辑断言（秒级）
+$PY tests/test_police_uav_video.py        # 警用链路端到端（真实 YOLO + mock VLM，落 tests/data/out/police_uav）
 $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz   # 人脸注册+自检 7/7
 $PY tests/test_yolo_params.py             # YOLO 参数对比（真实推理，yolov8n.pt，约 1 分钟）
-$PY tests/test_3modes.py                  # 三模式实机（需 VLM 端点可达，约 3.5 分钟）
 $PY umvp/resources.py                     # 资源估算自检（不联网；读 out/fingerprints.json 若存在）
 $PY web_lab/calibrate.py                  # 实测标定（遍历 models/*.pt 生成 out/fingerprints.json，换机必跑）
 $PY tests/test_face_extract_pipeline.py   # 人脸提取链路 27 断言（YOLO 识人→裁人→SCRFD 检脸→坐标还原）
@@ -87,3 +101,7 @@ $PY tests/test_face_extract_pipeline.py   # 人脸提取链路 27 断言（YOLO 
   SCRFD 640 全图 ~100ms、ArcFace 单张 ~37ms、千级底库检索 <1ms。换机后以
   `web_lab/calibrate.py` 重新标定为准。
 - 完整安装/移植步骤见 INSTALL.md（场景 A 本机继承 ai 环境 / 场景 B 新机器从零装）。
+- 联网检索/抓取优先用 GLM 系 MCP 工具（web-search-prime / web-reader / zread 免确认直用；
+  备用 fetch/search 与内置 webfetch/websearch 降级为需确认）——本机配置在全局
+  `~/.config/opencode/opencode.jsonc` 与 `~/.config/opencode/AGENTS.md`，换机参考
+  `~/openclaude-mcp-export/` 导出包（含 key，禁入 git）。

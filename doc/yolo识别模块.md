@@ -1,7 +1,7 @@
 # YOLO 识别模块（YOLODetector）专题
 
 > 适用范围：`umvp/pipe/composer.py` 中的 `YOLODetector` 模块。
-> 参数清单（类型/默认值/说明）见 `doc/模块与参数手册.md` §4.2，本文只讲**不重复**的部分：
+> 参数清单（类型/默认值/说明）见 `doc/modules/YOLO识别.md`，本文只讲**不重复**的部分：
 > 模块定位、输出字段、调参速查、注意事项。
 
 ---

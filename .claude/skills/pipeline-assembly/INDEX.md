@@ -29,7 +29,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| 01-umvp-intro.md | UMVP 通俗介绍（四模块 / 四模式 / 人脸链路 / 配套工具） |
+| 01-umvp-intro.md | UMVP 通俗介绍（四模块 / 自定义链路拼接 / 人脸链路 / 配套工具） |
 | 02-environment.md | 环境与验证命令（conda ai / 回归集 / 标定 / 警告过滤） |
 | 03-module-reference.md | 管道四模块 + 人脸链路 + 资源估算接口速查（参数表） |
 
@@ -53,7 +53,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| 10-decision-table.md | 链路决策表（四模式矩阵待定稿；YOLO 参数初值已实测 §1.2） |
+| 10-decision-table.md | 链路决策表（自定义拼接决策；YOLO 参数初值已实测 §1.2） |
 | 11-pitfalls.md | 常见坑清单（含 YOLO 参数调优坑） |
 | 12-verified-checklist.md | 已验证 / 未验证清单（YOLO 参数对比已录入） |
 | 13-worked-example-face.md | face-extract 先例（原 face-extract-pipeline skill 并入） |

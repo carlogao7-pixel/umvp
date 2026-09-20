@@ -63,6 +63,7 @@ class AlarmEvent:
     track_key: int
     action: str  # dwell:{cls} / 命中 action / inspection
     ts: float
+    description: str = ""  # VLM 返回的警情描述
 
 
 # ---------------- 模块 1: 帧管理 ----------------
@@ -237,6 +238,7 @@ class YOLODetector:
         # 数量按"过滤链后的该类目标数"算，不在范围内 → 该类不报送
         check_interval: float = 3.0,  # 每类独立计时的送审节拍
         roi: bool = False,  # False=送全帧(full:cls{类别}); True=送该类 ROI 裁剪(crop:cls{类别})
+        track_change_only: bool = False,  # 只在 track_id 变化时才报送（需要跟踪）
         # ---- 推理参数（model_path 为空则不推理，纯后处理） ----
         model_path: Optional[str] = None,  # YOLO 权重路径 (.pt)
         conf: float = 0.35,  # 检出阈值（调低召回重叠/被遮挡目标）
@@ -250,6 +252,7 @@ class YOLODetector:
         self.class_limits = dict(class_limits or {})
         self.check_interval = check_interval
         self.roi = roi
+        self.track_change_only = track_change_only
         self.model_path = model_path
         self.conf = conf
         self.iou = iou
@@ -259,6 +262,7 @@ class YOLODetector:
         self.device = device
         self._model = None  # 惰性加载
         self._last_check: Dict[int, float] = {}  # 类别 -> 上次报送时刻
+        self._last_track_ids: Dict[int, set] = {}  # 类别 -> 上次 track_id 集合（track_change_only 模式）
 
     # ---- 推理（model_path 非空时可用） ----
     def infer(self, frame, track: bool = False) -> List[Detection]:
@@ -272,6 +276,8 @@ class YOLODetector:
                 self._model.to(self.device)
         kw = dict(conf=self.conf, iou=self.iou, imgsz=self.imgsz,
                   max_det=self.max_det, classes=self.classes, verbose=False)
+        if self.device:
+            kw["device"] = self.device
         r = (self._model.track(frame, persist=True, **kw) if track
              else self._model.predict(frame, **kw))[0]
         dets: List[Detection] = []
@@ -315,6 +321,15 @@ class YOLODetector:
         for cls, cdets in sorted(by_cls.items()):
             # 每类独立计时：一类目标再多也只算一条请求
             if ts - self._last_check.get(cls, _NEG_INF) >= self.check_interval:
+                # track_change_only 模式：检查 track_id 是否变化
+                if self.track_change_only:
+                    current_track_ids = {d.track_id for d in cdets if d.track_id > 0}
+                    last_track_ids = self._last_track_ids.get(cls, set())
+                    if current_track_ids == last_track_ids and len(current_track_ids) > 0:
+                        # track_id 无变化，跳过报送
+                        continue
+                    self._last_track_ids[cls] = current_track_ids
+                
                 self._last_check[cls] = ts
                 ref = f"crop:cls{cls}" if self.roi else f"full:cls{cls}"
                 reqs.append(SubmitRequest(cls, GRAN_CLASS, ref, dets=cdets))
@@ -362,7 +377,7 @@ ALARM_INSPECTION = "inspection"  # 巡检：结果直接落盘
 
 class AlarmPolicy:
     """告警判定 + 冷却。scope 规则随 kind 显式指定：
-       dwell → (task_id, cls_id) 按类别；window/inspection → (task_id, task_id) 全局。
+       dwell → (task_id, cls_id) 按类别；window/inspection → (task_id, task_id, action) 按警情类型。
     """
 
     def __init__(
@@ -373,6 +388,7 @@ class AlarmPolicy:
         smooth_frames: int = 1,  # 双语义: dwell=驻留秒数阈值; window=滑动窗口长度
         hit_ratio: float = 1.0,  # window: 命中比例
         alarm_cooldown: float = 60.0,
+        cooldown_by_action: bool = False,  # 是否按警情类型独立冷却
     ) -> None:
         self.task_id = task_id
         self.target_actions = target_actions or []
@@ -382,6 +398,7 @@ class AlarmPolicy:
         self.smooth_frames = max(1, int(smooth_frames))
         self.hit_ratio = hit_ratio
         self.alarm_cooldown = alarm_cooldown
+        self.cooldown_by_action = cooldown_by_action
         self._history: Dict[int, List[str]] = {}
         self._first_seen: Dict[int, float] = {}
         self._cooldown_until: Dict[Tuple[int, int], float] = {}
@@ -390,11 +407,11 @@ class AlarmPolicy:
         return self._cooldown_until.get(scope, _NEG_INF) > ts
 
     # ---- VLM 结果回收（window / inspection） ----
-    def on_vlm_result(self, track_key: int, action: str, ts: float) -> List[AlarmEvent]:
+    def on_vlm_result(self, track_key: int, action: str, ts: float, description: str = "") -> List[AlarmEvent]:
         # 报送粒度: 周期性整帧=-1 → scene; 其余(按识别类型) track_key=类别编号 → class
         gran = GRAN_SCENE if track_key == -1 else GRAN_CLASS
         if self.kind == ALARM_INSPECTION:  # 巡检：不匹配 action，直接落盘
-            return [AlarmEvent(self.task_id, gran, track_key, "inspection", ts)]
+            return [AlarmEvent(self.task_id, gran, track_key, "inspection", ts, description)]
         h = self._history.setdefault(track_key, [])
         h.append(action)
         if len(h) > self.smooth_frames:
@@ -402,10 +419,11 @@ class AlarmPolicy:
         required = max(1, math.ceil(self.smooth_frames * self.hit_ratio))
         hits = sum(1 for a in h if a in self.target_actions)
         if action in self.target_actions and len(h) >= self.smooth_frames and hits >= required:
-            scope = (self.task_id, self.task_id)  # VLM 模式全局冷却
+            # 按警情类型独立冷却：scope = (task_id, task_id, action)
+            scope = (self.task_id, self.task_id, action) if self.cooldown_by_action else (self.task_id, self.task_id)
             if not self._cooling(scope, ts):
                 self._cooldown_until[scope] = ts + self.alarm_cooldown
-                return [AlarmEvent(self.task_id, gran, track_key, action, ts)]
+                return [AlarmEvent(self.task_id, gran, track_key, action, ts, description)]
         return []
 
     # ---- 驻留告警（small_only） ----
@@ -456,8 +474,8 @@ class Pipeline:
             submits = [SubmitRequest(-1, GRAN_SCENE, "full:global")]
         return submits, alarms
 
-    def on_vlm_result(self, track_key: int, action: str, ts: float) -> List[AlarmEvent]:
-        return self.alarm.on_vlm_result(track_key, action, ts)
+    def on_vlm_result(self, track_key: int, action: str, ts: float, description: str = "") -> List[AlarmEvent]:
+        return self.alarm.on_vlm_result(track_key, action, ts, description)
 
 
 def _yolo_kw(spec: dict) -> dict:

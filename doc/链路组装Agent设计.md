@@ -51,7 +51,7 @@
 
 | 壳代码 | 干什么 | 现有参照物 |
 |---|---|---|
-| 驱动壳 | 拿 spec → `compose()` 组装 `Pipeline` → 帧循环驱动 `step()` | `umvp/pipe/test_composer.py`、`tests/test_3modes.py`（脚本化 feed 风格） |
+| 驱动壳 | 拿 stages（模块+参数）→ `_chain_from_spec()` 组装 `Pipeline` → 帧循环驱动 `step()`（`compose()` 四模式为代码层兼容） | `umvp/pipe/test_composer.py`、`tests/test_police_uav_video.py`（脚本化 feed 风格） |
 | 接线壳 | YOLO 推理出的 dets 喂进管道；VLM 的 infer 回调（真实远端/模拟）；告警/结果落盘上报 | `VLMAnalyzer.prepare()` + infer 回调（`composer.py`） |
 | 测试壳 | 断言式测试 + 限帧 + 落盘可视化核验产物（annotated.png 级） | `tests/` 回归集 |
 | 胶水文件 | 现有模块拼不出的新链路时，写新胶水文件（如坐标还原、原生分辨率出图） | `umvp/pipe/crop_restore.py`（约 200 行，零改动复用两模块） |
@@ -89,7 +89,7 @@
 | 子项 | 做什么 | 参照 |
 |---|---|---|
 | 断言式测试 | 生成断言式测试壳（脚本化 feed / 真实输入两档） | `test_composer.py` 27 断言风格 |
-| 真实推理烟测 | 限帧跑真实推理，确认链路通 | `tests/test_yolo_params.py`、`test_3modes.py` |
+| 真实推理烟测 | 限帧跑真实推理，确认链路通 | `tests/test_yolo_params.py`、`tests/test_police_uav_video.py` |
 | 可视化核验 | 落盘画框图供目检（坐标映射等靠目检的项） | annotated.png 级产物 |
 | 回归确认 | 交付前跑回归集全绿 | CLAUDE.md 常用验证命令 |
 | 汇报 | 断言清单、通过/失败、**未验证场景清单** | skill 诚实风格延续 |
@@ -158,7 +158,7 @@
 
 **输入**（两种任选）：
 - 业务需求自然语言：设备、分辨率、路数、要识别的目标类别、告警需求、显存/帧率预算。
-- 已有 spec JSON（`doc/模块与参数手册.md` §7 的链路 spec 结构）。
+- 已有链路数据库结构（`doc/数据库结构.md` §4/§5 的 pipelines/pipeline_steps）。
 
 **输出交付包**（五件，缺一不算完成）：
 1. 方案说明：选的链路 + 理由 + 参数初值（含与备选方案的对比）。
