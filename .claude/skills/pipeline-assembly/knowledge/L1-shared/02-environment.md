@@ -11,13 +11,16 @@
 
 | 命令 | 内容 | 耗时 |
 |---|---|---|
-| `conda run -n ai python umvp/pipe/test_composer.py` | 纯逻辑 27 断言 | 秒级 |
+| `conda run -n ai python umvp/pipe/test_composer.py` | 纯逻辑 60 断言（含输出漏斗/规则 DSL） | 秒级 |
+| `conda run -n ai python tests/test_cropper.py` | 通用裁剪模块 26 断言（纯逻辑+轻量性） | 秒级 |
 | `conda run -n ai python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz` | 人脸注册 + 自检 7/7 | 秒级 |
 | `conda run -n ai python tests/test_yolo_params.py` | YOLO 参数对比（真实推理，yolov8n.pt） | 约 1 分钟 |
-| `conda run -n ai python tests/test_police_uav_pipeline.py` | 唯一保留链路（警用无人机）逻辑断言（不加载模型） | 秒级 |
+| `conda run -n ai python tests/test_police_uav_pipeline.py` | 警用链路（警用无人机）逻辑断言（不加载模型） | 秒级 |
 | `conda run -n ai python tests/test_police_uav_video.py` | 警用链路端到端（真实 YOLO + mock VLM） | 约 1 分钟 |
 | `conda run -n ai python umvp/resources.py` | 资源估算自检（不联网） | 秒级 |
-| `conda run -n ai python tests/test_face_extract_pipeline.py` | 人脸提取链路 27 断言 | 秒级 |
+| `conda run -n ai python tests/test_face_extract_pipeline.py` | 人脸提取链路 28 断言 | 秒级 |
+| `conda run -n ai python tests/test_face_capture_pipeline.py` | 人脸截取链路 39 断言 | 秒级 |
+| `conda run -n ai python tests/test_plate_recog_pipeline.py` | 车牌识别链路 28 断言 | 秒级 |
 
 ## 标定
 

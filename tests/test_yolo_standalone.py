@@ -32,7 +32,6 @@ DETECTOR = YOLODetector(
     classes=[CLS_PERSON],  # 只识别人
     class_limits={CLS_PERSON: (1, 300)},  # 识别对象白名单：人 1~300 个
     check_interval=3.0,
-    roi=False,
 )
 
 

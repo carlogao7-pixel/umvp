@@ -12,7 +12,6 @@ sys.path.insert(0, str(ROOT / "umvp"))
 sys.path.insert(0, str(ROOT / "web_lab"))
 
 import cv2
-import numpy as np
 from pipe.composer import (
     FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
     SAMPLING_ANALYSIS,
@@ -135,7 +134,6 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
         filters=[filter_confidence(0.35)],
         class_limits=_class_limits("0:2,300;2:1,300"),
         check_interval=5.0,
-        roi=True,
         track_change_only=True,
         model_path=str(ROOT / "models/yolov8n.pt"),
         conf=0.35,
@@ -147,7 +145,6 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
     )
     
     vlm = VLMAnalyzer(
-        crop_padding=0.15,
         max_resolution=(1280, 720),
         prompt=ALARM_PROMPT,
     )

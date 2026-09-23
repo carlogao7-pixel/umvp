@@ -26,16 +26,20 @@ import argparse
 import base64
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, unquote
 
 ROOT = Path(__file__).resolve().parents[1]          # 项目根
 UMVP = ROOT / "umvp"
@@ -59,6 +63,19 @@ _DB_ENABLED = True  # 启动时 --no-db 或 MySQL 不可用则置 False，preset
 
 _IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _TEST_LOCK = threading.Lock()
+
+# 阶段短标签：链路运行日志按"阶段→下一级"展示（不依赖具体链路类型）
+_STAGE_LABELS = {
+    "frame_manager": "帧管理", "yolo": "YOLO识别", "target_crop": "目标裁剪",
+    "annotate": "标注", "vlm": "VLM研判", "alarm": "输出处理",
+    "plate_recog": "车牌识别", "face_detect": "人脸检测", "face_embed": "人脸嵌入",
+    "face_store": "向量底库", "extract_faces": "原分辨率提取",
+}
+
+
+def _stage_label(mid) -> str:
+    return _STAGE_LABELS.get(mid) or (mid or "")
+
 
 # ---------------- 通用工具 ----------------
 
@@ -207,34 +224,38 @@ def _parse_vlm_result(content: str) -> tuple:
     return action, description
 
 
-def _parse_vlm_action(content: str) -> str:
-    """单取 action（旧接口，语义等价 _parse_vlm_result[0]）。"""
-    return _parse_vlm_result(content)[0]
-
-
 def _vlm_material(frame, payload: dict, req) -> "np.ndarray":
-    """按素材 ref 准备送审图：crop:* 取该类首目标 bbox 外扩裁剪；full:* 整帧。"""
-    img = frame
-    ref = str(payload.get("ref") or getattr(req, "ref", "") or "")
-    dets = list(getattr(req, "dets", None) or [])
-    if ref.startswith("crop:") and dets:
-        x1, y1, x2, y2 = dets[0].bbox
-        pad = float(payload.get("crop_padding") or 0)
-        h, w = frame.shape[:2]
-        px, py = int((x2 - x1) * pad), int((y2 - y1) * pad)
-        x1, y1 = max(0, x1 - px), max(0, y1 - py)
-        x2, y2 = min(w, x2 + px), min(h, y2 + py)
-        if x2 > x1 and y2 > y1:
-            img = frame[y1:y2, x1:x2]
-    return img
+    """按素材 ref 准备送审图：现只有 full:*（整帧/标注图直通）——ROI 裁剪已由
+    上游「目标裁剪」阶段承担，VLM 素材不再自行裁剪。"""
+    return frame
+
+
+def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
+    """快速探测端点是否可连（TCP 连接），避免 requests 长超时把整轮测试拖住。"""
+    import socket
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 def _vlm_real(p: dict, payload: dict, frame) -> tuple:
-    """OpenAI 兼容端点调用（返回 (action, description)）。"""
+    """OpenAI 兼容端点调用（返回 (action, description)）。
+
+    timeout=(连接, 读取)：连接阶段最多 5s（端点不可达时快速失败），读取按 vlm_timeout（默认 20s）。
+    """
     import requests
     url = str(p.get("vlm_endpoint") or "").strip() or "http://117.42.21.253:8000/v1/chat/completions"
     model = str(p.get("vlm_model") or "").strip() or "qwen3-vl-32b"
     key = str(p.get("vlm_key") or "").strip()
+    read_timeout = int(p.get("vlm_timeout", 20) or 20)
     mr = tuple(payload.get("max_resolution") or (1280, 720))
     h, w = frame.shape[:2]
     scale = min(mr[0] / w, mr[1] / h)
@@ -256,7 +277,7 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
         ]}],
     }
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    resp = requests.post(url, json=body, headers=headers, timeout=120)
+    resp = requests.post(url, json=body, headers=headers, timeout=(5, read_timeout))
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     return _parse_vlm_result(content)
@@ -277,14 +298,11 @@ def h_frame_manager(p: dict) -> dict:
         FrameManager, SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
     )
     sm = p.get("sampling", SAMPLING_ANALYSIS)
+    from pipe.composer import backpressure_params
     fm = FrameManager(sampling=sm, frame_skip=_int(p, "frame_skip", 3),
                       interval_sec=_float(p, "interval_sec", 3.0),
                       interval_frames=_int(p, "interval_frames", 30),
-                      queue_threshold=_int(p, "queue_threshold", 32),
-                      backpressure_multiplier=_int(p, "backpressure_multiplier", 2),
-                      max_frame_skip=_int(p, "max_frame_skip", 0) or None,
-                      adaptive_relax_ratio=_float(p, "adaptive_relax_ratio", 1.2),
-                      adaptive_recover_ratio=_float(p, "adaptive_recover_ratio", 0.5))
+                      **backpressure_params(p.get("backpressure", "standard")))
     n = _int(p, "n_frames", 20)
     step = _float(p, "ts_step", 1.0)
     fps = _float(p, "fps", 25.0)
@@ -338,7 +356,6 @@ def h_yolo(p: dict) -> dict:
     yolo = YOLODetector(filters=filters,
                         class_limits=_class_limits(p.get("class_limits", "")),
                         check_interval=_float(p, "check_interval", 3.0),
-                        roi=_bool(p, "roi"),
                         model_path=str(model),
                         conf=_float(p, "conf", 0.35), iou=_float(p, "iou", 0.7),
                         imgsz=_int(p, "imgsz", 640), max_det=_int(p, "max_det", 300),
@@ -368,8 +385,7 @@ def h_yolo(p: dict) -> dict:
 
 def h_vlm(p: dict) -> dict:
     from pipe.composer import VLMAnalyzer, SubmitRequest, Detection
-    vlm = VLMAnalyzer(crop_padding=_float(p, "crop_padding", 0.15),
-                      max_resolution=tuple(_int_tuple(p, "max_resolution", 2) or (1280, 720)),
+    vlm = VLMAnalyzer(max_resolution=tuple(_int_tuple(p, "max_resolution", 2) or (1280, 720)),
                       prompt=str(p.get("prompt", "")))
     ref = p.get("ref", "crop:cls0")
     gran = p.get("gran", "class")
@@ -396,11 +412,19 @@ def h_vlm(p: dict) -> dict:
 def h_alarm(p: dict) -> dict:
     from pipe.composer import AlarmPolicy
     kind = p.get("kind", "window")
-    ap = AlarmPolicy(task_id=_int(p, "task_id", 1), kind=kind,
-                     target_actions=_str_list(p, "target_actions"),
-                     smooth_frames=_int(p, "smooth_frames", 1),
-                     hit_ratio=_float(p, "hit_ratio", 1.0),
-                     alarm_cooldown=_float(p, "alarm_cooldown", 60.0))
+    try:
+        ap = AlarmPolicy(task_id=_int(p, "task_id", 1), kind=kind,
+                         target_actions=_str_list(p, "target_actions"),
+                         smooth_frames=(_int(p, "window_frames", 2) if kind == "window" else 1),
+                         hit_ratio=_float(p, "hit_ratio", 1.0),
+                         min_conf=_float(p, "min_conf", 0.0),
+                         min_dwell=(_float(p, "dwell_sec", 2.0) if kind == "dwell" else 0.0),
+                         key_cooldown=_float(p, "key_cooldown", -1.0),
+                         rules=_str_param(p, "rules"),
+                         alarm_cooldown=_float(p, "alarm_cooldown", 60.0),
+                         cooldown_by_action=_bool(p, "cooldown_by_action"))
+    except ValueError as e:  # 规则 DSL 非法：保存/测试时快速失败
+        return res(ok=False, error=f"规则配置错误: {e}")
     script = str(p.get("timeline", ""))
     lines = [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
     events, log = [], []
@@ -411,7 +435,6 @@ def h_alarm(p: dict) -> dict:
                 continue
             ts, tid, cls = float(parts[0]), int(parts[1]), int(parts[2])
             ev = ap.on_dwell(tid, cls, ts)
-            tag = f"t={ts:>6.1f} track={tid} cls={cls}"
             log.append(f"  {'⚠ 告警 ' + ev[0].action if ev else '○ 无'}")
             events += ev
     else:
@@ -422,14 +445,16 @@ def h_alarm(p: dict) -> dict:
             ts, tk = float(parts[0]), int(parts[1])
             action = " ".join(parts[2:])
             ev = ap.on_vlm_result(tk, action, ts)
-            tag = f"t={ts:>6.1f} track_key={tk} action={action}"
             log.append(f"  {'⚠ 告警 ' + ev[0].action if ev else '○ 无'}")
             events += ev
     text = (f"判定: {kind} | 目标动作: {ap.target_actions or '(无)'} | "
             f"窗口/驻留: {ap.smooth_frames} | 命中比例: {ap.hit_ratio} | "
-            f"冷却: {ap.alarm_cooldown}s\n告警 {len(events)} 次\n" + "\n".join(log))
-    table = {"title": "告警事件", "headers": ["ts", "gran", "track_key", "action"],
-             "rows": [[f"{e.ts:.2f}", e.gran, e.track_key, e.action] for e in events]}
+            f"冷却: {ap.alarm_cooldown}s | 置信度门槛: {ap.min_conf} | "
+            f"驻留门槛: {ap.min_dwell}s | 规则: {p.get('rules') or '(无)'}\n"
+            f"告警 {len(events)} 次\n" + "\n".join(log))
+    table = {"title": "告警事件", "headers": ["ts", "gran", "track_key", "action", "conf"],
+             "rows": [[f"{e.ts:.2f}", e.gran, e.track_key, e.action, f"{e.conf:.3f}"]
+                      for e in events]}
     return res(text=text, tables=[table] if events else [])
 
 
@@ -526,36 +551,96 @@ def h_face_store(p: dict) -> dict:
     return res(text=head + "\n" + buf.getvalue())
 
 
-def h_extract_faces(p: dict) -> dict:
-    from pipe.composer import YOLODetector
-    from face_detect.face_detector import FaceDetector
-    from pipe.crop_restore import CropRestore, extract_faces
-    model = _find_file(p.get("yolo_model", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
-    yolo = YOLODetector(model_path=str(model), conf=_float(p, "yolo_conf", 0.35),
-                        iou=_float(p, "yolo_iou", 0.7), imgsz=_int(p, "yolo_imgsz", 640),
-                        max_det=_int(p, "yolo_max_det", 300),
-                        classes=_int_list(p, "yolo_classes", [0]))
-    fd = FaceDetector(det_thresh=_float(p, "face_thresh", 0.4))
-    tool = CropRestore(upscale=_float(p, "upscale", 1.0), margin=_float(p, "margin", 0.15))
+def h_plate_recog(p: dict) -> dict:
+    from pipe.cropper import clamp_bbox
+    from plate_recog.plate_recognizer import PlateRecognizer, extract_plates
+    rec = PlateRecognizer(detect_level=str(p.get("detect_level", "high")))
     img_path, frame = _load_frame(p)
-    faces = extract_faces(frame, yolo, fd, tool,
-                          min_person_short=_int(p, "min_person_short", 30),
-                          dedup_iou=_float(p, "dedup_iou", 0.6))
+    mode = str(p.get("mode", "crop"))
+    if mode == "direct":
+        plates = rec.recognize(frame)
+    else:
+        from pipe.composer import YOLODetector
+        from pipe.cropper import Cropper
+        from pipe.target_crop import crop_targets
+        model = _find_file(p.get("yolo_model", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
+        yolo = YOLODetector(model_path=str(model), conf=_float(p, "yolo_conf", 0.25),
+                            iou=_float(p, "yolo_iou", 0.6), imgsz=_int(p, "yolo_imgsz", 1280),
+                            max_det=_int(p, "yolo_max_det", 300),
+                            classes=_int_list(p, "yolo_classes", [2]))
+        dets = yolo.infer(frame, track=False)  # 测试页脚手架：造车辆框（生产由上游 yolo 阶段提供）
+        # 目标裁剪：按车辆框裁车（测试页内联；生产链路由独立「目标裁剪」阶段完成）
+        crops = crop_targets(frame, dets, scale=2.0, margin=0.1, min_short=40,
+                             classes=_int_list(p, "yolo_classes", [2]))
+        tool = Cropper(upscale=1.0, margin=_float(p, "margin", 0.1))
+        plates = extract_plates(frame, crops, rec, tool,
+                                dedup_iou=_float(p, "dedup_iou", 0.6))
+    h, w = frame.shape[:2]
     canvas = frame.copy()
-    for f in faces:
-        x1, y1, x2, y2 = f.person_bbox
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        fx1, fy1, fx2, fy2 = f.face_bbox
-        cv2.rectangle(canvas, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
-        cv2.putText(canvas, f"face#{f.index} {f.score:.2f}", (fx1, max(fy1 - 5, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-    images = [{"title": "标注原图（蓝=人框, 绿=人脸框）", "data": _img_data_url(canvas)}]
-    for f in faces:
-        images.append({"title": f"原分辨率人脸 #{f.index} ({f.face_img.shape[1]}x{f.face_img.shape[0]})",
-                       "data": _img_data_url(f.face_img, 92)})
-    text = (f"图片: {img_path.name} | 提取到 {len(faces)} 张原分辨率人脸 | "
-            f"upscale={tool.upscale} margin={tool.margin}")
+    for pl in plates:
+        if pl.car_bbox:
+            cx1, cy1, cx2, cy2 = pl.car_bbox
+            cv2.rectangle(canvas, (cx1, cy1), (cx2, cy2), (255, 0, 0), 2)
+        x1, y1, x2, y2 = pl.bbox
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(canvas, f"{pl.plate_no} {pl.score:.2f}", (x1, max(y1 - 6, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+    images = [{"title": "标注原图（蓝=车框, 绿=车牌框）", "data": _img_data_url(canvas)}]
+    for pl in plates:
+        if getattr(pl, "plate_img", None) is not None:
+            # 两级裁剪链路：直接用从原图提取的原分辨率车牌小图
+            images.append({"title": f"车牌 #{pl.index} {pl.plate_no} "
+                                    f"({pl.plate_img.shape[1]}x{pl.plate_img.shape[0]})",
+                           "data": _img_data_url(pl.plate_img, 95)})
+            continue
+        x1, y1, x2, y2 = pl.bbox
+        pad = int(max(x2 - x1, y2 - y1) * 0.15)
+        cx1, cy1, cx2, cy2 = clamp_bbox((x1 - pad, y1 - pad, x2 + pad, y2 + pad), w, h)
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size:
+            images.append({"title": f"车牌 #{pl.index} {pl.plate_no}",
+                           "data": _img_data_url(crop, 95)})
+    rows = [[str(pl.index), pl.plate_no, pl.type_name, pl.color, f"{pl.score:.3f}",
+             str(list(pl.bbox)), f"{pl.width}x{pl.height}"] for pl in plates]
+    tables = [{"title": "车牌列表",
+               "headers": ["#", "车牌号", "类型", "颜色", "置信度", "bbox", "尺寸"],
+               "rows": rows}]
+    text = (f"图片: {img_path.name} | 方式: {mode} | detect_level={rec.detect_level} | "
+            f"识别到 {len(plates)} 张车牌")
+    return res(text=text, images=images, tables=tables)
+
+
+def h_target_crop(p: dict) -> dict:
+    """目标裁剪模块测试页：按测试框从原图裁出子图（验证 out_size/margin）。"""
+    from pipe.target_crop import crop_targets
+    img_path, frame = _load_frame(p)
+    bb = tuple(_int_tuple(p, "bbox", 4) or (10, 10, 200, 200))
+    crops = crop_targets(frame, boxes=[bb], margin=_float(p, "margin", 0.0),
+                         filter=_str_param(p, "filter"),
+                         out_size=_str_param(p, "out_size"))
+    canvas = frame.copy()
+    cv2.rectangle(canvas, (bb[0], bb[1]), (bb[2], bb[3]), (255, 0, 0), 2)
+    images = [{"title": "标注原图（蓝=裁剪框）", "data": _img_data_url(canvas)}]
+    for c in crops:
+        images.append({"title": f"裁剪 #{c.index} ({c.img.shape[1]}x{c.img.shape[0]})",
+                       "data": _img_data_url(c.img, 95)})
+    text = (f"图片: {img_path.name} | scale={_float(p, 'scale', 1.0)} "
+            f"margin={_float(p, 'margin', 0.0)} | 裁出 {len(crops)} 张")
     return res(text=text, images=images)
+
+
+def h_annotate(p: dict) -> dict:
+    """标注模块测试页：按测试框在原图画框。"""
+    from pipe.annotate import annotate_frame
+    from pipe.composer import Detection
+    img_path, frame = _load_frame(p)
+    bb = tuple(_int_tuple(p, "bbox", 4) or (10, 10, 200, 200))
+    cls = (_int_list(p, "classes", [0]) or [0])[0]
+    vis = annotate_frame(frame, [Detection(track_id=0, cls_id=cls, bbox=bb, score=0.9)],
+                         thickness=_int(p, "thickness", 2), show_label=_bool(p, "show_label"),
+                         filter=_str_param(p, "filter"))
+    return res(text=f"图片: {img_path.name} | 画框 1 个（cls{cls}）",
+               images=[{"title": "标注图", "data": _img_data_url(vis)}])
 
 
 def h_face_monitor(p: dict) -> dict:
@@ -644,7 +729,6 @@ def h_frame_yolo(p: dict) -> dict:
     yolo = YOLODetector(filters=filters,
                         class_limits=_class_limits(p.get("class_limits", "")),
                         check_interval=_float(p, "check_interval", 3.0),
-                        roi=_bool(p, "roi"),
                         model_path=str(model),
                         conf=_float(p, "conf", 0.35), iou=_float(p, "iou", 0.7),
                         imgsz=_int(p, "imgsz", 640), max_det=_int(p, "max_det", 300),
@@ -749,8 +833,6 @@ def h_pipeline_run(p: dict) -> dict:
     注意：取图节奏由链路内部 FrameManager 的 frame_skip 控制（见链路设计器帧管理模块），
     测试台不再提供独立的 frame_skip 参数，避免重复控制。
     """
-    from pipe.composer import Detection
-    
     # 获取链路配置（业务 ID，如 PIPE0001）
     pipeline_id = str(p.get("pipeline_id", "") or "").strip()
     if not pipeline_id:
@@ -794,6 +876,13 @@ def h_pipeline_run(p: dict) -> dict:
             break
     use_real_vlm = _bool(vlm_cfg, "use_real_vlm")
     vlm_fail = 0  # 真实调用失败次数（网络等），累计供结果提示
+    # 真实 VLM 端点预探测：不可达则本轮直接跳过真实调用，避免每帧长超时把测试拖住
+    _vlm_url = str(vlm_cfg.get("vlm_endpoint") or "").strip() \
+        or "http://117.42.21.253:8000/v1/chat/completions"
+    vlm_unreachable = False
+    if feedback and use_real_vlm and not _endpoint_reachable(_vlm_url):
+        vlm_unreachable = True
+        print(f"[vlm] 端点不可达，本轮跳过真实调用（改用素材包）: {_vlm_url}")
 
     # 输出目录设置
     output_dir = Path(str(p.get("output_dir", "tests/data/out/test_pipeline")).strip())
@@ -823,122 +912,262 @@ def h_pipeline_run(p: dict) -> dict:
         return s
 
     log, images = [], []
-    timeline = []  # 结构化逐条记录: {kind: frame/submit/vlm/alarm/fail/face/info, text, data?, ts, frame}
+    timeline = []  # 结构化逐条记录: {kind, stage, to, text, data?, ts, frame}
 
-    # ---- 人脸链检测（含 face_embed 阶段 → 视频人脸去重提取模式）----
+    # ---- 阶段顺序：日志统一渲染成"阶段→下一级"（不依赖具体链路类型）----
+    _stage_order = [s.get("module_id") for s in spec.get("stages") or [] if s.get("module_id")]
+    _next_of = {_stage_order[i]: _stage_order[i + 1] for i in range(len(_stage_order) - 1)}
+
+    def _emit(kind, text, ts, stage=None, to="__next__", data=None,
+              log_line=False, prefix="", frame_no=0):
+        """写一条结构化日志；自动带 stage→to 标签与帧序数，前端据此按阶段过滤与着色。"""
+        if to == "__next__":
+            to = _next_of.get(stage)
+        item = {"kind": kind, "text": text, "ts": ts, "frame": frame_no}
+        if stage:
+            item["stage"] = stage
+            item["stage_label"] = _stage_label(stage)
+        if to:
+            item["to"] = to
+            item["to_label"] = _stage_label(to)
+        if data:
+            item["data"] = data
+        timeline.append(item)
+        if log_line:
+            tag = f"[{_stage_label(stage)}] " if stage else ""
+            log.append(f"{prefix}{tag}帧#{frame_no} {text}")
+        return item
+
+    # ---- 人脸链检测（两种形态，共用 _face_step）----
+    # ① 含 face_embed 阶段 → 视频人脸去重提取模式（嵌入 + 身份去重）；
+    # ② 仅 face_detect 阶段（无嵌入/检索）→ 人脸截取模式：逐帧提取原分辨率人脸并落盘。
+    # 链路段：帧管理 → YOLO识人 → 目标裁剪（裁人）→ 人脸检测（检脸 + 原图出脸）。
     stage_params = {s.get("module_id"): (s.get("params") or {}) for s in spec.get("stages") or []}
-    is_face_chain = "face_embed" in stage_params
+    is_face_chain = any(k in stage_params for k in ("face_embed", "face_detect", "extract_faces"))
     fdet = femb = ftool = None
+    f_crop = fstage = None
     face_vecs = []       # 已收集身份的归一化嵌入
     face_count = face_dup = 0
     face_dedup_thresh = 0.55
-    f_min_short, f_dedup_iou = 30, 0.6
     if is_face_chain:
         from face_detect.face_detector import FaceDetector
-        from face_embed.face_embedder import FaceEmbedder
-        from pipe.crop_restore import CropRestore, extract_faces
+        from face_detect.face_pipeline import FaceStage
+        from pipe.cropper import Cropper
+        from pipe.target_crop import TargetCrop
+        edp = stage_params.get("extract_faces") or {}  # 兼容旧形态
         fdp = stage_params.get("face_detect") or {}
         fep = stage_params.get("face_embed") or {}
-        fdet = FaceDetector(device=_str_param(fdp, "device", "auto"),
-                            det_thresh=_float(fdp, "det_thresh", 0.5),
-                            det_size=tuple(_int_tuple(fdp, "det_size", 2) or (640, 640)))
-        femb = FaceEmbedder(device=_str_param(fep, "device", "auto"))
-        ftool = CropRestore(upscale=_float(fdp, "upscale", 1.0),
-                            margin=_float(fdp, "margin", 0.15))
-        face_dedup_thresh = _float(fep, "thresh", 0.55) or 0.55
-        f_min_short = _int(fdp, "min_person_short", 30) or 30
-        f_dedup_iou = _float(fdp, "dedup_iou", 0.6) or 0.6
+        tcp = stage_params.get("target_crop") or {}
+        # 检测器参数：有 face_detect 阶段用它的；否则用 extract_faces 阶段的 face_thresh
+        det_src = fdp if "face_detect" in stage_params else edp
+        fdet = FaceDetector(device=_str_param(det_src, "device", "auto"),
+                            det_thresh=(_float(det_src, "det_thresh", 0.0)
+                                        or _float(det_src, "face_thresh", 0.4)),
+                            det_size=tuple(_int_tuple(det_src, "det_size", 2) or (640, 640)),
+                            use_crop=_bool(det_src, "use_crop"))
+        if "face_embed" in stage_params:
+            from face_embed.face_embedder import FaceEmbedder
+            femb = FaceEmbedder(device=_str_param(fep, "device", "auto"))
+            face_dedup_thresh = _float(fep, "thresh", 0.55) or 0.55
+        # 目标裁剪（裁人）：新形态用 target_crop 阶段；兼容旧 extract_faces 的 upscale
+        # （旧形态的人框尺寸过滤已归 YOLO，此分支不再过滤）
+        if "target_crop" in stage_params:
+            f_crop = TargetCrop(margin=_float(tcp, "margin", 0.0),
+                                classes=_int_list(tcp, "classes", [0]) or [0],
+                                filter=_str_param(tcp, "filter"),
+                                out_size=_str_param(tcp, "out_size"))
+        else:
+            f_crop = TargetCrop(scale=_float(edp, "upscale", 1.0) or 1.0, margin=0.0,
+                                classes=_int_list(edp, "yolo_classes", [0]) or [0])
+        # 人脸检测阶段：出脸 margin / 去重 IoU（新形态在 face_detect；兼容旧 extract_faces）
+        f_margin = _float(fdp, "margin", 0.0) or _float(edp, "margin", 0.15)
+        f_dedup_iou = _float(fdp, "dedup_iou", 0.0) or _float(edp, "dedup_iou", 0.6) or 0.6
+        ftool = Cropper(upscale=1.0, margin=f_margin)
+        fstage = FaceStage(fdet, ftool, dedup_iou=f_dedup_iou)
+        # 链路未配 yolo 阶段时，用 extract_faces 阶段的 yolo_* 参数自建识人检测器
+        if pipe.yolo is None:
+            from pipe.composer import YOLODetector
+            model = _find_file(_str_param(edp, "yolo_model"), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
+            pipe.yolo = YOLODetector(
+                model_path=str(model), conf=_float(edp, "yolo_conf", 0.35),
+                iou=_float(edp, "yolo_iou", 0.7), imgsz=_int(edp, "yolo_imgsz", 640),
+                max_det=_int(edp, "yolo_max_det", 300),
+                classes=_int_list(edp, "yolo_classes", [0]))
 
-    def _face_step(frame, ts, tag):
-        """人脸链单帧处理：YOLO识人→检脸→嵌入→与已收集身份去重→新脸记事件+出图。"""
+    def _face_step(frame_no, frame, ts, tag):
+        """人脸链单帧处理：YOLO识人→目标裁剪(裁人)→检脸→（嵌入+身份去重）→记事件+出图。"""
         nonlocal face_count, face_dup
-        faces = extract_faces(frame, pipe.yolo, fdet, ftool,
-                              min_person_short=f_min_short, dedup_iou=f_dedup_iou)
+        dets = pipe.yolo.infer(frame, track=False) if pipe.yolo is not None else []
+        crops = f_crop.run(frame, dets, ts)
+        faces = fstage.run(frame, crops, ts)
+        if "frame_manager" in _stage_order:
+            _emit("frame", tag, ts, stage="frame_manager", frame_no=frame_no, log_line=True)
+        if "target_crop" in _stage_order:
+            _emit("info", f"裁出 {len(crops)} 张人子图", ts, stage="target_crop",
+                  frame_no=frame_no, log_line=True, prefix="    ")
+        face_stage = ("face_embed" if "face_embed" in _stage_order else
+                      "face_detect" if "face_detect" in _stage_order else
+                      "extract_faces" if "extract_faces" in _stage_order else
+                      (_stage_order[-1] if _stage_order else None))
         new_faces = 0
         for f in faces:
-            vec = femb.embed_face(f.face_img)
-            vec = vec / (np.linalg.norm(vec) or 1.0)
-            best = max((float(v @ vec) for v in face_vecs), default=0.0)
             data = f.to_dict()
-            data["best_sim"] = round(best, 3)
-            if best >= face_dedup_thresh:
-                face_dup += 1
-                timeline.append({"kind": "info",
-                                 "text": f"◦ 重复人脸（相似 {best:.2f}）",
-                                 "data": data, "ts": ts, "frame": processed_count})
-                continue
-            face_vecs.append(vec)
+            if femb is not None:
+                vec = femb.embed_face(f.face_img)
+                vec = vec / (np.linalg.norm(vec) or 1.0)
+                best = max((float(v @ vec) for v in face_vecs), default=0.0)
+                data["best_sim"] = round(best, 3)
+                if best >= face_dedup_thresh:
+                    face_dup += 1
+                    _emit("info", f"重复人脸（相似 {best:.2f}）", ts, stage=face_stage,
+                          frame_no=frame_no, data=data, log_line=True, prefix="    ")
+                    continue
+                face_vecs.append(vec)
             face_count += 1
             new_faces += 1
             fname = output_dir / f"face_{face_count:03d}_{ts:.1f}s.{image_format}"
             _save_image(fname, f.face_img)
-            timeline.append({"kind": "face",
-                             "text": f"◉ 新人脸 #{face_count}（{f.face_img.shape[1]}x{f.face_img.shape[0]}）",
-                             "data": data, "ts": ts, "frame": processed_count})
+            _emit("face", f"{'新人脸' if femb is not None else '人脸'} #{face_count}"
+                        f"（{f.face_img.shape[1]}x{f.face_img.shape[0]}）",
+                  ts, stage=face_stage, frame_no=frame_no, data=data,
+                  log_line=True, prefix="    ")
             if len(images) < 36:
-                images.append({"title": f"新人脸 #{face_count} t={ts:.1f}s",
+                images.append({"title": f"{'新人脸' if femb is not None else '人脸'} #{face_count} t={ts:.1f}s",
                                "data": _img_data_url(f.face_img, 90)})
-        timeline.append({"kind": "frame",
-                         "text": f"{tag} → 检出人脸 {len(faces)} 张，新身份 {new_faces} 个",
-                         "ts": ts, "frame": processed_count})
-        log.append(f"{tag} → 检出人脸 {len(faces)} 张，新身份 {new_faces} 个")
+        unit = "新身份" if femb is not None else "人脸"
+        _emit("info", f"检出人脸 {len(faces)} 张，{unit} {new_faces} 个",
+              ts, stage=face_stage, frame_no=frame_no, log_line=True, prefix="    ")
         log.append("")
         return len(faces)
 
-    def _step_out(tag, subs, al, ts, frame=None):
-        nonlocal detection_count, alarm_count, vlm_fail
-        log.append(f"{tag} → 报送 {len(subs)} 条, 告警 {len(al)} 条")
-        timeline.append({"kind": "frame", "text": f"{tag} → 报送 {len(subs)} 条, 告警 {len(al)} 条",
-                         "ts": ts, "frame": processed_count})
-
-        total_dets = sum(len(s.dets) for s in subs)
-        detection_count += total_dets
+    def _step_out(frame_no, ts, tag, dets, subs, al, frame=None):
+        """逐模块展示本帧各自处理的内容（不管是否向下传递），每条带帧序数。"""
+        nonlocal detection_count, alarm_count, vlm_fail, plate_count, vlm_unreachable
+        plates = getattr(pipe, "last_plates", [])
+        plate_in = getattr(pipe, "last_plate_input", [])
+        detection_count += len(dets or [])
         alarm_count += len(al)
+        plate_count += len(plates)
 
-        for s in subs:
-            line = f"· {s.ref} (gran={s.gran}, track_key={s.track_key}, 目标数={len(s.dets)})"
-            log.append("    " + line)
-            timeline.append({"kind": "submit", "text": line, "ts": ts, "frame": processed_count})
-        for e in al:
-            log.append(f"    ⚠ {e.action}")
-            timeline.append({"kind": "alarm", "text": f"⚠ {e.action}", "ts": ts, "frame": processed_count})
+        # 帧管理：帧决策（放行本帧）
+        if "frame_manager" in _stage_order:
+            _emit("frame", tag, ts, stage="frame_manager", frame_no=frame_no, log_line=True)
 
-        if feedback and pipe.vlm is not None:
-            for s in subs:
-                action = vlm_action
-                description = ""
-                if use_real_vlm:
-                    if frame is None:
+        # YOLO 识别：检出统计 +（向下游）报送/传递
+        if "yolo" in _stage_order:
+            by_cls = {}
+            for d in dets or []:
+                by_cls[d.cls_id] = by_cls.get(d.cls_id, 0) + 1
+            cls_desc = "、".join(f"cls{c}×{n}" for c, n in sorted(by_cls.items())) or "无"
+            parts = [f"检出 {len(dets or [])}（{cls_desc}）"]
+            if subs:
+                parts.append("报送 " + "、".join(f"{s.ref} 目标{len(s.dets)}" for s in subs))
+            if pipe.plate is not None and "target_crop" not in _stage_order:
+                tids = [d.track_id for d in plate_in if getattr(d, "track_id", 0)]
+                parts.append(f"传递车辆框 {len(plate_in)} 个" + (f"（track {tids}）" if tids else ""))
+            _emit("submit", "；".join(parts), ts, stage="yolo",
+                  frame_no=frame_no, log_line=True, prefix="    ")
+
+        # 目标裁剪：本帧按上游 YOLO 框裁出的子图
+        if "target_crop" in _stage_order:
+            crops = getattr(pipe, "last_crops", [])
+            tids = [c.track_id for c in crops if getattr(c, "track_id", 0)]
+            _emit("info", f"裁出 {len(crops)} 张子图" + (f"（track {tids}）" if tids else ""),
+                  ts, stage="target_crop", frame_no=frame_no, log_line=True, prefix="    ")
+
+        # 标注：本帧生成带框图（供 VLM 素材）
+        if "annotate" in _stage_order:
+            vis = getattr(pipe, "last_annotated", None)
+            _emit("info", "已生成标注图" if vis is not None else "无检出，未生成标注图",
+                  ts, stage="annotate", frame_no=frame_no, log_line=True, prefix="    ")
+
+        # VLM 研判：本帧处理内容（真实/模拟研判；未开启回填/端点不可达则展示素材准备）
+        if "vlm" in _stage_order and pipe.vlm is not None:
+            if not subs:
+                _emit("info", "无报送，未处理", ts, stage="vlm",
+                      frame_no=frame_no, log_line=True, prefix="    ")
+            else:
+                for s in subs:
+                    if not feedback:
+                        _emit("vlm", f"素材包 {s.ref}（未开启研判回填）", ts, stage="vlm",
+                              frame_no=frame_no, log_line=True, prefix="    ")
                         continue
-                    try:
-                        payload = pipe.vlm.prepare(s, None)
-                        action, description = _vlm_real(vlm_cfg, payload,
-                                                        _vlm_material(frame, payload, s))
-                        line = f"◈ VLM 实测: {action}" + (f" — {description}" if description else "")
-                        log.append("    " + line)
-                        timeline.append({"kind": "vlm", "text": line, "ts": ts,
-                                         "frame": processed_count})
-                    except Exception as e:
-                        vlm_fail += 1
-                        line = f"✗ VLM 调用失败({vlm_fail}): {e}"
-                        log.append("    " + line)
-                        timeline.append({"kind": "fail", "text": line, "ts": ts,
-                                         "frame": processed_count})
-                        continue
-                for e in pipe.on_vlm_result(s.track_key, action, ts, description):
-                    hit = f"★ VLM({action}) 命中 → {e.action}"
-                    if e.description:
-                        hit += f" — {e.description}"
-                    log.append("    " + hit)
-                    alarm_count += 1
-                    timeline.append({"kind": "alarm", "text": hit,
-                                     "ts": ts, "frame": processed_count})
+                    if use_real_vlm:
+                        if vlm_unreachable:
+                            _emit("vlm", f"素材包 {s.ref}（端点不可达，跳过真实调用）", ts,
+                                  stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
+                            continue
+                        if frame is None:
+                            continue
+                        try:
+                            payload = pipe.vlm.prepare(s, None)
+                            base = getattr(pipe, "last_annotated", None)
+                            if base is None:
+                                base = frame
+                            action, description = _vlm_real(
+                                vlm_cfg, payload, _vlm_material(base, payload, s))
+                            _emit("vlm", f"研判 {action}"
+                                  + (f" — {description}" if description else "") + "（真实调用）",
+                                  ts, stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
+                        except Exception as e:
+                            vlm_fail += 1
+                            _emit("fail", f"调用失败({vlm_fail}): {e}", ts, stage="vlm",
+                                  frame_no=frame_no, log_line=True, prefix="    ")
+                            if vlm_fail >= 3 and not vlm_unreachable:
+                                vlm_unreachable = True
+                                _emit("info", "真实 VLM 连续失败≥3，本轮后续改用素材包", ts,
+                                      stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
+                            continue
+                    else:
+                        action, description = vlm_action, ""
+                        _emit("vlm", f"研判 {action}（模拟回填）", ts, stage="vlm",
+                              frame_no=frame_no, log_line=True, prefix="    ")
+                    for e in pipe.on_vlm_result(s.track_key, action, ts, description):
+                        hit = f"命中 → {e.action}"
+                        if e.description:
+                            hit += f" — {e.description}"
+                        alarm_count += 1
+                        _emit("alarm", hit, ts, stage="vlm",
+                              frame_no=frame_no, log_line=True, prefix="    ")
+
+        # 车牌识别：本帧识别结果 + 原分辨率车牌小图落盘
+        if "plate_recog" in _stage_order:
+            if plates:
+                for p in plates:
+                    _emit("submit",
+                          f"识别 {p.plate_no} {p.type_name}/{p.color} {p.score:.2f} bbox={list(p.bbox)}",
+                          ts, stage="plate_recog", data=p.to_dict(),
+                          frame_no=frame_no, log_line=True, prefix="    ")
+                    if getattr(p, "plate_img", None) is not None:
+                        plate_saved[0] += 1
+                        fname = output_dir / f"plate_{plate_saved[0]:03d}_{p.plate_no}_{ts:.1f}s.{image_format}"
+                        if _save_image(fname, p.plate_img) and len(images) < 36:
+                            images.append({"title": f"车牌 {p.plate_no} t={ts:.1f}s",
+                                           "data": _img_data_url(p.plate_img, 90)})
+            else:
+                _emit("info", f"识别 0 张（传入车图 {len(plate_in)} 张）", ts,
+                      stage="plate_recog", frame_no=frame_no, log_line=True, prefix="    ")
+
+        # 输出处理（告警）：本帧判定结果（触发/无）
+        if "alarm" in _stage_order:
+            if al:
+                for e in al:
+                    desc = f" — {e.description}" if getattr(e, "description", "") else ""
+                    conf = getattr(e, "conf", 1.0)
+                    ctext = f"（conf {conf:.2f}）" if conf and conf < 1.0 else ""
+                    _emit("alarm", f"触发 {e.action}{ctext}{desc}", ts, stage="alarm",
+                          frame_no=frame_no, log_line=True, prefix="    ")
+            else:
+                _emit("info", "无告警", ts, stage="alarm",
+                      frame_no=frame_no, log_line=True, prefix="    ")
         log.append("")  # 帧块之间空行，多换行更易读
     
     # 初始化计数器
     processed_count = 0
     detection_count = 0
     alarm_count = 0
+    plate_count = 0
+    plate_saved = [0]  # 已落盘原分辨率车牌小图数（文件名编号用）
     
     # 图片测试模式
     image_name = str(p.get("image", "")).strip()
@@ -947,8 +1176,8 @@ def h_pipeline_run(p: dict) -> dict:
         if not img_path:
             return res(ok=False, error=f"找不到图片: {image_name}")
 
-        if pipe.yolo is None:
-            return res(ok=False, error="该链路无 YOLO 阶段，图片测试仅适用于含 YOLO 的链路")
+        if pipe.yolo is None and pipe.plate is None:
+            return res(ok=False, error="该链路无 YOLO/车牌阶段，图片测试仅适用于含检测的链路")
 
         img_path, frame = _load_frame({"image": image_name})
 
@@ -959,24 +1188,32 @@ def h_pipeline_run(p: dict) -> dict:
 
         if is_face_chain:
             processed_count += 1
-            n_faces = _face_step(frame, 0.0, f"图片测试: {img_path.name}")
+            n_faces = _face_step(0, frame, 0.0, f"图片测试: {img_path.name}")
             head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
-            head += f" | 检出人脸 {n_faces} 张 | 新身份 {face_count} 个（阈值 {face_dedup_thresh}）"
+            unit = "新身份" if femb is not None else "人脸"
+            head += f" | 检出人脸 {n_faces} 张 | {unit} {face_count} 个"
+            if femb is not None:
+                head += f"（阈值 {face_dedup_thresh}）"
             head += f" | 输出到: {output_dir}" + _save_summary()
             return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
 
-        dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
-        
-        # 保存标注图
+        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else []
+
+        subs, al = pipe.step(0, 0.0, dets, frame=frame)
+        _step_out(0, 0.0, f"图片测试: {img_path.name}", dets, subs, al, frame=frame)
+
+        # 保存标注图（检出框 + 车牌框）
         canvas = frame.copy()
         _draw_tracks(canvas, dets)
+        for p in getattr(pipe, "last_plates", []):
+            px1, py1, px2, py2 = p.bbox
+            cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
+            cv2.putText(canvas, p.plate_no, (px1, max(py1 - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         anno_name = output_dir / f"frame_000_{timestamp}_annotated.{image_format}"
         _save_image(anno_name, canvas)
-        
+
         images.append({"title": f"原始帧 {image_name}", "data": _img_data_url(canvas, 70)})
-        
-        subs, al = pipe.step(0, 0.0, dets, frame=frame)
-        _step_out(f"图片测试: {img_path.name} (检出 {len(dets)} 个)", subs, al, 0.0, frame=frame)
         
         head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
         head += f" | 检出 {detection_count} 个 | 告警 {alarm_count} 个"
@@ -1028,26 +1265,33 @@ def h_pipeline_run(p: dict) -> dict:
         processed_count += 1
         frame_num = n - start_frame
         time_str = f"{ts:.2f}s"
-        tag = f"帧{n} 时间{time_str} (处理第{frame_num+1}帧)"
+        tag = f"时间{time_str} (处理第{frame_num+1}帧)"
 
         if is_face_chain:
             # 人脸链：extract_faces 内部自跑 YOLO 识人，不走 pipe.step
-            n_faces = _face_step(frame, ts, tag)
+            n_faces = _face_step(n, frame, ts, tag)
             detection_count += n_faces
             n += 1
             continue
 
         dets = None
         if pipe.yolo is not None:
-            dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
+            dets = pipe.yolo.infer(frame, track=pipe.track_needed())
 
-        # 保存关键帧图片
+        subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
+        plates = getattr(pipe, "last_plates", [])
+        _step_out(n, ts, tag, dets, subs, al, frame=frame)
+
+        # 保存关键帧图片（检出框 + 车牌框）
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        if dets and len(dets) > 0:
-            # 有检测结果的帧保存标注图
+        if (dets and len(dets) > 0) or plates:
             canvas = frame.copy()
-            _draw_tracks(canvas, dets)
+            _draw_tracks(canvas, dets or [])
+            for p in plates:
+                px1, py1, px2, py2 = p.bbox
+                cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                cv2.putText(canvas, p.plate_no, (px1, max(py1 - 6, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
             anno_name = output_dir / f"frame_{frame_num:04d}_{timestamp.replace(':', '')}_{time_str.replace('.', '_')}_det.{image_format}"
             if not _save_image(anno_name, canvas) and dropped_saves[0] == 1:
                 timeline.append({"kind": "info",
@@ -1055,11 +1299,8 @@ def h_pipeline_run(p: dict) -> dict:
                                  "ts": ts, "frame": processed_count})
 
             if len(images) < 6:  # 限制显示的图片数量
-                images.append({"title": f"帧#{frame_num} 时间{time_str} 检出{len(dets)}个", "data": _img_data_url(canvas, 65)})
-
-        subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
-        detection_count += len(dets or [])
-        _step_out(tag, subs, al, ts, frame=frame)
+                images.append({"title": f"帧#{frame_num} 时间{time_str} 检出{len(dets or [])}个/车牌{len(plates)}",
+                               "data": _img_data_url(canvas, 65)})
 
         n += 1
 
@@ -1068,14 +1309,24 @@ def h_pipeline_run(p: dict) -> dict:
     if is_face_chain:
         head = f"链路: {spec.get('name') or '未命名'} | 视频: {vid.name}"
         head += f" | 范围: {start_time}s-{end_time}s ({start_frame}-{end_frame}帧)"
-        head += f" | 处理 {processed_count} 帧 | 新身份 {face_count} 个 | 重复丢弃 {face_dup} 次"
-        head += f" | 去重阈值 {face_dedup_thresh} | 输出到: {output_dir}" + _save_summary()
+        head += f" | 处理 {processed_count} 帧"
+        if femb is not None:
+            head += f" | 新身份 {face_count} 个 | 重复丢弃 {face_dup} 次 | 去重阈值 {face_dedup_thresh}"
+        else:
+            head += f" | 截取人脸 {face_count} 张"
+        head += f" | 输出到: {output_dir}" + _save_summary()
         return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
 
     head = f"链路: {spec.get('name') or '未命名'} | 视频: {vid.name}"
     head += f" | 范围: {start_time}s-{end_time}s ({start_frame}-{end_frame}帧)"
-    head += f" | 处理 {processed_count} 帧 | 检出 {detection_count} 个 | 告警 {alarm_count} 个"
-    head += f" | VLM: {'真实调用' if use_real_vlm else '模拟回填(' + vlm_action + ')'}"
+    head += f" | 处理 {processed_count} 帧 | 检出 {detection_count} 个 | 车牌 {plate_count} 次 | 告警 {alarm_count} 个"
+    if vlm_unreachable:
+        vlm_state = "端点不可达，已跳过"
+    elif use_real_vlm:
+        vlm_state = "真实调用"
+    else:
+        vlm_state = "模拟回填(" + vlm_action + ")"
+    head += f" | VLM: {vlm_state}"
     if vlm_fail:
         head += f"（失败 {vlm_fail} 次）"
     head += f" | 输出到: {output_dir}"
@@ -1094,7 +1345,7 @@ def _chain_from_spec(spec: dict):
     from pipe.composer import (
         FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
         SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
-        filter_confidence, filter_min_size,
+        filter_confidence, filter_min_size, backpressure_params,
     )
     stages = spec.get("stages") or []
     by_mod: dict = {}
@@ -1108,8 +1359,8 @@ def _chain_from_spec(spec: dict):
 
     if "frame_manager" not in by_mod:
         raise ValueError("链路缺少必需阶段: frame_manager")
-    if "alarm" not in by_mod and "face_embed" not in by_mod:
-        raise ValueError("链路缺少必需阶段: alarm（或 face_embed 组成人脸链）")
+    if not any(k in by_mod for k in ("alarm", "face_embed", "face_detect", "plate_recog")):
+        raise ValueError("链路缺少必需阶段: alarm（或 face_embed / face_detect / plate_recog 作为终段）")
 
     # 字符串参数统一走模块级 _str_param（None/空白 → 默认值）
 
@@ -1118,15 +1369,22 @@ def _chain_from_spec(spec: dict):
         sampling=_str_param(fp, "sampling", SAMPLING_ANALYSIS),
         frame_skip=_int(fp, "frame_skip", 3),
         interval_sec=_float(fp, "interval_sec", 3.0),
-        interval_frames=_int(fp, "interval_frames", 30))
+        interval_frames=_int(fp, "interval_frames", 30),
+        **backpressure_params(_str_param(fp, "backpressure", "standard")))
     ap = _one("alarm")
     if "alarm" in by_mod:
+        a_kind = _str_param(ap, "kind", "window")
+        # 按判定方式取用：window 用「滑窗长度」；dwell 用「驻留秒数」；两者互不干扰
         alarm = AlarmPolicy(
             task_id=_int(ap, "task_id", 1),
-            kind=_str_param(ap, "kind", "window"),
+            kind=a_kind,
             target_actions=_str_list(ap, "target_actions"),
-            smooth_frames=_int(ap, "smooth_frames", 1),
+            smooth_frames=(_int(ap, "window_frames", 2) if a_kind == "window" else 1),
             hit_ratio=_float(ap, "hit_ratio", 1.0),
+            min_conf=_float(ap, "min_conf", 0.0),
+            min_dwell=(_float(ap, "dwell_sec", 2.0) if a_kind == "dwell" else 0.0),
+            key_cooldown=_float(ap, "key_cooldown", -1.0),
+            rules=_str_param(ap, "rules"),
             alarm_cooldown=_float(ap, "alarm_cooldown", 60.0),
             cooldown_by_action=_bool(ap, "cooldown_by_action"))
     else:
@@ -1146,7 +1404,6 @@ def _chain_from_spec(spec: dict):
         yolo = YOLODetector(
             filters=filters, class_limits=_class_limits(_str_param(yp, "class_limits")),
             check_interval=_float(yp, "check_interval", 3.0),
-            roi=_bool(yp, "roi"),
             track_change_only=_bool(yp, "track_change_only"),
             model_path=str(model), conf=_float(yp, "conf", 0.35),
             iou=_float(yp, "iou", 0.7), imgsz=_int(yp, "imgsz", 640),
@@ -1156,10 +1413,152 @@ def _chain_from_spec(spec: dict):
     if "vlm" in by_mod:
         vp = _one("vlm")
         vlm = VLMAnalyzer(
-            crop_padding=_float(vp, "crop_padding", 0.15),
             max_resolution=tuple(_int_tuple(vp, "max_resolution", 2) or (1280, 720)),
             prompt=_str_param(vp, "prompt"))
-    return Pipeline(frame=fm, alarm=alarm, yolo=yolo, vlm=vlm)
+    crop = None
+    if "target_crop" in by_mod:
+        from pipe.target_crop import TargetCrop
+        cp = _one("target_crop")
+        crop = TargetCrop(margin=_float(cp, "margin", 0.0),
+                          classes=_int_list(cp, "classes", None),
+                          filter=_str_param(cp, "filter"),
+                          out_size=_str_param(cp, "out_size"))
+    annotate = None
+    if "annotate" in by_mod:
+        from pipe.annotate import Annotator
+        anp = _one("annotate")
+        annotate = Annotator(thickness=_int(anp, "thickness", 2),
+                             show_label=_bool(anp, "show_label"),
+                             classes=_int_list(anp, "classes", None),
+                             filter=_str_param(anp, "filter"))
+    plate = None
+    if "plate_recog" in by_mod:
+        from plate_recog.plate_recognizer import PlateRecognizer
+        from plate_recog.plate_pipeline import PlateStage
+        from pipe.cropper import Cropper
+        pp = _one("plate_recog")
+        tool = Cropper(upscale=1.0, margin=_float(pp, "margin", 0.1))
+        td = pp.get("track_dedup")
+        plate = PlateStage(
+            PlateRecognizer(detect_level=_str_param(pp, "detect_level", "high")),
+            tool, mode=_str_param(pp, "mode", "crop"),
+            dedup_iou=_float(pp, "dedup_iou", 0.6),
+            track_dedup=(True if td in (None, "") else _bool(pp, "track_dedup")),
+            track_cooldown=_float(pp, "track_cooldown", 5.0))
+    return Pipeline(frame=fm, alarm=alarm, yolo=yolo, vlm=vlm,
+                    crop=crop, annotate=annotate, plate=plate)
+
+
+# ---------------- 实时播放叠加：SSE 流式链路运行（方案 B） ----------------
+# 逐分析帧推框的数值（不传图，浏览器本地播原视频 + canvas 叠加）；前端按
+# currentTime×fps 定位帧号并"播到最新结果时间就暂停等结果"，实现框与画面同步。
+_STREAMS: dict = {}  # run_id -> threading.Event（停止信号）
+
+
+def h_pipeline_stream(write, params: dict) -> None:
+    """SSE 流式运行一条链路：write(event, payload) 逐条推送。
+
+    事件：meta（fps/帧范围/阶段）→ frame（n/ts/dets/plates/alarms）→ done。
+    说明：为不阻塞流，本模式不做真实 VLM 调用（mock 回填由 vlm_feedback 控制）；
+    需要真实研判请用批量运行。停止：POST /api/test/pipeline_run/stop {run_id}。
+    """
+    if not _DB_ENABLED:
+        write("error", {"message": "数据库未启用（--no-db）"})
+        return
+    pipeline_id = _str_param(params, "pipeline_id")
+    if not pipeline_id:
+        write("error", {"message": "请指定测试链路（pipeline_id）"})
+        return
+    try:
+        spec = db.load_pipeline(pipeline_id)
+    except Exception as e:
+        write("error", {"message": f"加载链路失败: {e}"})
+        return
+    video_name = _str_param(params, "video")
+    vid = _find_file(video_name, [VID_DIR])
+    if not vid:
+        write("error", {"message": f"找不到视频: {video_name}"})
+        return
+    try:
+        pipe = _chain_from_spec(spec)
+    except Exception as e:
+        write("error", {"message": f"装配链路失败: {e}"})
+        return
+
+    cap = cv2.VideoCapture(str(vid))
+    if not cap.isOpened():
+        cap.release()
+        write("error", {"message": f"无法打开视频: {vid}"})
+        return
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_time = _float(params, "start_time", 0.0)
+    end_time = _float(params, "end_time", 0.0)
+    max_frames = _int(params, "max_frames", 0)
+    start_frame = int(start_time * fps)
+    end_frame = min(int(end_time * fps) if end_time > 0 else total, total)
+    fm_params = next((s.get("params") or {} for s in spec.get("stages") or []
+                      if s.get("module_id") == "frame_manager"), {})
+    vlm_feedback = _bool(params, "vlm_feedback")
+    vlm_action = _str_param(params, "vlm_action", "fire")
+
+    run_id = uuid.uuid4().hex[:12]
+    stop_evt = threading.Event()
+    _STREAMS[run_id] = stop_evt
+    write("meta", {"run_id": run_id, "name": spec.get("name"), "fps": fps,
+                   "total_frames": total, "start_frame": start_frame,
+                   "end_frame": end_frame,
+                   "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                   "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                   "frame_skip": _int(fm_params, "frame_skip", 1),
+                   "stages": [s.get("module_id") for s in spec.get("stages") or []]})
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    processed = detection_count = plate_count = alarm_count = 0
+    t0 = time.time()
+    n = start_frame
+    try:
+        while True:
+            if stop_evt.is_set():
+                break
+            ok, frame = cap.read()
+            if not ok or n >= end_frame:
+                break
+            if max_frames and processed >= max_frames:
+                break
+            ts = n / fps
+            if not pipe.frame.wants_frame(n, ts):  # 帧管理取图节奏
+                n += 1
+                continue
+            dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo is not None else []
+            subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
+            if vlm_feedback and pipe.vlm is not None:
+                for s in subs:  # 模拟回填（真实 VLM 见函数说明）
+                    al += pipe.on_vlm_result(s.track_key, vlm_action, ts)
+            plates = list(getattr(pipe, "last_plates", []))
+            processed += 1
+            detection_count += len(dets or [])
+            plate_count += len(plates)
+            alarm_count += len(al)
+            write("frame", {
+                "n": n, "ts": round(ts, 3),
+                "dets": [{"cls": d.cls_id, "bbox": list(d.bbox),
+                          "score": round(float(d.score), 3),
+                          "track": int(getattr(d, "track_id", 0) or 0)} for d in (dets or [])],
+                "plates": [{"plate_no": p.plate_no, "type_name": p.type_name, "color": p.color,
+                            "score": round(float(p.score), 3), "bbox": list(p.bbox),
+                            "car_bbox": list(p.car_bbox) if p.car_bbox else None}
+                           for p in plates],
+                "alarms": [{"action": e.action, "desc": getattr(e, "description", ""),
+                            "conf": round(float(getattr(e, "conf", 1.0)), 3)} for e in al],
+            })
+            n += 1
+    finally:
+        cap.release()
+        _STREAMS.pop(run_id, None)
+    write("done", {"run_id": run_id, "processed": processed, "detections": detection_count,
+                   "plates": plate_count, "alarms": alarm_count,
+                   "elapsed": round(time.time() - t0, 2), "stopped": stop_evt.is_set()})
 
 
 def h_chain(p: dict) -> dict:
@@ -1175,17 +1574,56 @@ def h_chain(p: dict) -> dict:
     feedback = _bool(p, "vlm_feedback")
     vlm_action = str(p.get("vlm_action", "fire")).strip() or "fire"
     log, images = [], []
+    _so = [s.get("module_id") for s in spec.get("stages") or [] if s.get("module_id")]
+    _nx = {_so[i]: _so[i + 1] for i in range(len(_so) - 1)}
 
-    def _step_out(tag, subs, al, ts):
-        log.append(f"{tag} → 报送 {len(subs)} 条, 告警 {len(al)} 条")
-        for s in subs:
-            log.append(f"    · {s.ref} (gran={s.gran}, track_key={s.track_key}, 目标数={len(s.dets)})")
-        for e in al:
-            log.append(f"    ⚠ {e.action}")
-        if feedback and pipe.vlm is not None:
-            for s in subs:
-                for e in pipe.on_vlm_result(s.track_key, vlm_action, ts):
-                    log.append(f"    ★ VLM({vlm_action}) 命中 → {e.action}")
+    def _tag(stage):
+        return f"[{_stage_label(stage)}] "
+
+    def _step_out(frame_no, ts, dets, subs, al):
+        """逐模块展示本帧处理内容（不管是否向下传递），每条带帧序数。"""
+        if "frame_manager" in _so:
+            log.append(_tag("frame_manager") + f"帧#{frame_no} 放行 ts={ts:.2f}s")
+        if "yolo" in _so:
+            by_cls = {}
+            for d in dets or []:
+                by_cls[d.cls_id] = by_cls.get(d.cls_id, 0) + 1
+            desc = "、".join(f"cls{c}×{n}" for c, n in sorted(by_cls.items())) or "无"
+            parts = [f"检出 {len(dets or [])}（{desc}）"]
+            if subs:
+                parts.append("报送 " + "、".join(f"{s.ref} 目标{len(s.dets)}" for s in subs))
+            log.append("    " + _tag("yolo") + f"帧#{frame_no} " + "；".join(parts))
+        if "target_crop" in _so:
+            crops = getattr(pipe, "last_crops", [])
+            tids = [c.track_id for c in crops if getattr(c, "track_id", 0)]
+            log.append("    " + _tag("target_crop") + f"帧#{frame_no} 裁出 {len(crops)} 张子图"
+                       + (f"（track {tids}）" if tids else ""))
+        if "vlm" in _so and pipe.vlm is not None:
+            if not subs:
+                log.append("    " + _tag("vlm") + f"帧#{frame_no} 无报送，未处理")
+            else:
+                for s in subs:
+                    if feedback:
+                        log.append("    " + _tag("vlm") + f"帧#{frame_no} 研判 {vlm_action}（模拟回填）")
+                        for e in pipe.on_vlm_result(s.track_key, vlm_action, ts):
+                            log.append("    " + _tag("vlm") + f"帧#{frame_no} 命中 → {e.action}")
+                    else:
+                        log.append("    " + _tag("vlm") + f"帧#{frame_no} 素材包 {s.ref}（未开启研判回填）")
+        if "plate_recog" in _so:
+            plates = getattr(pipe, "last_plates", [])
+            if plates:
+                for p in plates:
+                    log.append("    " + _tag("plate_recog")
+                               + f"帧#{frame_no} 识别 {p.plate_no} {p.type_name}/{p.color} {p.score:.2f}")
+            else:
+                log.append("    " + _tag("plate_recog") + f"帧#{frame_no} 识别 0 张")
+        if "alarm" in _so:
+            if al:
+                for e in al:
+                    desc = f" — {e.description}" if getattr(e, "description", "") else ""
+                    log.append("    " + _tag("alarm") + f"帧#{frame_no} 触发 {e.action}{desc}")
+            else:
+                log.append("    " + _tag("alarm") + f"帧#{frame_no} 无告警")
 
     if p.get("feed") == "video":
         # 真实视频驱动：按帧管理节奏抽帧 → YOLO 推理（dwell 模式 track=True 保
@@ -1199,7 +1637,7 @@ def h_chain(p: dict) -> dict:
             cap.release()
             return res(ok=False, error=f"无法打开视频: {vid}")
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        n = analyzed = total_det = 0
+        n = analyzed = total_det = total_plate = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -1213,13 +1651,19 @@ def h_chain(p: dict) -> dict:
             analyzed += 1
             dets = None
             if pipe.yolo is not None:
-                dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
+                dets = pipe.yolo.infer(frame, track=pipe.track_needed())
             subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
             total_det += len(dets or [])
-            _step_out(f"帧{n} ts={ts:.1f}（检出 {len(dets or [])} 个）", subs, al, ts)
+            total_plate += len(getattr(pipe, "last_plates", []))
+            _step_out(n, ts, dets, subs, al)
             if len(images) < 4:
                 canvas = frame.copy()
                 _draw_tracks(canvas, dets or [])
+                for p in getattr(pipe, "last_plates", []):
+                    px1, py1, px2, py2 = p.bbox
+                    cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                    cv2.putText(canvas, p.plate_no, (px1, max(py1 - 6, 14)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                 if canvas.shape[1] > 1280:
                     k = 1280 / canvas.shape[1]
                     canvas = cv2.resize(canvas, (1280, int(canvas.shape[0] * k)))
@@ -1227,18 +1671,23 @@ def h_chain(p: dict) -> dict:
                                "data": _img_data_url(canvas, 70)})
         cap.release()
         head = f"链路: {spec.get('name') or spec.get('description') or '未命名'} | 视频: {vid.name}"
-        head += f" | 读取帧 {n} | 分析帧 {analyzed} | 检出 {total_det} 个"
+        head += f" | 读取帧 {n} | 分析帧 {analyzed} | 检出 {total_det} 个 | 车牌 {total_plate} 次"
         return res(text=head + "\n" + "\n".join(log), images=images)
     elif p.get("feed") == "real":
-        if pipe.yolo is None:
-            return res(ok=False, error="该链路无 YOLO 阶段，真实图片驱动仅适用于含 YOLO 的链路")
+        if pipe.yolo is None and pipe.plate is None:
+            return res(ok=False, error="该链路无 YOLO/车牌阶段，真实图片驱动仅适用于含检测的链路")
         img_path, frame = _load_frame(p)
-        dets = pipe.yolo.infer(frame, track=(pipe.alarm.kind == "dwell"))
+        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else None
         canvas = frame.copy()
-        _draw_tracks(canvas, dets)
-        images.append({"title": "YOLO 标注", "data": _img_data_url(canvas)})
+        _draw_tracks(canvas, dets or [])
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
-        _step_out(f"真实图片: {img_path.name} (检出 {len(dets)} 个)", subs, al, 0.0)
+        for pl in getattr(pipe, "last_plates", []):
+            px1, py1, px2, py2 = pl.bbox
+            cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
+            cv2.putText(canvas, pl.plate_no, (px1, max(py1 - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        images.append({"title": "检测标注（蓝=目标框, 绿=车牌框）", "data": _img_data_url(canvas)})
+        _step_out(0, 0.0, dets, subs, al)
     else:
         script = str(p.get("script", ""))
         lines = [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
@@ -1252,7 +1701,7 @@ def h_chain(p: dict) -> dict:
             dets = [Detection(track_id=start_track + t, cls_id=cls, bbox=(10, 10, 100, 200),
                               score=0.9, model_path="script") for t in range(count)]
             subs, al = pipe.step(frame_idx, ts, dets)
-            _step_out(f"步: 帧{frame_idx} ts={ts:.1f} cls{cls}×{count}", subs, al, ts)
+            _step_out(frame_idx, ts, dets, subs, al)
     head = f"链路: {spec.get('name') or spec.get('description') or '未命名'}"
     return res(text=head + "\n" + "\n".join(log), images=images)
 
@@ -1276,16 +1725,9 @@ PARAMS = {
         "scenario": {"label": "模拟场景", "type": "select", "default": "平稳",
                      "options": ["平稳", "积压浪涌", "耗时渐增"], "test_only": True,
                      "help": "queue 模式用「积压浪涌」造高峰；adaptive 用「耗时渐增」"},
-        "queue_threshold": {"label": "积压阈值（队列）", "type": "int", "default": 32,
-                            "help": "积压超过它就开始放宽抽帧"},
-        "backpressure_multiplier": {"label": "放宽倍数", "type": "int", "default": 2,
-                                    "help": "放宽时抽帧间隔乘以几倍"},
-        "max_frame_skip": {"label": "放宽上限（0=自动）", "type": "int", "default": 0,
-                           "help": "抽帧间隔最多放宽到多少；0=自动(基础×倍数×4)"},
-        "adaptive_relax_ratio": {"label": "放宽比例（自适应）", "type": "float", "default": 1.2,
-                                 "help": "耗时变长时，间隔乘多少"},
-        "adaptive_recover_ratio": {"label": "恢复比例（自适应）", "type": "float", "default": 0.5,
-                                   "help": "耗时恢复后，间隔按什么比例回落"},
+        "backpressure": {"label": "背压档位", "type": "select", "default": "standard",
+                         "options": ["off", "standard", "aggressive"],
+                         "help": "off=不放宽; standard=标准; aggressive=更激进（积压/耗时高时更快放宽）"},
         "fps": {"label": "视频帧率（预算用）", "type": "float", "default": 25.0,
                 "test_only": True,
                 "help": "用来估算每帧的推理时间预算（adaptive 模式用）"},
@@ -1314,17 +1756,15 @@ PARAMS = {
         "device": {"label": "推理设备（空=自动）", "type": "str", "default": "",
                    "help": "如 cpu 或 0"},
         "filter_conf": {"label": "过滤链：置信度下限（0=不启用）", "type": "float", "default": 0.0,
-                        "help": "低于它的检出直接丢弃，不参与报送"},
+                        "help": "低于它的检出视为未识别（对所有下游生效，先于按类数量统计）"},
         "min_short": {"label": "过滤链：短边最小像素（0=不启用）", "type": "int", "default": 0,
-                      "help": "目标短边小于它就不报送"},
+                      "help": "目标短边小于它视为未识别（碎框/噪声过滤）"},
         "min_long": {"label": "过滤链：长边最小像素（0=不启用）", "type": "int", "default": 0,
-                     "help": "目标长边小于它就不报送"},
+                     "help": "目标长边小于它视为未识别（小目标过滤）"},
         "class_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
-                         "default": "0:1,300", "help": "类别:下限,上限，分号分隔；空=不报送"},
+                         "default": "0:1,300", "help": "类别:下限,上限，分号分隔；数量按过滤后该类目标数算，不在范围内该类整体不报送；空=不报送"},
         "check_interval": {"label": "报送节拍（秒/类）", "type": "float", "default": 3.0,
                            "help": "同一类别每隔几秒才报一次，避免刷屏"},
-        "roi": {"label": "裁剪送审（crop:cls）", "type": "bool", "default": False,
-                "help": "开=送该类裁剪图; 关=送全帧"},
         "track_change_only": {"label": "只在 track_id 变化时报送", "type": "bool", "default": False,
                               "help": "开启后，只有 track_id 发生变化时才报送 VLM（需要启用跟踪）"},
         "ts": {"label": "报送时间戳（秒）", "type": "float", "default": 0.0,
@@ -1332,8 +1772,6 @@ PARAMS = {
                "help": "本帧的时间戳，随报送结果一起带出"},
     },
     "vlm": {
-        "crop_padding": {"label": "裁剪外扩比例", "type": "float", "default": 0.15,
-                         "help": "裁剪目标时往外多扩多少，避免贴边"},
         "max_resolution": {"label": "送审缩放上限（宽,高）", "type": "str", "default": "1280,720",
                            "help": "送审图片最大尺寸，超出会缩小"},
         "prompt": {"label": "提示词", "type": "text", "default": "",
@@ -1369,20 +1807,39 @@ PARAMS = {
     "alarm": {
         "kind": {"label": "判定方式", "type": "select", "default": "window",
                  "options": ["window", "dwell", "inspection"],
-                 "help": "window=VLM滑动窗口; dwell=驻留秒数; inspection=直接落盘"},
+                 "help": "预设档位：window=VLM滑动窗口; dwell=驻留秒数; inspection=巡检/车牌（同对象只输出一次）"},
         "task_id": {"label": "任务编号", "type": "int", "default": 1,
                     "help": "告警会带上这个任务编号"},
         "target_actions": {"label": "目标动作（逗号分隔，空=巡检）", "type": "str",
                            "default": "fire,fight",
-                           "help": "哪些动作算告警，多个用逗号分隔"},
-        "smooth_frames": {"label": "窗口长度 / 驻留秒数", "type": "int", "default": 2,
-                          "help": "window=连续几帧看; dwell=驻留几秒才报"},
+                           "show_if": {"key": "kind", "in": ["window"]},
+                           "help": "哪些动作算告警，多个用逗号分隔（仅 window）"},
+        "window_frames": {"label": "滑窗长度（帧）", "type": "int", "default": 2,
+                          "show_if": {"key": "kind", "in": ["window"]},
+                          "help": "连续几帧命中才告警（仅 window 判定）"},
         "hit_ratio": {"label": "命中比例", "type": "float", "default": 1.0,
-                      "help": "窗口内命中比例到多少才告警（1.0=全部命中）"},
+                      "show_if": {"key": "kind", "in": ["window"]},
+                      "help": "窗口内命中比例到多少才告警（1.0=全部命中，仅 window）"},
+        "min_conf": {"label": "置信度门槛（0=关）", "type": "float", "default": 0.0,
+                     "help": "事件置信度低于它不输出（车牌=识别分；VLM 默认 1.0 不受限）"},
+        "dwell_sec": {"label": "驻留秒数", "type": "float", "default": 2.0,
+                      "show_if": {"key": "kind", "in": ["dwell"]},
+                      "help": "对象持续出现达到该秒数才输出（仅 dwell 判定）"},
+        "rules": {"label": "规则条件（空=关）", "type": "text", "default": "",
+                  "help": "对事件字段自定义条件：字段 操作符 值（>= > <= < == != contains in，"
+                          "操作符两侧留空格）；组内逗号=并且，组间分号=或者。"
+                          "字段：conf/dwell/label/key/features.名，"
+                          "如 features.reading >= 80, features.unit == ℃;conf >= 0.9"},
         "alarm_cooldown": {"label": "冷却时间（秒）", "type": "float", "default": 60.0,
-                           "help": "同一目标告警后多久内不再重复报"},
+                           "show_if": {"key": "kind", "in": ["window", "dwell"]},
+                           "help": "同一目标告警后多久内不再重复报（window/dwell；inspection 见 下一条）"},
+        "key_cooldown": {"label": "巡检同对象去重（-1=只一次）", "type": "float", "default": -1.0,
+                         "show_if": {"key": "kind", "in": ["inspection"]},
+                         "help": "仅 inspection：-1=同对象只输出一次（车牌默认）；"
+                                 "0=不去重逐条落盘; >0=同对象 N 秒后可再报"},
         "cooldown_by_action": {"label": "按警情类型独立冷却", "type": "bool", "default": False,
-                               "help": "开启后，不同警情类型独立冷却时间"},
+                               "show_if": {"key": "kind", "in": ["window"]},
+                               "help": "开启后，不同警情类型独立冷却时间（仅 window）"},
         "timeline": {"label": "事件时间线（每行一条）", "type": "text",
                      "test_only": True,
                      "default": "# window/inspection: ts, track_key, action\n"
@@ -1415,8 +1872,12 @@ PARAMS = {
                      "help": "越高越慢，小脸更清楚"},
         "max_num": {"label": "最多人脸数（0=不限）", "type": "int", "default": 0,
                     "help": "最多返回几张脸"},
-        "use_crop": {"label": "生成对齐裁剪图", "type": "bool", "default": True,
-                     "help": "勾选=同时输出 5 点对齐后的脸部裁剪图"},
+        "use_crop": {"label": "生成对齐裁剪图", "type": "bool", "default": False,
+                     "help": "勾选=额外产出 5 点对齐的 112×112 正面脸图（给人脸嵌入用；一般不需要）"},
+        "margin": {"label": "人脸出图外扩比例", "type": "float", "default": 0.15,
+                   "help": "从原图裁原分辨率人脸时往外多扩多少"},
+        "dedup_iou": {"label": "人脸去重 IoU", "type": "float", "default": 0.6,
+                      "help": "两张脸重叠超过它算同一张，只留一张"},
     },
     "face_embed": {
         "image": {"label": "测试图片（自动先检测再嵌入）", "type": "file", "src": "img",
@@ -1456,31 +1917,67 @@ PARAMS = {
                  "test_only": True,
                  "help": "注册到库里的身份名字"},
     },
-    "extract_faces": {
+    "target_crop": {
+        "out_size": {"label": "输出分辨率（空=原图；640=长边；640,480=严格；×2=倍数）",
+                     "type": "str", "default": "",
+                     "help": "空=原图；单个数=长边像素等比；宽,高=严格尺寸；×2/2x=缩放倍数"},
+        "margin": {"label": "裁剪外扩比例", "type": "float", "default": 0.0,
+                   "help": "按框宽高往外多扩多少，避免目标贴边被切"},
+        "classes": {"label": "只裁这些类别（逗号分隔，空=全部）", "type": "str", "default": "",
+                    "help": "对哪些类别的检测做裁剪（如 2=车，0=人）"},
+        "filter": {"label": "框筛选条件（空=全裁）", "type": "str", "default": "",
+                   "help": "显式字段名条件：track_id == 1 / cls_id == 2 / "
+                           "cls_id in 0|2, score >= 0.5；组内逗号AND、组间分号OR"},
         "image": {"label": "测试图片", "type": "file", "src": "img", "test_only": True,
-                  "help": "含人的原图，从中提取原生分辨率人脸"},
-        "yolo_model": {"label": "YOLO 权重", "type": "file", "src": "model",
-                       "help": "检测权重；不选默认 yolov8n.pt"},
-        "yolo_conf": {"label": "YOLO conf", "type": "float", "default": 0.35,
-                      "help": "先识别人的置信度阈值"},
-        "yolo_iou": {"label": "YOLO iou", "type": "float", "default": 0.7,
-                     "help": "重叠超过它的人框合并"},
-        "yolo_imgsz": {"label": "YOLO imgsz", "type": "int", "default": 640,
-                       "help": "推理分辨率"},
-        "yolo_max_det": {"label": "YOLO max_det", "type": "int", "default": 300,
-                         "help": "单帧最多目标数"},
-        "yolo_classes": {"label": "YOLO 类别（默认人）", "type": "str", "default": "0",
-                         "help": "识别哪类目标（0=人）"},
-        "face_thresh": {"label": "人脸检测阈值", "type": "float", "default": 0.4,
-                        "help": "人框内再找脸的人脸阈值"},
-        "upscale": {"label": "人裁剪图放大倍数", "type": "float", "default": 1.0,
-                    "help": "人框先放大几倍再找脸（1.0=原样）"},
-        "margin": {"label": "人脸出图外扩比例", "type": "float", "default": 0.15,
-                   "help": "输出人脸时往外多扩多少"},
-        "min_person_short": {"label": "最小人框长边（像素）", "type": "int", "default": 30,
-                             "help": "人框长边小于它直接跳过"},
-        "dedup_iou": {"label": "人脸去重 IoU", "type": "float", "default": 0.6,
-                      "help": "两张脸重叠超过它算同一张，只留一张"},
+                  "help": "按框裁图的测试图片"},
+        "bbox": {"label": "测试框（x1,y1,x2,y2）", "type": "str", "default": "10,10,200,200",
+                 "test_only": True, "help": "测试页按该框裁剪"},
+    },
+    "annotate": {
+        "thickness": {"label": "框线粗细（像素）", "type": "int", "default": 2,
+                      "help": "画框的线宽"},
+        "show_label": {"label": "显示类别标签", "type": "bool", "default": True,
+                       "help": "在框上方标注类别名（人/车…）"},
+        "classes": {"label": "只画这些类别（逗号分隔，空=全部）", "type": "str", "default": "",
+                    "help": "对哪些类别的检测画框（如 0,2）"},
+        "filter": {"label": "框筛选条件（空=全画）", "type": "str", "default": "",
+                   "help": "显式字段名条件：track_id == 1 / cls_id == 2 / "
+                           "cls_id in 0|2, score >= 0.5；组内逗号AND、组间分号OR"},
+        "image": {"label": "测试图片", "type": "file", "src": "img", "test_only": True,
+                  "help": "画框测试图片"},
+        "bbox": {"label": "测试框（x1,y1,x2,y2）", "type": "str", "default": "10,10,200,200",
+                 "test_only": True, "help": "测试页画该框"},
+    },
+    "plate_recog": {
+        "detect_level": {"label": "检测精度档", "type": "select", "default": "high",
+                         "options": ["high", "low"],
+                         "help": "high=640（远角/小车牌更准，慢）；low=320（快）"},
+        "mode": {"label": "识别方式", "type": "select", "default": "crop",
+                 "options": ["crop", "direct"],
+                 "help": "crop=消费上游目标裁剪的车图再识别（远角小牌）；direct=整帧直接识别"},
+        "margin": {"label": "车牌出图外扩比例", "type": "float", "default": 0.1,
+                   "help": "从原图裁原分辨率车牌小图时往外多扩多少"},
+        "dedup_iou": {"label": "车牌去重 IoU", "type": "float", "default": 0.6,
+                      "help": "两张车牌重叠超过它算同一张，只留一张"},
+        "track_dedup": {"label": "按车辆跟踪去重", "type": "bool", "default": True,
+                        "help": "同一辆车（同一 track）只识别一次，避免逐帧重复识别"},
+        "track_cooldown": {"label": "同车重试间隔（秒）", "type": "float", "default": 5.0,
+                           "help": "同一 track 多少秒后才允许再次识别；0=只识别一次"},
+        # ---- 测试页脚手架（test_only，不落库、不进链路）----
+        "image": {"label": "测试图片", "type": "file", "src": "img", "test_only": True,
+                  "help": "含车辆/车牌的图片"},
+        "yolo_model": {"label": "测试用 YOLO 权重", "type": "file", "src": "model",
+                       "test_only": True, "help": "测试页用 YOLO 造车辆框；不选默认 yolov8n.pt"},
+        "yolo_conf": {"label": "测试 YOLO conf", "type": "float", "default": 0.25,
+                      "test_only": True, "help": "测试页车辆检测置信度"},
+        "yolo_iou": {"label": "测试 YOLO iou", "type": "float", "default": 0.6,
+                     "test_only": True, "help": "测试页车框合并阈值"},
+        "yolo_imgsz": {"label": "测试 YOLO imgsz", "type": "int", "default": 1280,
+                       "test_only": True, "help": "测试页推理分辨率"},
+        "yolo_max_det": {"label": "测试 YOLO max_det", "type": "int", "default": 300,
+                         "test_only": True, "help": "测试页单帧最多车辆数"},
+        "yolo_classes": {"label": "测试 YOLO 类别", "type": "str", "default": "2",
+                         "test_only": True, "help": "测试页识别哪类目标（2=车）"},
     },
     "face_monitor": {
         "video": {"label": "测试视频", "type": "file", "src": "vid", "group": "运行控制",
@@ -1561,9 +2058,6 @@ PARAMS = {
         "check_interval": {"label": "报送节拍（秒/类）", "type": "float", "default": 3.0,
                            "group": "YOLO 识别 YOLODetector",
                            "help": "同一类别每隔几秒才报一次，避免刷屏"},
-        "roi": {"label": "裁剪送审（crop:cls）", "type": "bool", "default": False,
-                "group": "YOLO 识别 YOLODetector",
-                "help": "开=送该类裁剪图; 关=送全帧"},
     },
 }
 
@@ -1576,13 +2070,23 @@ MODULES = {
         "name": "小模型识别 YOLODetector", "group": "管道四模块",
         "desc": "复用 pipe.composer.YOLODetector：推理 + 过滤链 + 按类报送。",
         "params": PARAMS["yolo"], "handler": h_yolo},
+    "target_crop": {
+        "name": "目标裁剪 TargetCrop", "group": "管道四模块",
+        "desc": "按上游检测框裁子图（输出分辨率可配，默认原分辨率）；"
+                "供车牌识别/人脸检测/VLM 消费。不含检测器。",
+        "params": PARAMS["target_crop"], "handler": h_target_crop},
+    "annotate": {
+        "name": "标注 Annotator", "group": "管道四模块",
+        "desc": "在帧副本上画上游检测框（供 VLM 看“原图+画框”）；纯绘制，无模型。",
+        "params": PARAMS["annotate"], "handler": h_annotate},
     "vlm": {
         "name": "大模型研判 VLMAnalyzer", "group": "管道四模块",
         "desc": "复用 pipe.composer.VLMAnalyzer：素材包准备，可接真实 VLM。",
         "params": PARAMS["vlm"], "handler": h_vlm},
     "alarm": {
-        "name": "告警策略 AlarmPolicy", "group": "管道四模块",
-        "desc": "复用 pipe.composer.AlarmPolicy：window/dwell/inspection + 冷却。",
+        "name": "输出处理（告警）OutputPolicy", "group": "管道四模块",
+        "desc": "复用 pipe.composer.OutputPolicy（原告警策略）：Finding 统一进，"
+                "驻留/词表/置信/规则DSL/滑窗/去重冷却七道闸出（AlarmPolicy 为兼容别名）。",
         "params": PARAMS["alarm"], "handler": h_alarm},
     "face_detect": {
         "name": "人脸检测 FaceDetector", "group": "人脸识别链路",
@@ -1596,10 +2100,11 @@ MODULES = {
         "name": "向量底库 FaceStore", "group": "人脸识别链路",
         "desc": "复用 face_embed.face_store：注册 / 检索 / 自检 / 持久化。",
         "params": PARAMS["face_store"], "handler": h_face_store},
-    "extract_faces": {
-        "name": "原分辨率提取 extract_faces", "group": "人脸识别链路",
-        "desc": "复用 pipe.crop_restore：YOLO 识人 → 裁人 → SCRFD → 原图出脸。",
-        "params": PARAMS["extract_faces"], "handler": h_extract_faces},
+    "plate_recog": {
+        "name": "车牌识别 PlateRecognizer", "group": "车牌识别链路",
+        "desc": "复用 plate_recog.plate_recognizer：HyperLPR3 在车辆子图里裁车牌 + 识别；"
+                "车辆子图由上游「目标裁剪」提供，或整帧直读。",
+        "params": PARAMS["plate_recog"], "handler": h_plate_recog},
     "face_monitor": {
         "name": "视频人脸检索 FaceMonitor", "group": "已完成链路", "hidden": True,
         "desc": "视频/摄像头人脸监控链路：抽帧 + 检测 + 嵌入 + 检索（在「已完成链路」中选择并运行）。",
@@ -1622,9 +2127,6 @@ MODULES = {
 
 
 def _file_index() -> dict:
-    def names(d: Path):
-        return sorted({p.name for p in d.glob("*")
-                       if p.is_file() and p.suffix.lower() in _IMG_SUFFIX})
     return {
         "img": sorted({p.name for p in PIC_DIR.glob("*") if p.suffix.lower() in _IMG_SUFFIX}
                       | {p.name for p in TEST_IMGS.glob("*") if p.suffix.lower() in _IMG_SUFFIX}),
@@ -1652,6 +2154,147 @@ def _video_info(name: str) -> dict:
     return {"ok": True, "name": name, "width": w, "height": h,
             "fps": round(fps, 2), "total_frames": total,
             "duration_sec": round(total / fps, 1) if fps > 0 else 0.0}
+
+
+# ---------------- 视频解码适配：非浏览器友好编码按需转码为 H.264 ----------------
+# 浏览器 <video> 只解 H.264/VP8/VP9/AV1；项目素材多为 H.265(HEVC)/4K，直接播是黑屏。
+# 策略：ffprobe 探测编码 → 浏览器友好则直接回原文件；否则后台 ffmpeg 转 H.264/AAC，
+# 缓存到 out/transcoded/（源文件不变），前端轮询进度、转完再播。分析仍用原视频，
+# 转码只影响预览：预览宽 >1920 时等比缩到 1920，框坐标在前端按原分辨率还原。
+TRANS_DIR = ROOT / "out/transcoded"
+TRANS_DIR.mkdir(parents=True, exist_ok=True)
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_BROWSER_VCODECS = {"h264", "vp8", "vp9", "av1"}
+_BROWSER_ACODECS = {None, "", "aac", "mp3", "opus", "vorbis"}
+_TRANS_LOCK = threading.Lock()
+_TRANS: dict = {}  # cache_path(str) -> {status, progress, error, src, proc}
+
+
+def _probe_video(path: Path) -> dict:
+    """ffprobe 读视频/音频编码、像素格式、时长（缺 ffprobe 返回空）。"""
+    if not _FFPROBE:
+        return {}
+    cmd = [_FFPROBE, "-v", "error", "-show_streams", "-show_format",
+           "-of", "json", str(path)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        data = json.loads(out.stdout or "{}")
+    except Exception:
+        return {}
+    streams = data.get("streams", [])
+    v = next((s for s in streams if s.get("codec_type") == "video"), {})
+    a = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    dur = 0.0
+    with contextlib.suppress(Exception):
+        dur = float(data.get("format", {}).get("duration") or 0.0)
+    return {"vcodec": v.get("codec_name"), "acodec": a.get("codec_name"),
+            "pix_fmt": v.get("pix_fmt"), "width": v.get("width"),
+            "height": v.get("height"), "duration": dur}
+
+
+def _is_browser_playable(info: dict) -> bool:
+    """H.264(yuv420p)+常见音轨可直接播；HEVC/非 420 像素格式/未知音轨需转码。"""
+    if not info or info.get("vcodec") not in _BROWSER_VCODECS:
+        return False
+    if info.get("vcodec") == "h264" and info.get("pix_fmt") not in ("yuv420p", "yuvj420p"):
+        return False
+    return info.get("acodec") in _BROWSER_ACODECS
+
+
+def _trans_cache_path(src: Path) -> Path:
+    """转码缓存路径：源名+大小+mtime+参数版本 哈希，源变则重转。"""
+    st = src.stat()
+    key = f"{src.name}|{st.st_size}|{st.st_mtime_ns}|v1|max1920"
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return TRANS_DIR / f"{src.stem}.{h}.mp4"
+
+
+def _trans_start(src: Path, out: Path, duration: float) -> None:
+    """启动后台转码线程（同 key 已在跑则跳过）。"""
+    key = str(out)
+    with _TRANS_LOCK:
+        st = _TRANS.get(key)
+        if st and st.get("status") == "transcoding":
+            return
+        _TRANS[key] = {"status": "transcoding", "progress": 0.0,
+                       "error": "", "src": str(src), "proc": None}
+
+    def _worker():
+        tmp = out.with_suffix(".part.mp4")
+        vf = "scale='min(1920,iw)':-2"  # 宽 >1920 等比缩到 1920（预览够用，体积/解码成本大降）
+        cmd = [_FFMPEG, "-y", "-v", "error", "-i", str(src), "-vf", vf,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(tmp)]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            with _TRANS_LOCK:
+                _TRANS[key]["proc"] = proc
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith(("out_time_us=", "out_time_ms=")):
+                    val = line.split("=", 1)[1]
+                    if val.isdigit() and duration > 0:
+                        pct = min(99.0, int(val) / 1e6 / duration * 100)
+                        with _TRANS_LOCK:
+                            _TRANS[key]["progress"] = round(pct, 1)
+            proc.wait()
+            if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                tmp.replace(out)
+                with _TRANS_LOCK:
+                    _TRANS[key].update(status="ready", progress=100.0)
+            else:
+                err = (proc.stderr.read() or "").strip()[-300:] if proc.stderr else ""
+                with _TRANS_LOCK:
+                    _TRANS[key].update(status="error", error=err or "转码失败")
+        except Exception as e:
+            with _TRANS_LOCK:
+                _TRANS[key].update(status="error", error=f"{type(e).__name__}: {e}")
+        finally:
+            with contextlib.suppress(Exception):
+                if tmp.is_file() and not out.is_file():
+                    tmp.unlink()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _video_prepare(name: str) -> dict:
+    """确保视频可在浏览器播放：友好则回原文件，否则触发/查询 H.264 转码进度。"""
+    path = _find_file(name, [VID_DIR])
+    if not path:
+        return {"ok": False, "error": f"找不到视频: {name}"}
+    info = _probe_video(path)
+    if _is_browser_playable(info):
+        return {"ok": True, "status": "ready", "transcoded": False,
+                "url": f"/files/videos/{quote(name)}"}
+    if not _FFMPEG:
+        return {"ok": False, "error": "该视频编码浏览器不支持，且未安装 ffmpeg，无法转码"}
+    out = _trans_cache_path(path)
+    if out.is_file() and out.stat().st_size > 0:
+        return {"ok": True, "status": "ready", "transcoded": True,
+                "url": f"/media/videos/{quote(name)}"}
+    with _TRANS_LOCK:
+        st = dict(_TRANS.get(str(out), {}))
+    if st.get("status") == "error":  # 已失败：不自动重试，回错误让前端提示
+        return {"ok": True, "status": "error", "error": st.get("error", "转码失败"),
+                "transcoded": True, "url": f"/media/videos/{quote(name)}"}
+    _trans_start(path, out, float(info.get("duration") or 0.0))
+    with _TRANS_LOCK:
+        st = dict(_TRANS.get(str(out), {}))
+    return {"ok": True, "status": st.get("status", "transcoding"),
+            "progress": st.get("progress", 0.0), "transcoded": True,
+            "error": st.get("error", ""), "url": f"/media/videos/{quote(name)}"}
+
+
+def _media_path(name: str) -> Path | None:
+    """已转码缓存文件路径；不存在或空文件返回 None。"""
+    src = _find_file(name, [VID_DIR])
+    if not src:
+        return None
+    out = _trans_cache_path(src)
+    return out if out.is_file() and out.stat().st_size > 0 else None
 
 
 def _get_estimator() -> ResourceEstimator:
@@ -1876,10 +2519,60 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    def _stream(self, params: dict) -> None:
+        """SSE 流式运行（实时播放叠加）：抢 _TEST_LOCK（忙则回 error 事件）后逐事件写出。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def write(event: str, payload: dict) -> None:
+            body = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            self.wfile.write(body.encode("utf-8"))
+            self.wfile.flush()
+
+        if not _TEST_LOCK.acquire(blocking=False):
+            with contextlib.suppress(Exception):
+                write("error", {"message": "另一测试正在运行，请稍后再试"})
+            return
+        try:
+            h_pipeline_stream(write, params)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端断开：循环随写失败结束
+        except Exception as e:
+            print(traceback.format_exc())
+            with contextlib.suppress(Exception):
+                write("error", {"message": f"{type(e).__name__}: {e}"})
+        finally:
+            self.close_connection = True  # 流结束即断开（HTTP/1.1 keep-alive 下否则客户端会一直等）
+            _TEST_LOCK.release()
+
     def _send_file(self, path: Path, ctype: str) -> None:
+        size = path.stat().st_size
+        rng = self.headers.get("Range")
+        if rng:  # 支持 HTTP Range（206）：视频拖动进度条必需
+            m = re.match(r"bytes=(\d*)-(\d*)", str(rng).strip())
+            if m and (m.group(1) or m.group(2)):
+                start = int(m.group(1)) if m.group(1) else 0
+                end = int(m.group(2)) if m.group(2) else size - 1
+                end = min(end, size - 1)
+                if start <= end and start < size:
+                    self.send_response(206)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Content-Length", str(end - start + 1))
+                    self.end_headers()
+                    with open(path, "rb") as f:
+                        f.seek(start)
+                        self.wfile.write(f.read(end - start + 1))
+                    return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(size))
         self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         with open(path, "rb") as f:
@@ -1894,14 +2587,14 @@ class Handler(BaseHTTPRequestHandler):
             html = (STATIC / "test.html").read_bytes()
             self._send(200, html, "text/html; charset=utf-8")
         elif path.startswith("/files/videos/"):
-            video_name = path[len("/files/videos/"):]
+            video_name = unquote(path[len("/files/videos/"):])  # 浏览器对中文名会百分号编码
             video_path = VID_DIR / video_name
             if video_path.is_file():
                 self._send_file(video_path, "video/mp4")
             else:
                 self._send(404, b"video not found", "text/plain")
         elif path.startswith("/files/images/"):
-            image_name = path[len("/files/images/"):]
+            image_name = unquote(path[len("/files/images/"):])
             image_path = PIC_DIR / image_name
             if not image_path.is_file():
                 image_path = TEST_IMGS / image_name
@@ -1914,6 +2607,19 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/video/info":
             qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             self._json(_video_info((qs.get("name") or [""])[0]))
+        elif path == "/api/video/prepare":  # 解码适配：确保浏览器可播（必要时转码）
+            qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            self._json(_video_prepare((qs.get("name") or [""])[0]))
+        elif path.startswith("/media/videos/"):  # 转码后的 H.264 预览文件
+            media_name = unquote(path[len("/media/videos/"):])
+            media_path = _media_path(media_name)
+            if media_path:
+                self._send_file(media_path, "video/mp4")
+            else:
+                self._send(404, b"media not ready", "text/plain")
+        elif path == "/api/test/pipeline_run/stream":  # 实时播放叠加（SSE）
+            qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            self._stream({k: v[0] for k, v in qs.items() if v})
         elif path == "/api/presets":
             qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             kind = (qs.get("kind") or ["module"])[0]
@@ -1946,6 +2652,23 @@ class Handler(BaseHTTPRequestHandler):
                             "back_calc": reco})
             except Exception as e:  # spec 不合法时给出明确报错
                 self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        # ---- 实时播放叠加：停止流式运行 ----
+        if self.path == "/api/test/pipeline_run/stop":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self._json({"ok": False, "error": "请求体不是合法 JSON"})
+                return
+            rid = str(body.get("run_id") or "").strip()
+            evt = _STREAMS.get(rid)
+            if evt is None:
+                self._json({"ok": False, "error": f"无此运行: {rid}"})
+                return
+            evt.set()
+            self._json({"ok": True, "stopped": rid})
             return
 
         # ---- 命名配置暂存（MySQL）----
@@ -2055,19 +2778,20 @@ _SEED_STAGES = [
     # 帧管理：远角无人机视频按 15 帧抽 1（2026-08-24 实调）
     ("frame_manager", "警用无人机·帧管理", {
         "sampling": "analysis", "frame_skip": 15, "interval_sec": 3.0,
-        "interval_frames": 30, "queue_threshold": 32,
-        "backpressure_multiplier": 2, "adaptive_relax_ratio": 1.2,
-        "adaptive_recover_ratio": 0.5}),
+        "interval_frames": 30, "backpressure": "standard"}),
     # YOLO：imgsz=1280 为远角小目标决定性参数（2026-08-24 实调，见知识库决策表）
     ("yolo", "警用无人机·YOLO识别", {
         "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
         "imgsz": 1280, "max_det": 300, "classes": "0,2", "device": "",
         "filter_conf": 0.0, "min_short": 0, "min_long": 0,
         "class_limits": "0:2,300;2:1,300", "check_interval": 3.0,
-        "roi": False, "track_change_only": False}),
+        "track_change_only": False}),
+    # 标注：把检出框画在原帧上，供 VLM 看"原图 + 画框"
+    ("annotate", "警用无人机·标注", {
+        "thickness": 2, "show_label": True, "classes": "", "filter": ""}),
     # VLM：接真实端点（use_real_vlm=true；不可达时测试台记日志继续，不中断）
     ("vlm", "警用无人机·VLM研判", {
-        "crop_padding": 0.15, "max_resolution": "1280,720", "prompt": ALARM_PROMPT,
+        "max_resolution": "1280,720", "prompt": ALARM_PROMPT,
         "use_real_vlm": True,
         "vlm_endpoint": "http://117.42.21.253:8000/v1/chat/completions",
         "vlm_model": "qwen3-vl-32b", "vlm_key": ""}),
@@ -2075,55 +2799,141 @@ _SEED_STAGES = [
     ("alarm", "警用无人机·告警策略", {
         "kind": "window", "task_id": 1,
         "target_actions": "治安类,交警类,群体性事件类,救援救助类",
-        "smooth_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 30.0,
+        "window_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 30.0,
         "cooldown_by_action": True}),
 ]
 
+# 第二条链路：车牌识别（帧管理 → YOLO 识车 → 车牌识别(裁车牌+识别) → 告警）
+_SEED_PLATE_NAME = "车牌识别链路"
+_SEED_PLATE_STAGES = [
+    # 帧管理：车牌视频按 5 帧抽 1（比警用链路密，兼顾远角小牌）
+    ("frame_manager", "车牌识别·帧管理", {
+        "sampling": "analysis", "frame_skip": 5, "interval_sec": 3.0,
+        "interval_frames": 30, "backpressure": "standard"}),
+    # YOLO：只识车（classes=2），为车牌识别提供车辆框（复用原有 yolo 模块）
+    ("yolo", "车牌识别·YOLO识车", {
+        "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
+        "imgsz": 1280, "max_det": 300, "classes": "2", "device": "",
+        "filter_conf": 0.0, "min_short": 0, "min_long": 40,
+        "class_limits": "2:1,300", "check_interval": 0.0,
+        "track_change_only": False}),
+    # 目标裁剪：按 YOLO 车辆框裁车放大 2×（供车牌识别在车图里裁车牌）
+    ("target_crop", "车牌识别·目标裁剪", {
+        "out_size": "×2", "margin": 0.1,
+        "classes": "2", "filter": ""}),
+    # 车牌识别：从车图裁车牌 + 识别 + 坐标还原 + 原图出原分辨率车牌小图
+    # （track_dedup：同一辆车只识别一次，5 秒后可重试）
+    ("plate_recog", "车牌识别·车牌识别", {
+        "detect_level": "high", "mode": "crop", "margin": 0.1,
+        "dedup_iou": 0.6, "track_dedup": True, "track_cooldown": 5.0}),
+    # 告警：巡检（识别到的车牌逐条记录，同车牌跨帧去重）
+    ("alarm", "车牌识别·告警策略", {
+        "kind": "inspection", "task_id": 2, "target_actions": "",
+        "window_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 30.0,
+        "cooldown_by_action": False}),
+]
+
+
+# 第三条链路：人脸截取（帧管理 → YOLO 识人 → 原分辨率人脸提取；无嵌入/检索/告警）
+_SEED_FACE_NAME = "人脸截取链路"
+_SEED_FACE_STAGES = [
+    # 帧管理：按 5 帧抽 1（近景人脸视频节奏；远角可调大 frame_skip）
+    ("frame_manager", "人脸截取·帧管理", {
+        "sampling": "analysis", "frame_skip": 5, "interval_sec": 3.0,
+        "interval_frames": 30, "backpressure": "standard"}),
+    # YOLO：只识人（classes=0），imgsz=1280 兼容远角小目标（分辨率近乎免费的召回）
+    ("yolo", "人脸截取·YOLO识人", {
+        "model_path": "models/yolov8n.pt", "conf": 0.3, "iou": 0.6,
+        "imgsz": 1280, "max_det": 300, "classes": "0", "device": "",
+        "filter_conf": 0.0, "min_short": 0, "min_long": 30,
+        "class_limits": "0:1,300", "check_interval": 0.0,
+        "track_change_only": False}),
+    # 目标裁剪：按 YOLO 人框裁人（供人脸检测在子图里检脸）
+    ("target_crop", "人脸截取·目标裁剪", {
+        "out_size": "", "margin": 0.0,
+        "classes": "0", "filter": ""}),
+    # 人脸检测：在目标子图里检脸 + 从原图出原分辨率人脸
+    ("face_detect", "人脸截取·人脸检测", {
+        "device": "auto", "det_thresh": 0.4, "det_size": "640,640",
+        "max_num": 0, "use_crop": False, "margin": 0.15, "dedup_iou": 0.6}),
+]
 
 # 链路未使用、但产品保留的模块（人脸识别链）：每模块同样恰播种一份参数（不入链路步骤）
 _SEED_STANDALONE = [
     ("face_detect", "人脸检测·默认", {
         "device": "auto", "det_thresh": 0.5, "det_size": "640,640",
-        "max_num": 0, "use_crop": True}),
+        "max_num": 0, "use_crop": False, "margin": 0.15, "dedup_iou": 0.6}),
     ("face_embed", "人脸嵌入·默认", {
         "device": "auto", "det_thresh": 0.5, "det_size": "640,640"}),
     ("face_store", "向量底库·默认", {
         "db_path": "out/face_db.npz", "thresh": 0.45, "topk": 5,
         "device": "auto"}),
-    ("extract_faces", "原分辨率提取·默认", {
-        "yolo_model": "", "yolo_conf": 0.35, "yolo_iou": 0.7, "yolo_imgsz": 640,
-        "yolo_max_det": 300, "yolo_classes": "0", "face_thresh": 0.4,
-        "upscale": 1.0, "margin": 0.15, "min_person_short": 30,
-        "dedup_iou": 0.6}),
+    ("target_crop", "目标裁剪·默认", {
+        "out_size": "", "margin": 0.0,
+        "classes": "", "filter": ""}),
+    ("annotate", "标注·默认", {
+        "thickness": 2, "show_label": True, "classes": "", "filter": ""}),
+    ("plate_recog", "车牌识别·默认", {
+        "detect_level": "high", "mode": "crop", "margin": 0.1,
+        "dedup_iou": 0.6, "track_dedup": True, "track_cooldown": 5.0}),
 ]
 
 
+def _seed_chain(name: str, stages: list, description: str, have: dict) -> None:
+    """幂等播种一条链路：先保各阶段模块 preset，再建链路引用。
+
+    已存在同名链路时：阶段结构一致则原样保留（不动用户改动）；结构变化（如插入
+    「目标裁剪」）则按模块复用旧 preset（保留其参数）、补建缺失阶段、丢弃下线阶段，
+    重建步骤（save_pipeline 同名覆盖）。这样既迁移结构，又不产生重复 preset。
+    """
+    expected = [mid for mid, _s, _p in stages]
+    existing = next((p for p in db.list_pipelines() if p["name"] == name), None)
+    reuse: dict = {}
+    if existing is not None:
+        got = [s.get("module_id") for s in (existing.get("steps") or [])]
+        if got == expected:
+            return
+        print(f"[seed] 链路「{name}」阶段已变更，重建…")
+        for s in (existing.get("steps") or []):
+            reuse.setdefault(s["module_id"], s["preset_id"])  # 按模块复用旧 preset
+    stage_ids = []
+    for mid, sname, params in stages:
+        pid = reuse.get(mid)
+        if pid is None:
+            key = (mid, sname)
+            if key in have:
+                pid = have[key]
+            else:
+                pid, _created = db.save_preset("module", sname, mid, params)
+                print(f"[seed] 模块配置「{sname}」已播种（{pid}）")
+                have[key] = pid
+        stage_ids.append(pid)
+    pid, _created = db.save_pipeline(name, stage_ids, streams=1, budget={},
+                                     meta={"description": description})
+    print(f"[seed] 链路「{name}」已播种（{pid}）")
+
+
 def _seed_pipeline() -> None:
-    """幂等播种唯一保留链路：先保模块 preset（同名跳过），再建链路引用。失败不影响运行。"""
+    """幂等播种链路与模块 preset（同名跳过）。失败不影响运行。"""
     if not _DB_ENABLED:
         return
     try:
         have = {(p["module_id"], p["name"]): p["id"]
                 for p in db.list_presets("module")}
-        stage_ids = []
-        for mid, name, params in _SEED_STAGES:
-            key = (mid, name)
-            if key not in have:
-                pid, _created = db.save_preset("module", name, mid, params)
-                print(f"[seed] 模块配置「{name}」已播种（{pid}）")
-            else:
-                pid = have[key]
-            stage_ids.append(pid)
         for mid, name, params in _SEED_STANDALONE:
             if (mid, name) not in have:
                 pid, _created = db.save_preset("module", name, mid, params)
                 print(f"[seed] 模块配置「{name}」已播种（{pid}）")
-        if not any(p["name"] == _SEED_PIPELINE_NAME for p in db.list_pipelines()):
-            pid, _created = db.save_pipeline(
-                _SEED_PIPELINE_NAME, stage_ids, streams=1, budget={},
-                meta={"description": "警用无人机监测链路：帧管理→YOLO识人车→"
-                                     "VLM研判警情→告警策略（模块自定义拼接）"})
-            print(f"[seed] 链路「{_SEED_PIPELINE_NAME}」已播种（{pid}）")
+                have[(mid, name)] = pid
+        _seed_chain(_SEED_PIPELINE_NAME, _SEED_STAGES,
+                    "警用无人机监测链路：帧管理→YOLO识人车→VLM研判警情→告警策略"
+                    "（模块自定义拼接）", have)
+        _seed_chain(_SEED_PLATE_NAME, _SEED_PLATE_STAGES,
+                    "车牌识别链路：帧管理→YOLO识车→车牌识别(HyperLPR3)→告警"
+                    "（模块自定义拼接）", have)
+        _seed_chain(_SEED_FACE_NAME, _SEED_FACE_STAGES,
+                    "人脸截取链路：帧管理→YOLO识人→原分辨率人脸提取"
+                    "（无嵌入/检索/告警，截取落盘即目的）", have)
     except Exception as e:
         print(f"[seed] 播种链路失败（不影响运行）: {e}")
 

@@ -2,7 +2,6 @@
 """
 警用无人机链路测试（验证扩展功能）
 """
-import json
 import sys
 from pathlib import Path
 
@@ -15,7 +14,7 @@ import numpy as np
 from pipe.composer import (
     FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
     Detection, SAMPLING_ANALYSIS,
-    filter_confidence, filter_min_size,
+    filter_confidence,
 )
 
 ALARM_PROMPT = """你是一个警情分析专家。请分析画面中的情况，并以 JSON 格式返回分析结果：
@@ -69,7 +68,6 @@ def test_police_uav_pipeline():
         filters=[filter_confidence(0.35)],
         class_limits=_class_limits("0:2,300;2:2,300"),
         check_interval=5.0,
-        roi=True,
         track_change_only=True,
         model_path=str(ROOT / "models/yolov8n.pt"),
         conf=0.35,
@@ -81,7 +79,6 @@ def test_police_uav_pipeline():
     )
     
     vlm = VLMAnalyzer(
-        crop_padding=0.15,
         max_resolution=(1280, 720),
         prompt=ALARM_PROMPT,
     )
@@ -101,7 +98,7 @@ def test_police_uav_pipeline():
     print("✓ 链路构建成功")
     print(f"  - 帧管理: {fm.sampling}, frame_skip={fm.frame_skip}")
     print(f"  - YOLO: class_limits={yolo.class_limits}, track_change_only={yolo.track_change_only}")
-    print(f"  - VLM: crop_padding={vlm.crop_padding}")
+    print(f"  - VLM: max_resolution={vlm.max_resolution}")
     print(f"  - 告警: cooldown_by_action={alarm.cooldown_by_action}, alarm_cooldown={alarm.alarm_cooldown}")
     
     # 测试帧决策

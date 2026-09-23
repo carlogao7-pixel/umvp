@@ -266,6 +266,9 @@ function select(id){
     form.appendChild(div);
     for (const [pk, spec] of test) form.appendChild(field(pk, spec));
   }
+  applyShowIf(form);
+  form.oninput = () => applyShowIf(form);
+  form.onchange = () => applyShowIf(form);
   renderEstimate(m.estimate);
   document.getElementById("run").disabled = false;
   refreshModulePresets();
@@ -309,7 +312,23 @@ function field(pk, spec, prefix){
     h.className = "help"; h.textContent = spec.help;
     row.appendChild(h);
   }
+  if (spec.show_if) row.dataset.showIf = JSON.stringify(spec.show_if);  // 按其他字段值联动显隐
   return row;
+}
+
+// 按 show_if 联动显隐：条件形如 {key:"kind", in:["window"]} 或 {key:"x", eq:"y"}
+function applyShowIf(scope){
+  scope.querySelectorAll("[data-show-if]").forEach(row => {
+    let cond;
+    try { cond = JSON.parse(row.dataset.showIf); } catch(e){ return; }
+    const ctrl = scope.querySelector('[data-name="' + cond.key + '"]');
+    if (!ctrl){ row.hidden = false; return; }
+    const v = ctrl.type === "checkbox" ? (ctrl.checked ? "true" : "false") : ctrl.value;
+    let show = true;
+    if (cond["in"] !== undefined) show = cond["in"].map(String).includes(String(v));
+    else if (cond["eq"] !== undefined) show = String(cond["eq"]) === String(v);
+    row.hidden = !show;
+  });
 }
 
 function renderInput(pk, spec, prefix){
@@ -749,6 +768,11 @@ function renderStagePresetSel(q, sel, mid){
 
 function addStage(mid, params, presetId){
   const m = SCHEMA.modules[mid];
+  // 每个模块在一条链路中最多一个阶段：重复点击调色板不会新增重复阶段（防止误加）
+  if (STAGES.some(s => s.module === mid)){
+    alert("「" + (m ? m.name : mid) + "」已在链路中；每个模块只能有一个阶段，请直接修改该阶段参数。");
+    return null;
+  }
   const el = document.createElement("div");
   el.className = "stage";
   const head = document.createElement("div");
@@ -781,10 +805,14 @@ function addStage(mid, params, presetId){
       form.appendChild(field(pk, spec, "s" + STAGES.length + "-" + pk));
     }
     el.appendChild(form);
+    applyShowIf(form);
+    form.oninput = () => applyShowIf(form);
+    form.onchange = () => applyShowIf(form);
   }
   document.getElementById("dg-stages").appendChild(el);
   STAGES.push({module: mid, el, presetId: presetId || null});
   if (params) fillForm(el, params);
+  applyShowIf(el);
   return el;
 }
 
@@ -886,7 +914,13 @@ async function savePipelinePreset(){
   // 每个阶段：有绑定 id → 更新该 preset（id 稳定不新建）；无绑定 → 新建并记下 id。
   // 命名统一为「链路名 · 模块名」，仅在新建时落库；既有 preset 若名字不一致也顺带归一。
   // 注意：直接用 STAGES（保有 el / presetId），snapshot() 只返回 {module, params} 会丢失二者。
-  const stages = STAGES;
+  // 防御性去重：同一模块只保留首个阶段（后端亦拒绝重复模块，双保险）。
+  const seenMods = new Set();
+  const stages = STAGES.filter(s => {
+    if (seenMods.has(s.module)) return false;
+    seenMods.add(s.module);
+    return true;
+  });
   const steps = [];
   for (const stage of stages){
     const moduleId = stage.module;

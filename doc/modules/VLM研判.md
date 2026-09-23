@@ -1,6 +1,6 @@
 # VLM 研判 VLMAnalyzer
 
-> 模块组：管道四模块 | 代码：`umvp/pipe/composer.py`（`VLMAnalyzer`）
+> 模块组：管道模块 | 代码：`umvp/pipe/composer.py`（`VLMAnalyzer`）
 > 数据库参数：`VLM0001`「警用无人机·VLM研判」（presets 表 + preset_params_vlm 表）
 
 ## 1. 模块定位
@@ -15,7 +15,6 @@
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| crop_padding | float | 0.15 | 裁剪外扩比例：crop:* 素材向外多扩，避免目标贴边 |
 | max_resolution | str | "1280,720" | 送审前缩放上限（宽,高），超出按比例缩小 |
 | prompt | text | 空 | VLM 提示词；空=用测试台默认分类提示词 |
 
@@ -36,7 +35,7 @@ SubmitRequest 提供，不预填、不落库。
 
 ### 2.4 当前库内值（VLM0001）
 
-`crop_padding=0.15, max_resolution="1280,720", use_real_vlm=true,
+`max_resolution="1280,720", use_real_vlm=true,
 vlm_endpoint=http://117.42.21.253:8000/v1/chat/completions,
 vlm_model=qwen3-vl-32b`，prompt 为警情四分类提示词（要求返回 JSON：
 `alert_type`（治安类/交警类/群体性事件类/救援救助类/无异常）+ `description`）。
@@ -55,28 +54,27 @@ vlm_model=qwen3-vl-32b`，prompt 为警情四分类提示词（要求返回 JSON
 
 | 字段 | 类型 | 内容 |
 |---|---|---|
-| ref | str | 素材引用（full:cls{N} / crop:cls{N} / full:global） |
+| ref | str | 素材引用（full:cls{N} / full:global）；ROI 裁剪送审改由上游「目标裁剪」阶段承担 |
 | gran | str | 报送粒度（class/scene） |
 | track_key | int | 识别类型编号（scene=-1） |
 | prompt | str | 提示词 |
-| crop_padding | float/None | 仅裁剪素材带外扩比例；全帧为 None |
 | max_resolution | (w,h) | 送审缩放上限 |
 | bbox | (x1,y1,x2,y2)/None | 单目标位置（有单目标素材时） |
 | det_count | int | 该类目标数量 |
 
 ### 4.2 链路运行时的 VLM 研判结果
 
-真实 VLM 返回 JSON 文本，链路解析出两个字段喂给告警策略：
+真实 VLM 返回 JSON 文本，链路解析出两个字段喂给输出处理（OutputPolicy）：
 
 | 字段 | 类型 | 内容 |
 |---|---|---|
-| alert_type（action） | str | 警情类型/动作名（如"交警类"、"无异常"），告警策略按它匹配 target_actions |
+| alert_type（action） | str | 警情类型/动作名（如"交警类"、"无异常"），输出处理按它匹配 target_actions |
 | description | str | 警情文字描述，随 AlarmEvent 带出 |
 
 ## 5. 上下游衔接
 
 - 上游：YOLO 识别的 SubmitRequest + 原帧。
-- 下游：研判结果（action, description）交给告警策略 `on_vlm_result()` 判定告警。
+- 下游：研判结果（action, description）交给输出处理 `on_vlm_result()`（兼容入口，内部走统一漏斗）判定告警。
 
 ## 6. 验证
 

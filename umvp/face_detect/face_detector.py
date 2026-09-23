@@ -23,6 +23,14 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+# 公共加载逻辑（provider 选择 / CUDA 回退 / is_gpu）。兼容两种导入方式：
+# 包导入（face_detect.face_detector）用相对导入；以脚本方式跑 face_detect/ 下的测试时
+# （该目录在 sys.path）回退为平级导入。
+try:
+    from .providers import DeviceAware, build_providers, load_insightface_model
+except ImportError:  # pragma: no cover - 脚本运行时的兜底
+    from providers import DeviceAware, build_providers, load_insightface_model
+
 # -------------------- 默认模型路径 --------------------
 # 独立项目自包含：默认加载项目内 face_models/（本文件位于 umvp/face_detect/，向上两级是项目根）。
 # 传 model_root 参数仍可覆盖（如 ~/.insightface/models）。
@@ -77,7 +85,7 @@ class FaceDetection:
         }
 
 
-class FaceDetector:
+class FaceDetector(DeviceAware):
     """InsightFace SCRFD 人脸检测器封装。
 
     用法:
@@ -132,38 +140,9 @@ class FaceDetector:
 
     # ---------------- 加载 ----------------
     def _load(self) -> None:
-        import onnxruntime as ort
-        from insightface.model_zoo import get_model
-
-        # 探测可用 provider
-        available = set(ort.get_available_providers())
-        if self.device == "auto":
-            self._provider_names = [
-                "CUDAExecutionProvider" if "CUDAExecutionProvider" in available else "CPUExecutionProvider",
-                "CPUExecutionProvider",
-            ]
-        elif self.device == "cuda":
-            self._provider_names = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            self._provider_names = ["CPUExecutionProvider"]
-
-        self._ctx_id = 0 if self._provider_names[0] == "CUDAExecutionProvider" else -1
-
-        try:
-            self.det = get_model(
-                self._model_path, download=False, providers=self._provider_names
-            )
-        except Exception as e:
-            # 全 CUDA 失败回退 CPU
-            if "CPUExecutionProvider" not in self._provider_names:
-                print(f"[FaceDetector] CUDA 初始化失败({e})，回退 CPU")
-                self._provider_names = ["CPUExecutionProvider"]
-                self._ctx_id = -1
-                self.det = get_model(
-                    self._model_path, download=False, providers=self._provider_names
-                )
-            else:
-                raise
+        self._provider_names, self._ctx_id = build_providers(self.device)
+        self.det, self._provider_names, self._ctx_id = load_insightface_model(
+            self._model_path, self._provider_names, self._ctx_id, tag="FaceDetector")
 
         self.det.prepare(ctx_id=self._ctx_id, det_thresh=self.det_thresh, det_size=self.det_size)
         print(
@@ -171,10 +150,6 @@ class FaceDetector:
             f"device={'GPU(cuda)' if self._ctx_id >= 0 else 'CPU'} | "
             f"thresh={self.det_thresh} | det_size={self.det_size}"
         )
-
-    @property
-    def is_gpu(self) -> bool:
-        return self._ctx_id >= 0
 
     # ---------------- 推理 ----------------
     def detect(self, img_bgr: np.ndarray, max_num: Optional[int] = None) -> List[FaceDetection]:

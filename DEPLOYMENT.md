@@ -34,6 +34,316 @@
 
 ## 记录
 
+### 2026-09-23(七) · 识别对象有效性过滤统一到 YOLO 输出处；裁剪模块去过滤
+- 变更内容：① `YOLODetector.infer()` 返回前套过滤链（`filter_conf`/`min_short`/`min_long`/
+  自定义 `filters`）——不达标目标**视为"未识别"**，对**所有下游**（VLM 报送 / 目标裁剪·
+  车牌·人脸传递 / 标注）统一生效，且**先于** `class_limits` 按类计数；`pass_dets` 不再过滤
+  （入参已是干净输出）。② YOLO 恢复 `min_short`/`min_long` 参数（PARAMS/种子/handler/装配）。
+  ③ 目标裁剪删除 `min_short`（参数+代码），回归纯机械裁剪+缩放；`crop_restore.extract_faces`
+  兼容层自行过滤人框。④ 种子语义迁移：车牌 YOLO0002 `min_long=40`、人脸 YOLO0003
+  `min_long=30`（原目标裁剪 min_short=40/30 的"长边≥N"语义）。
+- 影响面：DB（yolo 参数表加回 min_short/min_long、target_crop 删 min_short）、配置（行为）
+- 部署注意：重启自动补/删列；**已有库**的 YOLO0001/0002/0003 参数值已在本机直接迁移
+  （结构未变的链路不会自动重播种）——换机若已有旧库，需确认 YOLO0002 `min_long=40`、
+  YOLO0003 `min_long=30`、目标裁剪 CROP0002 `out_size=×2`。
+- 验证：`umvp/pipe/test_composer.py`（60，含 infer 输出处过滤）、`tests/test_target_crop.py`
+  （35）、`tests/test_plate_recog_pipeline.py`（28）、`tests/test_face_capture_pipeline.py`（39）、
+  `tests/test_police_uav_pipeline.py`、`tests/test_annotate.py`（16）、`tests/test_cropper.py`（26）、
+  `umvp/resources.py` 全过；装配抽查：infer 过滤小目标生效、CROP0002 `out_size=×2`、
+  YOLO0002 `min_long=40`。
+
+### 2026-09-23(六) · 模块参数优化：清理失效/冗余、背压档位、告警拆字段、目标裁剪合并尺寸
+- 变更内容：① 帧管理 5 个背压细节参数（queue_threshold/backpressure_multiplier/max_frame_skip/
+  adaptive_relax_ratio/adaptive_recover_ratio）收敛为 1 个「背压档位」`backpressure`
+  （off/standard/aggressive），并接上链路装配（此前配了不生效）；composer 新增
+  `BACKPRESSURE_LEVELS`/`backpressure_params`。② 删除 VLM「裁剪外扩比例」crop_padding
+  （roi 移除后已失效；VLMAnalyzer/_vlm_material 同步）。③ 人脸检测 `use_crop` 默认改 false
+  （链路一般不需要对齐裁剪图）。④ 删除 YOLO「过滤链：短边/长边最小像素」min_short/min_long
+  （功能归属后续讨论）。⑤ 目标裁剪：`scale` 合并进 `out_size`（支持 `×2`/`2x` 倍数写法）。
+  ⑥ 输出处理：`smooth_frames`/`min_dwell` 拆为 `window_frames`（window）/`dwell_sec`（dwell），
+  装配按 kind 映射；前端新增 `show_if` 联动显隐。⑦ YOLO 类别筛选统一取消、设备全局默认维持现状。
+- 影响面：DB（多模块参数列增删，init_db 自动收敛）、配置（各模块表单参数变化）
+- 部署注意：重启 web_lab 自动补/删列并重播种；被删参数的历史值丢弃；各链路阶段结构不变。
+- 验证：`tests/test_target_crop.py`（37）、`tests/test_annotate.py`（16）、
+  `tests/test_cropper.py`（26）、`umvp/pipe/test_composer.py`（58）、
+  `tests/test_police_uav_pipeline.py`、`umvp/resources.py`、
+  `tests/test_plate_recog_pipeline.py`（28）、`tests/test_face_capture_pipeline.py`（39）全过。
+
+### 2026-09-23(五) · 条件 DSL 抽公共模块 + 目标裁剪支持框筛选
+- 变更内容：① 条件 DSL 抽到 `umvp/pipe/conditions.py`（`parse_condition`/`match_obj`），
+  供「标注」与「目标裁剪」共用（原标注内联实现迁移）。② `umvp/pipe/target_crop.py` 新增
+  `filter` 参数（条件 DSL，显式字段名），与 `classes` 同时生效（AND）；**默认 `filter=""`
+  = 全裁，行为与原来的简单过滤一致**。web_lab 注册 target_crop.filter 参数。
+- 影响面：结构（新增 conditions.py）、DB（target_crop 参数表新增 filter 列）、配置（目标裁剪可选筛选）
+- 部署注意：重启 web_lab 自动补列；既有目标裁剪 preset 的 filter 为空（=全裁，行为不变）。
+- 验证：`tests/test_target_crop.py`（33，含条件 DSL）、`tests/test_annotate.py`（16）、
+  `umvp/pipe/test_composer.py`（58）全过。
+
+### 2026-09-23(四) · 标注模块加框筛选条件 DSL
+- 变更内容：`umvp/pipe/annotate.py` 新增 `filter` 参数（条件 DSL，只画满足条件的框）——
+  显式字段名（`cls_id`/`track_id`/`score`，含中文别名），组内逗号 AND、组间分号 OR，
+  操作符 `== != > >= < <= in`（`=`≡`==`，`in` 值用 `|`）；`classes` 与 `filter` 同时生效（AND）。
+  条件按对象属性取值，不绑定 YOLO，便于后续接入其它来源。web_lab 注册 annotate.filter 参数。
+- 影响面：DB（annotate 参数表新增 filter 列）、配置（标注模块行为）
+- 部署注意：重启 web_lab 自动补列；既有标注 preset 的 filter 为空（=全画，行为不变）。
+- 验证：`tests/test_annotate.py`（16 断言：画框/classes/条件 DSL 各组/别名/非法报错/Pipeline）。
+
+### 2026-09-23(三) · 目标裁剪加输出分辨率参数 + 新增「标注」模块
+- 变更内容：① `umvp/pipe/target_crop.py`：新增 `out_size`（""=原图 / "640"=长边像素等比 /
+  "640,480"=严格尺寸），在 scale 之后应用；CropResult 增 `scale_x/scale_y`（严格尺寸非等比时
+  坐标还原按 X/Y 各自比例）。② 新增 `umvp/pipe/annotate.py`「标注」模块（`annotate_frame`/
+  `Annotator`）：在帧副本上画检测框（可带类别标签），供 VLM 看"原图+画框"；`Pipeline` 增
+  `annotate` 阶段与 `last_annotated`，web_lab 的 VLM 素材准备优先用标注图。③ 注册模块 annotate
+  （前缀 ANNO）+ 参数；PIPE0001 加「标注」阶段（帧管理→YOLO→标注→VLM→告警）。
+- 影响面：结构（新增 annotate 模块/文件）、DB（新增 annotate 参数表与 ANNO 前缀、target_crop
+  增 out_size 列）、配置（PIPE0001 阶段变化）
+- 部署注意：重启 web_lab 自动重建 PIPE0001（按模块复用旧 preset、新增标注阶段）；
+  target_crop 参数表自动补 out_size 列。
+- 验证：`tests/test_target_crop.py`（28）、`tests/test_annotate.py`（6）、
+  `umvp/pipe/test_composer.py`（58）、`tests/test_plate_recog_pipeline.py`（28）全过；
+  DB 迁移后 PIPE0001=5 步（含 annotate）。
+
+### 2026-09-23(二) · 链路设计器防重复模块阶段 + 播种按模块复用 preset
+- 变更内容：① `web_lab/index.html`：调色板添加已在链路中的模块时不再新增重复阶段（提示
+  "每个模块只能有一个阶段"）；保存链路前按模块去重。② `web_lab/db.py` `save_pipeline`：
+  校验步骤模块不重复（重复即报 ValueError，防脏数据）。③ `web_lab/server.py` `_seed_chain`：
+  结构变化重建时按模块**复用旧 preset**（保留用户参数），补建缺失阶段、丢弃下线阶段——
+  同时自愈历史重复步骤（如 PIPE0001 误加的两条 frame_manager）。
+- 影响面：DB（save_pipeline 收紧：同链路重复模块被拒）、配置（种子链路重建逻辑）
+- 部署注意：重启 web_lab 自动重建 PIPE0002/0003 到新阶段结构并复用其既有 preset；
+  历史 PIPE0001 若因重复添加有冗余步骤，重建时按模块去重自愈。
+- 验证：重复模块保存被拒（ValueError，未写入）；PIPE0001=4 步（冗余已清）；PIPE0002=5 步、
+  PIPE0003=4 步（含 target_crop）；`tests/test_target_crop.py`/`test_cropper.py`/
+  `test_composer.py`/`test_police_uav_pipeline.py` 全过。
+
+### 2026-09-23 · 抽出「目标裁剪」模块：裁剪职责独立，YOLO 去 roi，车牌/人脸链重构
+- 变更内容：① 新增目标裁剪模块 `umvp/pipe/target_crop.py`（`crop_targets`/`CropResult`/`TargetCrop`）：
+  按上游检测框裁子图，输出分辨率可配（scale，默认 1.0=原分辨率）+ margin/min_short/classes；
+  `Cropper.crop` 支持任意缩放（含 <1）。② 车牌链 PIPE0002 改为 帧管理→YOLO识车→目标裁剪(裁车)
+  →车牌识别（`extract_plates` 改吃 crops、`PlateStage.run(frame,crops,ts)`；不再裁车）；车牌模块
+  参数去掉 car_classes/upscale/min_car_short，新增出牌 margin。③ 人脸链 PIPE0003 改为 帧管理→
+  YOLO识人→目标裁剪(裁人)→人脸检测（新增 `face_detect.face_pipeline.FaceStage`：检脸+原图出脸）；
+  `extract_faces` 模块下线（进 `_PRUNED_MODULES`），`crop_restore.extract_faces` 降级为兼容编排。
+  ④ 移除 YOLO 模块 `roi`（crop:cls 裁剪送审）参数与拼接层裁剪逻辑（YOLODetector 只检测）。
+  ⑤ 装配器 `_chain_from_spec` 支持 target_crop 阶段；`_seed_chain` 检测到阶段结构变化时自动重建。
+- 影响面：结构（新增模块/文件）、DB（新增 target_crop 参数表与 CROP 前缀；下线 extract_faces）、
+  配置（链路阶段结构变化，需重建种子链路）
+- 部署注意：重启 web_lab 自动重播种——PIPE0002/PIPE0003 阶段结构变化，`_seed_chain` 检测后
+  重建（删除旧步骤、覆盖阶段 preset）；extract_faces 参数表/preset 由 init_db 幂等清理。
+  若库内 PIPE0002/0003 曾被手工改过，重建会覆盖其阶段 preset。
+- 验证：`tests/test_target_crop.py`（24）、`umvp/pipe/test_composer.py`（58）、
+  `tests/test_cropper.py`（26）、`tests/test_face_capture_pipeline.py`（39）、
+  `tests/test_face_extract_pipeline.py`（28）、`tests/test_plate_recog_pipeline.py`（28）、
+  `tests/test_police_uav_pipeline.py`、`umvp/resources.py` 自检 均通过。
+
+### 2026-09-22 · 视频解码适配：web_lab 按需 H.264 转码（HEVC 素材浏览器可播）
+- 变更内容：① `web_lab/server.py` 新增 `GET /api/video/prepare?name=`（ffprobe 探测编码：
+  H.264/yuv420p + 常见音轨直接回原文件；HEVC 等则后台 ffmpeg 转 H.264/AAC 并回进度）与
+  `GET /media/videos/<name>`（转码缓存文件的 Range 服务）。转码缓存 `out/transcoded/
+  <stem>.<hash>.mp4`（键=源名+大小+mtime+参数版本，已 gitignore，可重建）。
+  ② `test.html` 选视频改走 `prepare` 并轮询转码进度、转完再播；叠加层坐标改按
+  `/api/video/info` 的**原始分辨率**换算（预览可能缩到 1920，故不用 `video.videoWidth`）。
+  ③ 新增 `tests/test_video_transcode.py`（18 断言：判定/缓存键/探测/端到端转码）。
+- 影响面：依赖（新增 ffmpeg/ffprobe 运行时依赖）、入口（新增两个 API）、结构（新增
+  `out/transcoded/` 缓存目录）
+- 部署注意：目标机需装 **ffmpeg（含 libx264）**；缺失时 HEVC 素材回错误提示（H.264 素材
+  不受影响）。`out/transcoded/` 纯缓存，可随时清空重建；源视频变更会自动重转。
+- 验证：`conda run -n ai python tests/test_video_transcode.py` → 18/18 通过；服务重启后
+  `curl '/api/video/prepare?name=violent1.mp4'` → `ready/transcoded:false`；
+  `curl '/api/video/prepare?name=traffic.MP4'` → `transcoding`；小 HEVC 片端到端转码后
+  `/media/videos/_e2e_hevc.mp4` Range 返回 206、输出 ffprobe 为 `h264/yuv420p`；
+  `node --check`（提取 script）通过。
+
+### 2026-09-22 · 实时播放叠加（SSE 流式运行 + 视频叠加框）+ 修复中文名视频 404
+- 变更内容：① 新增 SSE 流式链路运行 `GET /api/test/pipeline_run/stream`（逐分析帧推
+  `{n, ts, dets, plates, alarms}`，事件 `meta/frame/done/error`）与停止接口
+  `POST /api/test/pipeline_run/stop {run_id}`（`_STREAMS` 注册表 + 停止事件；复用
+  `_TEST_LOCK` 非阻塞抢锁，客户端断开即结束；流结束显式 `close_connection`）。
+  ② `test.html` 视频测试台新增「同步播放运行」：canvas 叠加层 + EventSource + 播放节流
+  （播到最新结果时间即暂停等结果），帧号用真实 fps（原硬编码 25 已改）。
+  ③ `_send_file` 支持 HTTP Range（206）——视频可拖进度条。
+  ④ **Bug 修复**：`/files/videos/`、`/files/images/` 路径未 URL 解码，中文名视频/图片
+  一直 404（浏览器对非 ASCII 名会百分号编码）；现 `unquote` 后中英文名均可访问。
+- 影响面：入口（新增两个 API；test.html 新增控件）、结构（新增 `doc/实时播放叠加设计.md`）
+- 部署注意：无依赖/模型/DB 变化；重启 web_lab 生效。流式运行不做真实 VLM 调用
+  （避免逐帧长阻塞），需真实研判仍用批量运行入口。
+- 验证：SSE 冒烟 `meta→frame×N→done`（含检测框/车牌）；停止接口回 `done.stopped=true`；
+  Range 中文/ASCII 名均 206、全量 200；批量入口 PIPE0002 零回归；`test.html` JS
+  `node --check` 通过、页面 200；composer 59 / cropper 26 / plate 28 / police_uav 逻辑全过。
+
+### 2026-09-22 · 重复实现重构：人脸加载逻辑抽出 providers.py + 裁剪 clamp 复用
+- 变更内容：① 新增 `umvp/face_detect/providers.py`（`build_providers` /
+  `load_insightface_model` / `DeviceAware`）——把 `FaceDetector` 与 `FaceEmbedder` 中
+  逐字重复的 InsightFace 加载逻辑（provider 列表构造、ctx_id 推导、CUDA 初始化失败
+  回退 CPU）与 `is_gpu` 属性收敛为单一实现；`face_detector` 用「相对导入 + 脚本目录
+  平级导入兜底」兼容原有 `python umvp/face_detect/test_face_detect.py` 运行方式，
+  `face_embedder` 复用同一模块。② `web_lab/server.py` 的 VLM 素材裁剪与车牌测试页
+  兜底裁剪改用 `pipe.cropper.clamp_bbox`（与通用裁剪模块同一口径）。
+- 影响面：结构（新增 `umvp/face_detect/providers.py`）
+- 部署注意：无依赖/模型/DB 变化；行为等价（device=auto 无 CUDA 时仍为 CPU×2 回退链）；
+  重启 web_lab 生效。
+- 验证：`py_compile` 通过；包导入与脚本目录平级导入两种方式冒烟通过、`is_gpu` 继承自
+  DeviceAware；`face_embed/test_face_embed.py --self-check` 28/28 命中；
+  `test_face_extract_pipeline.py` 28 / `test_face_capture_pipeline.py` 39 /
+  `test_plate_recog_pipeline.py` 28 / `test_composer.py` 59 / `test_cropper.py` 26 全过；
+  web_lab 重启后 `/api/test/face_detect`、`/api/test/face_embed` 均 200（device=CPU）。
+
+### 2026-09-22 · 代码/文档冗余清理（死代码、过时事实、调研归档、模块索引）
+- 变更内容：① **代码清理**——删除零引用死代码：`web_lab/server.py` 的局部
+  `from pipe.composer import Detection`（h_pipeline_run 内未用）、`_file_index` 内死函数
+  `names()`、被 `_parse_vlm_result` 取代的 `_parse_vlm_action()`；
+  `umvp/plate_recog/plate_recognizer.py` 未用的 `import cv2`；
+  `tests/test_police_uav_video.py` 未用 `import numpy`、`tests/test_police_uav_pipeline.py`
+  未用 `import json` 与 `filter_min_size`；`web_lab/calibrate.py` 两个标定函数未使用的
+  `face_models_dir` 形参与 `FACE_MODELS_DIR` 常量（CLI 参数不变）。
+  ② **文档清理**——同步过时事实（断言数、保留链路由一改三、存储设计“删参数不删列”已改自动删列、
+  `pipelines` 表现役非空、P4 已落地、性能基线对齐 `out/fingerprints.json`、旧链路名、
+  模块表头多 preset 归属）；`doc/yolo识别模块.md` 去重（字段表指向模块分册）；
+  `doc/输出处理模块设计.md` 瘦身（闸门/DSL 明细指向 `doc/modules/告警策略.md`）；
+  两份选型调研归档至 `doc/research/`（加“实现现状以模块分册为准”指针）；
+  新增 `doc/modules/INDEX.md` 模块文档入口。
+- 影响面：结构（新增 `doc/research/`、`doc/modules/INDEX.md`；调研文档移动路径）、
+  入口（`calibrate.py` 内部函数签名，CLI 不变）
+- 部署注意：无依赖/模型/DB 变化；重启 web_lab 生效（已重启）。历史记录类文档
+  （DEPLOYMENT.md 历史条目、调研原文、skill L4 先例）按约定只加注不删改。
+- 验证：`py_compile` 全部改动文件通过；回归 `test_composer.py` 59 / `test_cropper.py` 26 /
+  `test_plate_recog_pipeline.py` 28 / `test_police_uav_pipeline.py` / `test_police_uav_video.py`
+  全过；`calibrate.py --help` 正常；web_lab 重启后 `/api/schema` 200。
+
+### 2026-09-22 · 启停脚本修复：web_lab 后台服务改用 setsid 独立会话
+- 变更内容：`web_lab/restart.sh` 第 3 步由 `nohup ... &` 改为
+  `setsid "$PY" server.py ... < /dev/null >> out/web_lab.log 2>&1 &`——后台服务独立会话/
+  进程组，不随调用方（终端/CI/工具）退出被连带杀掉；stdin 接 /dev/null，避免继承调用方
+  管道导致调用方等待不返回。
+- 影响面：入口（restart.sh 启动机制）
+- 部署注意：无依赖/参数变化；重启后服务更稳（此前在非交互调用下可能被连带杀掉）。
+- 验证：`timeout 60 setsid ./web_lab/restart.sh < /dev/null` 返回 rc=0 且立即返回；
+  `GET /api/schema` 200；随后多次独立请求（/api/db/tables、/api/test/alarm、
+  /api/test/pipeline_run）均正常，服务在命令结束后持续存活。
+
+### 2026-09-22 · 告警模块通用化为「输出处理」OutputPolicy（七道闸漏斗 + 规则 DSL）
+- 变更内容：`pipe/composer.py` 的 `AlarmPolicy` 升级为 `OutputPolicy`（`AlarmPolicy` 保留为
+  兼容别名）——统一入口 `Finding`（key/label/conf/features/gran）→ 七道闸（登记/驻留
+  min_dwell/词表/置信度 min_conf/规则 rules/滑窗/去重冷却）→ `AlarmEvent`（新增 conf、
+  features 字段）。新增规则 DSL（字段 操作符 值；组内逗号 AND、组间分号 OR；自研解析器
+  无 eval，非法表达式快速失败）；`key_cooldown` 支持巡检/车牌「同对象只一次(-1，默认)/
+  不去重(0)/冷却间隔(>0)」；车牌 `Pipeline._plate_gate` 退役，改走漏斗按车牌号去重
+  （AL0002 行为不变）；`on_vlm_result`/`on_dwell` 保留为薄包装。模块展示名改
+  「输出处理（告警）」（module_id 仍为 `alarm`，表名/接口不变）。
+- 影响面：DB（preset_params_alarm 自动补 4 列：min_conf/min_dwell DOUBLE、rules TEXT、
+  key_cooldown DOUBLE）/ 入口（模块测试页展示）
+- 部署注意：重启 web_lab 自动补列；旧 preset 缺值走默认（=旧行为），三条链路零参数改动；
+  规则表达式操作符两侧需留空格。
+- 验证：`umvp/pipe/test_composer.py` 59 断言（38 旧全过 + 21 新：DSL 解析/求值、七闸、
+  巡检去重语义）；`tests/test_plate_recog_pipeline.py` 28 断言；`tests/test_police_uav_pipeline.py`
+  通过；web_lab 重启后 alarm 参数表出现 4 新列；PIPE0002 真视频（车牌识别.MP4 20–25s）
+  端到端告警 1 条，时间线 `触发 inspection（conf 0.83） — 京ACJ0710 绿牌新能源 0.83`。
+
+### 2026-09-22 · 车牌链路补原分辨率提取 + 新增 PIPE0003「人脸截取链路」
+- 变更内容：① `extract_plates` 在坐标还原后新增第三步原分辨率提取——`Cropper.extract`
+  按还原车牌框从原图直接裁出车牌小图（margin 外扩不缩放），`PlateResult` 新增
+  `plate_img`/`plate_crop_bbox`（整帧直读不带）；链路运行器同步落盘车牌小图
+  （`plate_NNN_车牌号_ts.jpg`，受 max_saved_images 上限约束），测试页优先展示 plate_img。
+  ② 新链路 PIPE0003「人脸截取链路」：帧管理→YOLO识人→原分辨率提取（FM0003→YOLO0003→
+  复用 EXTF0001），无嵌入/检索/告警；运行器 `_face_step` 通用化——仅含 extract_faces
+  阶段即逐帧截取落盘，含 face_embed 阶段仍走身份去重提取；`_chain_from_spec` 终段校验
+  放行 extract_faces；链路缺 yolo 阶段时按 extract_faces 阶段 yolo_* 参数自建识人检测器。
+- 影响面：DB（播种新增 FM0003/YOLO0003 两条 preset + PIPE0003 链路及 3 步引用，
+  重启自动播种）/ 入口（链路运行器行为）
+- 部署注意：无新增依赖；重启 web_lab 自动播种 PIPE0003；不重播种已存在的同名配置。
+- 验证：`tests/test_plate_recog_pipeline.py` 28 断言（含 plate_img=原图切片逐像素断言）；
+  新增 `tests/test_face_capture_pipeline.py` 39 断言；cropper 26 / composer 38 /
+  face_extract 28 全通过；`_chain_from_spec` 三形态装配冒烟通过（PIPE0003 形态 /
+  face_embed 旧形态 / 无终段仍拒绝）。
+
+### 2026-09-22 · 通用裁剪模块 cropper.py 独立（人脸/车牌链共用，车牌链不再引入人脸依赖）
+- 变更内容：crop_restore.py 中的通用裁剪能力（按框裁图可放大 / 坐标还原 / 关键点还原 /
+  原分辨率提取 / IoU 去重）提炼为新文件 `umvp/pipe/cropper.py`（`Cropper`/`CropPatch`/`iou`，
+  纯 cv2+numpy 零检测器依赖）；crop_restore.py 只留 `extract_faces` 人脸编排；
+  `plate_recog`（extract_plates/PlateStage，改顶层 import pipe.cropper，并删本地重复 `_iou`）
+  与 web_lab/server.py 四处改为直接用 `Cropper`；旧名 `CropRestore`/`PersonCrop`/`_iou`
+  保留为兼容别名（同源同实现）。
+- 影响面：结构（新增 pipe/cropper.py；车牌链不再经 crop_restore 传递引入
+  face_detect/onnxruntime）
+- 部署注意：无新增第三方依赖；换机 git pull 即可，无需重跑标定/播种/重启脚本之外的操作
+  （web_lab 需重启生效）。
+- 验证：`tests/test_cropper.py` 26 断言通过（含子进程轻量性检查：import pipe.cropper
+  不拉起 face/onnxruntime/ultralytics/hyperlpr3）；`umvp/pipe/test_composer.py` 38、
+  `tests/test_face_extract_pipeline.py` 28、`tests/test_plate_recog_pipeline.py` 21
+  断言全部通过；server.py 与改动模块 py_compile 通过。
+
+### 2026-09-21 · 测试台修复真实 VLM 端点不可达导致整轮测试“卡死”
+- 变更内容：① `_vlm_real` 超时由单一 120s 改为 `timeout=(连接5s, 读取 vlm_timeout 默认20s)`
+  ——端点不可达时快速失败；② `h_pipeline_run` 运行前对 VLM 端点做 TCP 预探测
+  （`_endpoint_reachable`，2s），不可达则本轮跳过真实调用、按“素材包”记日志并继续；
+  ③ 运行中连续失败 ≥3 次熔断（`vlm_unreachable`），后续不再尝试；④ 结果头 VLM 状态
+  显示“端点不可达，已跳过”。
+- 影响面：入口（测试台行为）
+- 部署注意：无新增依赖；重启 web_lab 生效。VLM 端点仍由链路 vlm 阶段参数配置。
+- 验证：警用链路（`use_real_vlm=true`、`vlm_feedback` 开）在端点不可达时 8 帧 15s 完成
+  （此前每报送最长等 120s 而近乎卡死），日志逐帧显示“素材包 …（端点不可达，跳过真实调用）”。
+
+### 2026-09-21 · 车牌识别视频去重：按 track_id 只识别一次 + 修复 YOLO 跟踪未生效
+- 变更内容：① `YOLODetector.infer` 在 track=True 时**显式传 `tracker="bytetrack.yaml"`**
+  ——本机 ultralytics 不显式传 tracker 时不分配 `boxes.id`（静默失效），导致跟踪
+  track_id 恒为 0（同时影响 dwell / 帧管理-YOLO 的跟踪）；② `PlateStage` 新增
+  `track_dedup`（默认 true）/ `track_cooldown`（默认 5s，落库参数），按上游 YOLO 的
+  track_id 去重：同一辆车只识别一次，冷却秒数后才允许重试；③ `Pipeline.track_needed()`
+  在链路含车牌阶段时让 yolo 自动开启跟踪。
+- 影响面：配置 / DB（plate_recog 新增 track_dedup、track_cooldown 两列）
+- 部署注意：重启 web_lab 自动补列；无需重播种（旧 preset 缺值走默认 true / 5.0）。
+- 验证：车牌识别.MP4 20–23s 识别 19→**1** 次；20–35s（90 分析帧 / 332 车辆框）
+  仅 **3** 次（每车一次，5s 冷却刷新）；`tests/test_plate_recog_pipeline.py` 20 断言通过；
+  警用链路与装配器回归通过。
+
+### 2026-09-21 · 车牌识别链路重构：模块只做裁车牌+识别，识车回归 yolo 模块
+- 变更内容：原 plate_recog 模块内含 YOLO 识车+裁车；改为职责分离——
+  `PlateRecognizer` 只做「从车图裁车牌 + 识别」，`extract_plates()` 改为消费**上游 yolo
+  模块的车辆框**（不再自跑 YOLO），`PlateStage` 去掉 yolo 参数。链路 PIPE0002 由
+  3 阶段改为 **4 阶段**：帧管理→**YOLO识车**→车牌识别→告警（新增 YOLO0002 preset）。
+  plate_recog 参数调整：新增 `car_classes`（落库），`yolo_*` 降为 test_only（仅模块
+  测试页脚手架用）。
+- 影响面：结构 / DB / 配置
+- 部署注意：重启 web_lab 自动建列（plate_recog 新增 car_classes、删除 yolo_* 列）
+  并播种 4 阶段 PIPE0002。旧 3 阶段 PIPE0002 与 FM0002/PLATE0002/AL0002 已删除后重建。
+- 验证：`tests/test_plate_recog_pipeline.py` 19 断言通过（改用 yolo.infer→dets→extract_plates）；
+  `/api/pipelines/load PIPE0002` 返回 4 阶段；`pipeline_run` 跑 车牌识别.MP4（20–23s）→
+  检出车辆框 46 个、车牌 19 次、告警 5 条（同车牌去重）。
+
+### 2026-09-21 · 新增车牌识别链路 PIPE0002（链路运行器支持 plate_recog 阶段）
+- 变更内容：① `pipe/composer.Pipeline` 新增可选 `plate` 阶段（鸭子类型，不引入
+  cv2/onnx 依赖）+ `last_plates`，`step()` 每帧调用并把新出现的车牌去重后触发告警；
+  ② 新增 `plate_recog/plate_pipeline.py` 的 `PlateStage`（YOLO 识车→裁车放大→识别）；
+  ③ `_chain_from_spec` 支持 `plate_recog` 阶段并放宽校验（终段可为 alarm/face_embed/
+  plate_recog）；h_chain / h_pipeline_run 增加车牌日志、标注框与计数；
+  ④ plate_recog 的 yolo_*/upscale/margin/min_car_short/dedup_iou 由 test_only 提升为
+  落库参数（新增 `yolo_max_det` 列）；⑤ 播种第二条链路 PIPE0002（FM0002/PLATE0002/AL0002）。
+- 影响面：结构 / DB / 配置
+- 部署注意：重启 web_lab 自动建列（plate_recog 新增 yolo_max_det 等列）并播种 PIPE0002；
+  无新增依赖（hyperlpr3 已在前一条记录）。
+- 验证：`/api/pipelines` 返回 PIPE0001+PIPE0002；load PIPE0002 得 3 阶段；
+  `pipeline_run` 跑 车牌识别.MP4（20–24s）→ 识别 沪/粤ACJ0710、京F07277、川G09U262 等，
+  告警 8 条（同车牌跨帧去重）；`tests/test_plate_recog_pipeline.py` 19 断言通过。
+
+### 2026-09-21 · 新增车牌识别模块（HyperLPR3）+ 模型自包含
+- 变更内容：新增 `umvp/plate_recog/`（`PlateRecognizer`/`PlateResult`/`extract_plates`
+  封装 HyperLPR3 检测+四点矫正+CRNN 识别+颜色分类；`extract_plates` 复用 CropRestore
+  做 YOLO 识车→裁车放大→坐标还原；`fetch_models.py` 拉取模型）。web_lab 注册
+  `plate_recog` 模块（PARAMS + `h_plate_recog` + MODULES，组「车牌识别链路」）；
+  db.py `_ID_PREFIXES` 登记 `PLATE`，播种 `PLATE0001`。requirements.txt 加
+  `hyperlpr3==0.1.3`；.gitignore 加 `plate_models/`；新增测试与 `doc/modules/车牌识别.md`。
+- 影响面：依赖 / 模型 / 结构 / DB / 入口
+- 部署注意：`pip install -r requirements.txt`（新增 hyperlpr3）；新克隆/换机需跑
+  `conda run -n ai python umvp/plate_recog/fetch_models.py` 拉模型到
+  `plate_models/hyperlpr3/20230229/onnx/`（约 12MB，官方源 `hyperlpr.tunm.top`）。
+  模型在项目内即可离线：模块加载前自动同步到 `~/.hyperlpr3/<版本>/` 以跳过
+  hyperlpr3 import 时的联网下载。重启 web_lab 后新模块出现在侧栏「车牌识别链路」，
+  参数表 `preset_params_plate_recog` 自动建（仅 `detect_level` 落库）。
+- 验证：`tests/test_plate_recog_pipeline.py` 16 断言通过（整帧识别 沪/粤ACJ0710 绿牌，
+  YOLO 识车→裁车放大→坐标还原框与原图一致）；`/api/test/plate_recog` 的 direct 与 crop
+  两种模式均返回车牌；移走 `~/.hyperlpr3` 后仅靠项目模型仍离线识别成功（无下载）；
+  项目模型与默认目录均缺失时给出 `fetch_models.py` 提示并报错。
+
 ### 2026-09-20 · 测试台新增视频信息预估 + 落盘上限 200 张
 - 变更内容：① 新增 GET `/api/video/info?name=` 接口（cv2 读分辨率/帧率/总帧数/时长）；
   test.html 选视频/换链路/改时间段/限帧后，信息条实时显示分辨率与"按链路帧管理

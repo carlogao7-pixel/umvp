@@ -31,7 +31,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent          # 项目根
 OUT_DEFAULT = ROOT / "out" / "fingerprints.json"
 MODELS_DIR = ROOT / "models"
-FACE_MODELS_DIR = ROOT / "face_models" / "buffalo_l"
 
 # 推理参数（标定固定档位，避免与用户参数纠缠）
 IMGSZ = 640
@@ -135,7 +134,7 @@ def calibrate_yolo(models_dir: Path, gpu: bool) -> dict:
     return out
 
 
-def calibrate_scrfd(face_models_dir: Path, gpu: bool) -> dict:
+def calibrate_scrfd(gpu: bool) -> dict:
     """标定 SCRFD 人脸检测（det_10g.onnx）在 640x640 的延迟。
 
     直接复用项目 FaceDetector 类（insightface 内部负责预处理/对齐），
@@ -172,7 +171,7 @@ def calibrate_scrfd(face_models_dir: Path, gpu: bool) -> dict:
     return out
 
 
-def calibrate_arcface(face_models_dir: Path, gpu: bool) -> dict:
+def calibrate_arcface(gpu: bool) -> dict:
     """标定 ArcFace 512d 嵌入（w600k_r50.onnx）单张延迟。
 
     直接复用项目 FaceEmbedder 类，与真实链路一致。
@@ -268,10 +267,10 @@ def main() -> None:
     result.update(calibrate_yolo(MODELS_DIR, gpu=gpu))
 
     print("\n===== SCRFD 标定 =====")
-    result.update(calibrate_scrfd(FACE_MODELS_DIR, gpu=gpu))
+    result.update(calibrate_scrfd(gpu=gpu))
 
     print("\n===== ArcFace 标定 =====")
-    result.update(calibrate_arcface(FACE_MODELS_DIR, gpu=gpu))
+    result.update(calibrate_arcface(gpu=gpu))
 
     import platform
     result["_meta"] = {

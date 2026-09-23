@@ -13,7 +13,7 @@
 | YOLO 参数对比·远角车+人（v2 人+车） | G4@1280 检出 52→230、track 1→7；G2@conf0.15 找回 1 人；G3@0.50 丢目标 | 车撑 track 骨架、人极难过检；数据 `out/yolo_bench4/` |
 | YOLO 参数对比·人群1（v2 仅人） | 640 全组 0 track；G4@1280 4 条稳定 track（与依次入画对应）；G5@iou0.9 首次 ≠ 基线（+70 重复框、仍 0 track） | 小目标 imgsz 1280 必开；数据 `out/yolo_bench5/` |
 | YOLO 模型档位（横幅1 实测） | yolov8n vs yolov8s 检出 386 vs 391，几乎无差 | 选择清晰无需区分，固定 `yolov8n.pt` |
-| 警用无人机链路端到端（traffic.MP4，2026-09-20） | 150 帧 → 10 帧分析（frame_skip=15）→ 报送 → 真实 qwen3-vl 研判"交警类"→ 告警命中；逻辑断言 test_police_uav_pipeline.py 全过 | 唯一保留链路 PIPE0001；真实 VLM 端点可达 |
+| 警用无人机链路端到端（traffic.MP4，2026-09-20） | 150 帧 → 10 帧分析（frame_skip=15）→ 报送 → 真实 qwen3-vl 研判"交警类"→ 告警命中；逻辑断言 test_police_uav_pipeline.py 全过 | 保留链路之一（PIPE0001，另有车牌 PIPE0002、人脸截取 PIPE0003）；真实 VLM 端点可达 |
 | 工作区整理简化后库表（2026-09-20） | presets 恰 8 行（每模块一份）、pipelines 恰 1 行 PIPE0001（4 步）、参数表 8 张；旧整数 schema 自动 DROP 重建 | 旧链路/播种/测试参数均已清理 |
 
 ### 未验证

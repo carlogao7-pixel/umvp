@@ -23,6 +23,9 @@ from typing import List
 
 import numpy as np
 
+# 公共加载逻辑（provider 选择 / CUDA 回退 / is_gpu），与 FaceDetector 共用
+from face_detect.providers import DeviceAware, build_providers, load_insightface_model
+
 # 独立项目自包含：默认加载项目内 face_models/（本文件位于 umvp/face_embed/，向上两级是项目根）。
 # 传 model_root 参数仍可覆盖（如 ~/.insightface/models）。
 DEFAULT_MODEL_ROOT = os.path.join(
@@ -33,7 +36,7 @@ EMBED_DIM = 512
 EMBED_INPUT_SIZE = (112, 112)  # ArcFace 标准输入尺寸
 
 
-class FaceEmbedder:
+class FaceEmbedder(DeviceAware):
     """InsightFace ArcFace 特征提取器封装。"""
 
     def __init__(
@@ -42,9 +45,6 @@ class FaceEmbedder:
         model_name: str = DEFAULT_EMBED_NAME,
         device: str = "auto",  # auto / cuda / cpu
     ) -> None:
-        import onnxruntime as ort
-        from insightface.model_zoo import get_model
-
         model_path = os.path.join(model_root, "buffalo_l", model_name)
         if not os.path.isfile(model_path):
             raise FileNotFoundError(
@@ -53,29 +53,9 @@ class FaceEmbedder:
             )
 
         self._device_name = device
-        available = set(ort.get_available_providers())
-        if device == "auto":
-            self._providers = [
-                "CUDAExecutionProvider" if "CUDAExecutionProvider" in available else "CPUExecutionProvider",
-                "CPUExecutionProvider",
-            ]
-        elif device == "cuda":
-            self._providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            self._providers = ["CPUExecutionProvider"]
-
-        self._ctx_id = 0 if self._providers[0] == "CUDAExecutionProvider" else -1
-
-        try:
-            self.model = get_model(model_path, download=False, providers=self._providers)
-        except Exception as e:
-            if "CPUExecutionProvider" not in self._providers:
-                print(f"[FaceEmbedder] CUDA 初始化失败({e})，回退 CPU")
-                self._providers = ["CPUExecutionProvider"]
-                self._ctx_id = -1
-                self.model = get_model(model_path, download=False, providers=self._providers)
-            else:
-                raise
+        self._providers, self._ctx_id = build_providers(device)
+        self.model, self._providers, self._ctx_id = load_insightface_model(
+            model_path, self._providers, self._ctx_id, tag="FaceEmbedder")
 
         self.model.prepare(ctx_id=self._ctx_id)
         print(
@@ -83,10 +63,6 @@ class FaceEmbedder:
             f"device={'GPU(cuda)' if self._ctx_id >= 0 else 'CPU'} | "
             f"dim={EMBED_DIM}"
         )
-
-    @property
-    def is_gpu(self) -> bool:
-        return self._ctx_id >= 0
 
     # ---------------- 特征提取 ----------------
     def embed_face(self, face_crop: np.ndarray) -> np.ndarray:

@@ -78,12 +78,15 @@ _MODULE_ID_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 _ID_PREFIXES = {
     "frame_manager": "FM",
     "yolo": "YOLO",
+    "target_crop": "CROP",
+    "annotate": "ANNO",
     "vlm": "VLM",
     "alarm": "AL",
     "face_detect": "FDET",
     "face_embed": "FEMB",
     "face_store": "FSTO",
     "extract_faces": "EXTF",
+    "plate_recog": "PLATE",
 }
 _PIPELINE_PREFIX = "PIPE"  # 链路（pipelines 表 / kind='pipeline' 的 preset）
 _PRESET_ID_RE = re.compile(r"^[A-Z]{2,4}\d{4}$")  # 合法业务 ID 形如 YOLO0001
@@ -94,8 +97,10 @@ _PRESET_ID_RE = re.compile(r"^[A-Z]{2,4}\d{4}$")  # 合法业务 ID 形如 YOLO0
 # 2026-09-20: compose/utest 为历史遗留空表，一并清理。
 # 2026-09-20(二): chain/face_monitor/frame_yolo 为 web 端隐藏运行器（运行入口，
 # 非产品模块），参数 preset 统一不落库，空参数表清理。
+# 2026-09-23: extract_faces（原分辨率提取）拆分为「目标裁剪 target_crop + 人脸检测
+# face_detect」，模块下线，参数表/preset 清理。
 _PRUNED_MODULES = {"frame_scheduler", "compose", "utest",
-                   "chain", "face_monitor", "frame_yolo"}
+                   "chain", "face_monitor", "frame_yolo", "extract_faces"}
 
 
 def _preset_prefix(module_id: str) -> str:
@@ -621,16 +626,24 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
         cur = conn.cursor()
         try:
             conn.ping(reconnect=True)
-            # 校验步骤引用的 preset 存在且为 module 类型（放事务外，避免无用锁占位）
+            # 校验步骤引用的 preset 存在、为 module 类型、且模块不重复（一条链路每个模块最多一个阶段）
             placeholders = ",".join(["%s"] * len(preset_ids))
-            cur.execute(f"SELECT id, kind FROM presets WHERE id IN ({placeholders})",
+            cur.execute(f"SELECT id, kind, module_id FROM presets WHERE id IN ({placeholders})",
                         tuple(preset_ids))
-            found = {rid: kind for rid, kind in cur.fetchall()}
+            found = {rid: (kind, mid) for rid, kind, mid in cur.fetchall()}
             for rid in preset_ids:
                 if rid not in found:
                     raise ValueError(f"步骤引用的配置不存在: id={rid}")
-                if found[rid] != "module":
-                    raise ValueError(f"步骤只能引用模块配置（kind='module'），id={rid} 是 {found[rid]}")
+                if found[rid][0] != "module":
+                    raise ValueError(f"步骤只能引用模块配置（kind='module'），id={rid} 是 {found[rid][0]}")
+            seen: dict = {}
+            for rid in preset_ids:
+                mid = found[rid][1]
+                if mid in seen:
+                    raise ValueError(
+                        f"链路包含重复模块阶段: {mid}（{seen[mid]} 与 {rid}）；"
+                        f"每个模块在一条链路中最多出现一次")
+                seen[mid] = rid
             conn.begin()
             cur.execute("SELECT id FROM pipelines WHERE name=%s", (name,))
             row = cur.fetchone()
@@ -731,8 +744,10 @@ def table_snapshots() -> dict:
                     " created_at, updated_at FROM pipelines"
                     " ORDER BY updated_at DESC, id DESC")
         pipelines_rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
-        cur.execute("SELECT id, pipeline_id, position, preset_id"
-                    " FROM pipeline_steps ORDER BY pipeline_id, position")
+        cur.execute("SELECT s.id, s.pipeline_id, s.position, s.preset_id,"
+                    " p.module_id, p.name"
+                    " FROM pipeline_steps s LEFT JOIN presets p ON p.id = s.preset_id"
+                    " ORDER BY s.pipeline_id, s.position")
         steps_rows = [[_jsonable(v) for v in r] for r in cur.fetchall()]
         modules = []
         for mid, schema in _SCHEMAS.items():
@@ -746,10 +761,10 @@ def table_snapshots() -> dict:
             for r in cur.fetchall():
                 preset_id, pname, updated_at = r[0], r[1], r[2]
                 values = _restore_params(dict(zip(cols, r[3:])), schema)
-                rows.append([pname, _jsonable(updated_at)]
+                rows.append([preset_id, pname, _jsonable(updated_at)]
                             + [values.get(k) for k in cols])
             modules.append({"module_id": mid,
-                            "columns": ["配置名", "更新时间"] + cols,
+                            "columns": ["id", "配置名", "更新时间"] + cols,
                             "rows": rows, "count": len(rows)})
     return {
         "presets": {"columns": ["id", "kind", "name", "module_id",
@@ -759,6 +774,7 @@ def table_snapshots() -> dict:
         "pipelines": {"columns": ["id", "name", "streams", "budget", "meta",
                                   "created_at", "updated_at"],
                       "rows": pipelines_rows},
-        "steps": {"columns": ["id", "pipeline_id", "position", "preset_id"],
+        "steps": {"columns": ["id", "pipeline_id", "position", "preset_id",
+                              "module_id", "配置名"],
                   "rows": steps_rows},
     }

@@ -63,9 +63,11 @@ if [ "$NO_DB" -eq 0 ]; then
 fi
 
 # ---- 3) 后台拉起 web server，日志落 out/web_lab.log ----
+# setsid：让 server 独立会话/进程组，不随调用方（终端/CI/工具）退出被连带杀掉；
+# stdin 接 /dev/null，避免继承调用方管道导致调用方等待。
 LOG="$ROOT/out/web_lab.log"
 mkdir -p "$ROOT/out"
-nohup "$PY" server.py "${SERVER_ARGS[@]}" >> "$LOG" 2>&1 &
+setsid "$PY" server.py "${SERVER_ARGS[@]}" < /dev/null >> "$LOG" 2>&1 &
 NEW_PID=$!
 echo "[restart] web_lab 已后台启动（pid=$NEW_PID，日志: out/web_lab.log）"
 

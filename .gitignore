@@ -8,6 +8,8 @@ __pycache__/
 models/*.pt
 # InsightFace 模型包（face_models/buffalo_l.zip 可解压重建）
 face_models/
+# HyperLPR3 车牌模型（plate_models/hyperlpr3/，用 umvp/plate_recog/fetch_models.py 重建）
+plate_models/
 # 测试视频（tests/data/vid/*.MP4，从原仓库获取）
 tests/data/vid/
 
@@ -18,6 +20,8 @@ tests/data/vid/
 # 人脸底库 / 视频索引（由注册/扫描生成）
 out/face_db.*
 out/video_db.*
+# 视频转码缓存（浏览器预览用，按需重建）
+out/transcoded/
 # 保留 out/fingerprints.json（标定基线，入库）
 # web_lab 后台运行日志（restart.sh 生成）
 out/web_lab.log

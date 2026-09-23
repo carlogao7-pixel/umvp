@@ -29,9 +29,9 @@
 
 | 文件 | 内容 |
 |---|---|
-| 01-umvp-intro.md | UMVP 通俗介绍（四模块 / 自定义链路拼接 / 人脸链路 / 配套工具） |
+| 01-umvp-intro.md | UMVP 通俗介绍（管道模块 / 自定义链路拼接 / 人脸链路 / 配套工具） |
 | 02-environment.md | 环境与验证命令（conda ai / 回归集 / 标定 / 警告过滤） |
-| 03-module-reference.md | 管道四模块 + 人脸链路 + 资源估算接口速查（参数表） |
+| 03-module-reference.md | 管道模块 + 人脸链路 + 资源估算接口速查（参数表） |
 
 ### L2-architect/（总装专属）
 

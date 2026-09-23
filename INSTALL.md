@@ -5,7 +5,8 @@
 > 直接继承现有 conda 环境 `ai` 运行，无需任何安装。
 > **场景 B（移植新机器）**——整目录拷贝后从零装依赖，走通验证测试。
 >
-> 代码本身无需编译（纯 Python）；模型权重已随包携带（`models/` + `face_models/buffalo_l/`）。
+> 代码本身无需编译（纯 Python）；YOLO/人脸权重已随包携带（`models/` + `face_models/buffalo_l/`），
+> 车牌权重需联网拉取一次（`umvp/plate_recog/fetch_models.py`，见 §3.5）。
 
 ---
 
@@ -13,10 +14,15 @@
 
 ```
 umvp/                                ← 项目根（独立部署包）
-├── umvp/                            ← 模块根（四模块 + 人脸管道，纯 Python + 推理封装）
+├── umvp/                            ← 模块根（管道模块 + 人脸管道，纯 Python + 推理封装）
 │   ├── pipe/
-│   │   ├── composer.py              ← 核心：四模块 + compose() 装配器（Frame/YOLO/VLM/Alarm）
-│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），27 项断言
+│   │   ├── composer.py              ← 核心：模块 + 装配器（Frame/YOLO/TargetCrop/Annotate/VLM/Alarm）
+│   │   ├── cropper.py               ← 通用裁剪 Cropper（按框裁图可缩放/坐标还原/原分辨率提取，纯 cv2+numpy）
+│   │   ├── target_crop.py           ← 目标裁剪 TargetCrop（按上游检测框裁子图，输出分辨率可配）
+│   │   ├── annotate.py              ← 标注 Annotator（在帧上画检测框，供 VLM 看"原图+画框"）
+│   │   ├── conditions.py            ← 条件 DSL（框筛选：cls_id/track_id/score）
+│   │   ├── crop_restore.py          ← extract_faces 兼容编排（已拆为「目标裁剪+人脸检测」两模块）
+│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），60 项断言
 │   ├── face_detect/
 │   │   ├── face_detector.py         ← SCRFD 人脸检测 + 5点对齐裁剪（默认读项目内 face_models/）
 │   │   ├── test_face_detect.py      ← 人脸检测验证（--image/--video/--camera）
@@ -25,9 +31,13 @@ umvp/                                ← 项目根（独立部署包）
 │   │   ├── face_embedder.py         ← ArcFace 512d 特征提取（L2 归一化，同项目内模型路径）
 │   │   ├── face_store.py            ← 向量底库：注册/检索/持久化（numpy 线性检索）
 │   │   └── test_face_embed.py       ← 底库注册/查询/自检（--register-dir/--query/--self-check）
-│   └── face_scan/
-│       ├── face_monitor.py          ← 人脸管道编排（流/视频/摄像头；取帧+背压复用 pipe.composer.FrameManager）
-│       └── test_face_scan.py        ← 视频人脸扫描验证
+│   ├── face_scan/
+│   │   ├── face_monitor.py          ← 人脸管道编排（流/视频/摄像头；取帧+背压复用 pipe.composer.FrameManager）
+│   │   └── test_face_scan.py        ← 视频人脸扫描验证
+│   └── plate_recog/
+│       ├── plate_recognizer.py      ← HyperLPR3 车牌检测+矫正+识别（默认读项目内 plate_models/）
+│       ├── plate_pipeline.py        ← 车牌链路阶段 PlateStage（消费上游车框：裁车→识别→坐标还原）
+│       └── fetch_models.py          ← 拉取车牌模型到 plate_models/（新克隆/换机）
 ├── models/                        ← YOLO 模型选择池（web_lab 前端自动列出，COCO person=0/car=2）
 │   ├── yolov8n.pt                 ← v8 轻量档（默认，CPU 单帧 ~0.2s）
 │   ├── yolov8s.pt                 ← v8 均衡档（精度优先）
@@ -39,11 +49,18 @@ umvp/                                ← 项目根（独立部署包）
 ├── face_models/
 │   ├── buffalo_l.zip                ← InsightFace 模型包（原始压缩包，存档）
 │   └── buffalo_l/                   ← 已解压（det_10g.onnx / w600k_r50.onnx 等，默认加载路径）
+├── plate_models/                    ← 车牌模型（不入库；fetch_models.py 拉取重建）
+│   └── hyperlpr3/20230229/onnx/     ← 检测 320/640 + 识别 + 颜色分类
 ├── tests/
-│   ├── test_3modes.py               ← 主实机测试：三模式真实视频 + YOLO + 大模型
+│   ├── test_police_uav_pipeline.py  ← 警用链路（警用无人机）逻辑断言
+│   ├── test_police_uav_video.py     ← 警用链路端到端（真实 YOLO + mock VLM）
 │   ├── test_yolo_params.py          ← YOLO 推理参数对比（重叠场景截图）
-│   ├── 分析模式测试.md              ← 测试配置说明
-│   └── data/                        ← 测试视频（face1 / rescue1 / traffic）+ 重叠截图
+│   ├── test_cropper.py              ← 通用裁剪模块纯逻辑断言（含轻量性检查，秒级）
+│   ├── test_target_crop.py          ← 目标裁剪模块纯逻辑断言（裁剪/分辨率/条件 DSL）
+│   ├── test_annotate.py             ← 标注模块纯逻辑断言（画框/条件 DSL）
+│   ├── test_face_extract_pipeline.py← 人脸提取链路（YOLO 识人→目标裁剪裁人→SCRFD）
+│   ├── test_plate_recog_pipeline.py ← 车牌识别链路（整帧 + 目标裁剪裁车→识别→坐标还原）
+│   └── data/                        ← 测试视频（face1 / rescue1 / traffic / 车牌识别）+ 截图
 ├── requirements.txt                 ← Python 依赖清单
 ├── README.md                        ← 包说明
 └── INSTALL.md                       ← 本指南
@@ -51,10 +68,13 @@ umvp/                                ← 项目根（独立部署包）
 
 依赖关系（模块 → 第三方库）：
 - `pipe/composer.py` → 纯 Python（抽帧+背压已内置于 FrameManager，无第三方依赖）
+- `pipe/cropper.py` → 仅 numpy + cv2（零检测器依赖，人脸/车牌链共用）
+- `pipe/crop_restore.py` → face_detect.face_detector（裁剪复用 cropper，人脸编排专属）
 - `face_detect/face_detector.py` → insightface + onnxruntime + numpy + cv2
 - `face_embed/face_embedder.py` → insightface + onnxruntime + numpy
 - `face_embed/face_store.py` → 仅 numpy
 - `face_scan/face_monitor.py` → cv2 + numpy
+- `plate_recog/plate_recognizer.py` → hyperlpr3 + onnxruntime + numpy + cv2
 - `tests/*.py` → ultralytics(YOLO) + cv2 + requests(VLM)
 
 ---
@@ -71,7 +91,7 @@ conda run -n ai python -c "import cv2, ultralytics, insightface"
 ls face_models/buffalo_l/
 #    应看到 det_10g.onnx w600k_r50.onnx 等 5 个文件
 
-# 3) 纯逻辑测试冒烟（27 项断言，不加载模型，秒级完成）
+# 3) 纯逻辑测试冒烟（59 项断言，不加载模型，秒级完成）
 cd <项目根>
 conda run -n ai python umvp/pipe/test_composer.py
 ```
@@ -151,6 +171,10 @@ ls face_models/buffalo_l/
 #    unzip face_models/buffalo_l.zip -d face_models/
 
 # YOLO 模型已在 models/，无需移动
+
+# 车牌模型（约 12MB）不在包内，联网拉取一次到项目内：
+$PY umvp/plate_recog/fetch_models.py
+#   产物: plate_models/hyperlpr3/20230229/onnx/（拉取后即可离线运行）
 ```
 
 ---
@@ -163,8 +187,11 @@ PY="conda run -n ai python"   # 便携：ai conda 环境解释器（或先 conda
 ```
 
 ```bash
-# 1) 纯逻辑测试（不加载任何模型，最快）→ 应输出「全部通过: 27 项断言」
+# 1) 纯逻辑测试（不加载任何模型，最快）→ 应输出「全部通过: 59 项断言」
 $PY umvp/pipe/test_composer.py
+
+# 1b) 通用裁剪模块（纯逻辑 + 轻量性检查 → 26 项断言）
+$PY tests/test_cropper.py
 
 # 2) 人脸链路注册+自检（读项目内 face_models/；test_imgs 建库并逐条自检 → 7/7 命中）
 $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
@@ -172,18 +199,22 @@ $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs
 # 3) YOLO 推理参数对比（重叠场景截图，真实推理 yolov8n.pt）
 $PY tests/test_yolo_params.py
 
-# 4) 三模式实机测试（YOLO + 三路真实视频 + 大模型）
-$PY tests/test_3modes.py
+# 4) 警用链路端到端（真实 YOLO + mock VLM，落 tests/data/out/police_uav）
+$PY tests/test_police_uav_video.py
+
+# 5) 车牌识别链路（整帧识别 + YOLO 识车→裁车放大→坐标还原 → 28 项断言）
+$PY tests/test_plate_recog_pipeline.py
 ```
 
 ### 注意事项
 
-- **VLM 端点可达性**：`tests/test_3modes.py` 里 `VLM_URL` 指向开发机上的 qwen3-vl 服务。
-  目标机需能访问该地址；否则改 `VLM_URL`/`VLM_MODEL` 指向自己的 OpenAI 兼容大模型端点。
+- **VLM 端点可达性**：警用链路测试（`tests/test_police_uav_video.py`）默认用 mock VLM；
+  真实端点配置在链路 vlm 阶段参数（vlm_endpoint/vlm_model），不可达时测试台记日志继续。
 - **运行目录**：从项目根运行（测试脚本内部按根目录定位模块与数据）。
 - **首次推理慢**：YOLO 首帧加载模型约 1~2 秒；SCRFD/ArcFace 首次加载 onnx 同理，属正常。
-- **性能基线（全 CPU）**：YOLO 单帧 ~1.7s（首载后更低）、SCRFD 640 全图 90–130ms、
-  ArcFace 单张 ~10ms、千级底库检索 <1ms。WSL2 下接近该量级。
+- **性能基线（全 CPU，权威值见 `out/fingerprints.json`）**：YOLO @640 各档 40–280ms
+  （yolov8n 39ms / yolo11n 48ms / yolo11s 100ms / yolo11m 276ms）、SCRFD 640 全图 ~100ms、
+  ArcFace 单张 ~37ms、千级底库检索 <1ms。WSL2 下接近该量级。
 
 ---
 

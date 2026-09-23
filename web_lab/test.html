@@ -49,9 +49,11 @@
   .video-container{position:relative;background:#000;border-radius:8px;overflow:hidden;margin-bottom:16px;
     border:1px solid var(--line)}
   .video-container video{width:100%;max-height:500px;display:block}
-  .video-overlay{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.7);
-    padding:8px 12px;display:flex;gap:12px;align-items:center;font-size:12px}
+  .video-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
+  .video-overlay{position:absolute;top:0;left:0;right:0;background:rgba(0,0,0,0.55);
+    padding:6px 12px;display:flex;gap:12px;align-items:center;font-size:12px;pointer-events:none}
   .time-display{color:#fff;font-family:monospace}
+  .stream-state{color:var(--accent);font-family:ui-monospace,Consolas,monospace}
   
   .results-container{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   
@@ -74,6 +76,7 @@
   .log-entry.kind-fail{color:#ef5350;background:rgba(239,83,80,0.1)}
   .log-entry.kind-face{color:#4dd0e1;background:rgba(77,208,225,0.12);font-weight:600}
   .log-entry.kind-info{color:var(--dim);opacity:.75}
+  .log-entry .stage-badge{color:var(--accent);opacity:.9;font-weight:600}
   .log-json{margin:4px 0 0 12px;padding:4px 8px;font-family:ui-monospace,Consolas,monospace;
     font-size:10.5px;line-height:1.5;color:#a5d6a7;background:rgba(0,0,0,0.25);
     border-left:2px solid var(--line);white-space:pre;overflow-x:auto}
@@ -148,10 +151,12 @@
     <h2 class="section-title">视频控制</h2>
     <div class="video-container">
       <video id="video_player" controls></video>
+      <canvas id="video_canvas" class="video-canvas"></canvas>
       <div class="video-overlay">
         <span class="time-display" id="time_display">00:00:00</span>
         <span>|</span>
         <span id="frame_display">帧: 0</span>
+        <span class="stream-state" id="sync_state">未同步</span>
       </div>
     </div>
     
@@ -200,6 +205,8 @@
     <div class="btn-row">
       <button class="primary" id="start_btn" onclick="startTest()">开始测试</button>
       <button class="stop" id="stop_btn" onclick="stopTest()" disabled>停止测试</button>
+      <button id="sync_btn" onclick="startSync()">同步播放运行</button>
+      <button class="stop" id="sync_stop_btn" onclick="stopSync()" disabled>停止同步</button>
       <button onclick="clearResults()">清空结果</button>
     </div>
   </section>
@@ -291,22 +298,69 @@ async function loadPipelines() {
   }
 }
 
+let videoReadyUrl = null;   // 浏览器可播的 URL（原文件或转码缓存）
+let prepareTimer = null;    // 转码进度轮询定时器
+
+function _setVideoSrc(url){
+  const v = document.getElementById('video_player');
+  if (v.getAttribute('src') !== url) v.src = url;
+}
+
 async function loadVideo() {
   const videoName = document.getElementById('video_select').value;
+  if (prepareTimer){ clearInterval(prepareTimer); prepareTimer = null; }
+  videoReadyUrl = null;
   if (!videoName) {
     document.getElementById('video_player').src = '';
     videoInfoCache = null;
     updateVideoInfo();
     return;
   }
-  document.getElementById('video_player').src = `/files/videos/${videoName}`;
-  // 拉取视频元信息（分辨率/帧率/总帧数），供处理量预估
+  // 拉取视频元信息（分辨率/帧率/总帧数），供处理量预估与叠加坐标换算
   try{
     const resp = await fetch('/api/video/info?name=' + encodeURIComponent(videoName));
     const data = await resp.json();
     videoInfoCache = data.ok ? data : null;
   }catch(e){ videoInfoCache = null; }
   updateVideoInfo();
+  await prepareVideo(videoName);
+}
+
+// 解码适配：浏览器不支持 HEVC 等编码时，后端按需转码 H.264，前端轮询进度后播放
+async function prepareVideo(videoName){
+  const box = document.getElementById('video_info');
+  let data;
+  try{
+    const resp = await fetch('/api/video/prepare?name=' + encodeURIComponent(videoName));
+    data = await resp.json();
+  }catch(e){
+    if (box) box.innerHTML = '视频准备失败：' + e.message;
+    return;
+  }
+  if (!data.ok){
+    if (box) box.innerHTML = '⚠️ ' + (data.error || '视频准备失败');
+    _syncSetState('视频不可播');
+    return;
+  }
+  if (data.status === 'ready'){
+    if (prepareTimer){ clearInterval(prepareTimer); prepareTimer = null; }
+    videoReadyUrl = data.url;
+    _setVideoSrc(data.url);
+    updateVideoInfo();
+    return;
+  }
+  if (data.status === 'error'){
+    if (prepareTimer){ clearInterval(prepareTimer); prepareTimer = null; }
+    if (box) box.innerHTML = '⚠️ 转码失败：' + (data.error || '');
+    return;
+  }
+  // transcoding：显示进度并轮询
+  const pct = (data.progress || 0).toFixed(1);
+  if (box) box.innerHTML = `正在转码为浏览器可播格式（H.264）… <b>${pct}%</b>`
+                           + `（源视频编码浏览器不支持，仅需转一次）`;
+  if (!prepareTimer){
+    prepareTimer = setInterval(() => prepareVideo(videoName), 1500);
+  }
 }
 
 // ---- 视频信息 + 帧管理处理量预估 ----
@@ -492,29 +546,25 @@ function addLogEntry(text, type = '') {
   container.scrollTop = container.scrollHeight;
 }
 
-// 结构化逐条渲染（来自后端 result.timeline），kind: frame/submit/vlm/alarm/fail/face/info
+// 结构化逐条渲染（来自后端 result.timeline）：统一按"阶段→下一级"标签展示，
+// 阶段标签由后端按链路 stages 动态生成，不依赖具体链路类型
 let lastTimeline = [];
-
-const KIND_FILTERS = [
-  {value: 'vlm',   label: '仅 VLM 报送', needs: ['vlm', 'submit']},
-  {value: 'alarm', label: '仅告警',      needs: ['alarm']},
-  {value: 'face',  label: '仅新人脸',    needs: ['face']},
-];
 
 function rebuildFilterOptions() {
   const sel = document.getElementById('log_filter');
-  const kinds = new Set(lastTimeline.map(i => i.kind));
   const prev = sel.value;
+  const seen = new Map(); // module_id -> 阶段短标签
+  for (const it of lastTimeline) {
+    if (it.stage && !seen.has(it.stage)) seen.set(it.stage, it.stage_label || it.stage);
+  }
   sel.innerHTML = '';
   const all = document.createElement('option');
   all.value = 'all'; all.textContent = '全部';
   sel.appendChild(all);
-  for (const f of KIND_FILTERS) {
-    if (f.needs.some(k => kinds.has(k))) {
-      const op = document.createElement('option');
-      op.value = f.value; op.textContent = f.label;
-      sel.appendChild(op);
-    }
+  for (const [mid, label] of seen) {
+    const op = document.createElement('option');
+    op.value = mid; op.textContent = '仅 ' + label;
+    sel.appendChild(op);
   }
   sel.value = [...sel.options].some(o => o.value === prev) ? prev : 'all';
 }
@@ -526,11 +576,18 @@ function renderTimeline(timeline) {
   container.innerHTML = '';
   const filter = document.getElementById('log_filter').value;
   for (const item of lastTimeline) {
-    if (!shouldShow(item.kind, filter)) continue;
+    if (!shouldShow(item, filter)) continue;
     const entry = document.createElement('div');
     entry.className = 'log-entry kind-' + item.kind;
     const head = document.createElement('div');
-    head.textContent = `[${(item.ts || 0).toFixed(1)}s 帧#${item.frame}] ${item.text}`;
+    if (item.stage_label) {
+      const badge = document.createElement('span');
+      badge.className = 'stage-badge';
+      badge.textContent = `[${item.stage_label}] `;
+      head.appendChild(badge);
+    }
+    head.appendChild(document.createTextNode(
+      `[${(item.ts || 0).toFixed(1)}s 帧#${item.frame}] ${item.text}`));
     entry.appendChild(head);
     if (item.data && typeof item.data === 'object' && Object.keys(item.data).length) {
       const pre = document.createElement('pre');
@@ -543,11 +600,9 @@ function renderTimeline(timeline) {
   container.scrollTop = container.scrollHeight;
 }
 
-function shouldShow(kind, filter) {
-  if (filter === 'vlm') return kind === 'vlm' || kind === 'submit' || kind === 'fail';
-  if (filter === 'alarm') return kind === 'alarm';
-  if (filter === 'face') return kind === 'face';
-  return true; // all
+function shouldShow(item, filter) {
+  if (filter === 'all') return true;
+  return item.stage === filter; // 按阶段过滤（选项由时间线里出现的阶段动态生成）
 }
 
 function applyLogFilter() {
@@ -604,7 +659,8 @@ function updateUIState() {
 document.getElementById('video_player').addEventListener('timeupdate', () => {
   const video = document.getElementById('video_player');
   const currentTime = video.currentTime;
-  const frame = Math.floor(currentTime * 25);
+  const fps = (videoInfoCache && videoInfoCache.fps) ? videoInfoCache.fps : 25;
+  const frame = Math.floor(currentTime * fps);
   
   const minutes = Math.floor(currentTime / 60);
   const seconds = Math.floor(currentTime % 60);
@@ -614,6 +670,172 @@ document.getElementById('video_player').addEventListener('timeupdate', () => {
     `${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}:${String(ms).padStart(2,'0')}`;
   document.getElementById('frame_display').textContent = `帧: ${frame}`;
 });
+
+// ---- 实时播放叠加（SSE 流式运行 + canvas 叠加 + 播放节流）----
+// 服务端逐分析帧推框的数值；视频只播到"已收到结果的最新时间"就暂停等（缓冲），
+// 收到新结果再续播——框与画面保持一致，播放速度=处理速度。
+let syncES = null;          // EventSource
+let syncRunId = null;
+let syncFps = 25;
+let syncFrames = [];        // 已收分析帧结果（按 n 升序）
+let syncLastTs = -1;        // 最新结果时间
+let syncAutoPaused = false; // 是否由节流自动暂停
+let syncDims = null;        // 被分析视频的原始宽高（meta 下发，叠加换算兜底）
+const SYNC_AHEAD_EPS = 0.2; // 允许视频比最新结果超前的时间（秒），超出即判为"未分析帧"
+
+function _syncSetState(text){
+  const el = document.getElementById('sync_state');
+  if (el) el.textContent = text;
+}
+
+function _syncClose(){
+  if (syncES) { syncES.close(); syncES = null; }
+  document.getElementById('sync_btn').disabled = false;
+  document.getElementById('sync_stop_btn').disabled = true;
+}
+
+function stopSync(){
+  if (syncRunId){
+    fetch('/api/test/pipeline_run/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({run_id: syncRunId})
+    }).catch(() => {});
+  }
+  _syncClose();
+  document.getElementById('video_player').pause();
+  _syncSetState('已停止');
+}
+
+function startSync(){
+  const videoName = document.getElementById('video_select').value;
+  const pid = document.getElementById('pipeline_select').value;
+  if (!videoName || !pid){ alert('请先选择链路与视频'); return; }
+  if (!videoReadyUrl){ alert('视频尚未准备好（转码中），请稍候再试'); return; }
+  if (syncES){ stopSync(); }
+  syncFrames = []; syncLastTs = -1; syncAutoPaused = false; syncRunId = null;
+  syncDims = null;
+  const video = document.getElementById('video_player');
+  const q = new URLSearchParams({
+    pipeline_id: pid, video: videoName,
+    start_time: document.getElementById('start_time').value || '0',
+    end_time: document.getElementById('end_time').value || '0',
+    max_frames: document.getElementById('max_frames').value || '0',
+    vlm_feedback: document.getElementById('vlm_feedback').checked ? '1' : '0',
+    vlm_action: document.getElementById('vlm_action').value || 'fire',
+  });
+  document.getElementById('sync_btn').disabled = true;
+  document.getElementById('sync_stop_btn').disabled = false;
+  _syncSetState('连接中…');
+  syncES = new EventSource('/api/test/pipeline_run/stream?' + q.toString());
+
+  syncES.addEventListener('meta', (e) => {
+    const d = JSON.parse(e.data);
+    syncRunId = d.run_id;
+    syncFps = d.fps || 25;
+    syncDims = (d.width && d.height) ? {w: d.width, h: d.height} : null;
+    video.pause();
+    video.currentTime = (d.start_frame || 0) / syncFps;
+    _syncSetState(`处理中… 0 帧（${syncFps.toFixed(1)}fps）`);
+  });
+  syncES.addEventListener('frame', (e) => {
+    const d = JSON.parse(e.data);
+    syncFrames.push(d);
+    syncLastTs = d.ts;
+    _syncSetState(`处理中… ${syncFrames.length} 帧`);
+    if (syncAutoPaused){  // 有新结果，续播
+      syncAutoPaused = false;
+      video.play().catch(() => {});
+    }
+  });
+  syncES.addEventListener('done', (e) => {
+    const d = JSON.parse(e.data);
+    _syncSetState(`完成：${d.processed} 帧 / 检测 ${d.detections} / 车牌 ${d.plates} / `
+                  + `告警 ${d.alarms}（${d.elapsed}s）${d.stopped ? '｜已停止' : ''}`);
+    video.pause();  // 停在最后一个分析帧，避免视频继续跑而框被冻结
+    _syncClose();
+  });
+  syncES.addEventListener('error', (e) => {
+    let msg = '连接中断';
+    if (e && e.data){ try { msg = JSON.parse(e.data).message || msg; } catch (_) {} }
+    _syncSetState('错误: ' + msg);
+    _syncClose();
+  });
+}
+
+function _syncDraw(){
+  const video = document.getElementById('video_player');
+  const canvas = document.getElementById('video_canvas');
+  if (video && canvas){
+    if (canvas.width !== video.clientWidth || canvas.height !== video.clientHeight){
+      canvas.width = video.clientWidth; canvas.height = video.clientHeight;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (video.videoWidth && syncFrames.length){
+      const curN = Math.floor(video.currentTime * syncFps);
+      let res = null;  // 取 ≤ 当前帧号的最近分析帧（抽帧时框保持到下一分析帧）
+      for (let i = syncFrames.length - 1; i >= 0; i--){
+        if (syncFrames[i].n <= curN){ res = syncFrames[i]; break; }
+      }
+      // 陈旧度闸门：视频跑过"已收到结果的最新时间"即视为未分析帧（结束后继续播、
+      // 拖进度条超出分析范围等），不画冻结的旧框，改为提示。
+      let stale = false;
+      if (res && video.currentTime - syncLastTs > SYNC_AHEAD_EPS){ res = null; stale = true; }
+      if (res) _syncDrawOverlay(ctx, res, video, canvas);
+      else if (stale) _syncDrawHint(ctx, canvas, '当前帧未分析（已超出分析范围）');
+      // 播放节流：播到最新结果时间就暂停等结果
+      if (syncES && video.currentTime >= syncLastTs && !video.paused){
+        video.pause(); syncAutoPaused = true;
+        _syncSetState(`缓冲中… 已收 ${syncFrames.length} 帧`);
+      }
+    }
+  }
+  requestAnimationFrame(_syncDraw);
+}
+
+function _syncDrawHint(ctx, canvas, text){
+  ctx.save();
+  ctx.font = '13px ui-monospace,monospace';
+  const w = ctx.measureText(text).width + 20;
+  const x = (canvas.width - w) / 2, y = 14;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(x, y, w, 24);
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText(text, x + 10, y + 16);
+  ctx.restore();
+}
+
+function _syncDrawOverlay(ctx, res, video, canvas){
+  // 坐标按"原始分辨率"换算（转码预览可能缩到 1920，videoWidth 已非原分辨率）。
+  // 视频在元素框内按比例 contain（可能左右/上下留黑边），故用统一缩放 + 居中偏移，
+  // 不能直接用 canvas 宽高/原分辨率（否则横向纵向比例不同 → 框向两边拉扯漂移）。
+  const ow = (syncDims && syncDims.w) || (videoInfoCache && videoInfoCache.width) || video.videoWidth;
+  const oh = (syncDims && syncDims.h) || (videoInfoCache && videoInfoCache.height) || video.videoHeight;
+  const dw = video.clientWidth, dh = video.clientHeight;
+  const scale = Math.min(dw / ow, dh / oh);
+  const offX = (dw - ow * scale) / 2, offY = (dh - oh * scale) / 2;
+  const X = x => offX + x * scale, Y = y => offY + y * scale;
+  const CLS_COLORS = {0: '#4fc3f7', 2: '#ffb74d'};
+  for (const d of (res.dets || [])){
+    const [x1, y1, x2, y2] = d.bbox;
+    ctx.strokeStyle = CLS_COLORS[d.cls] || '#81c784';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(X(x1), Y(y1), (x2 - x1) * scale, (y2 - y1) * scale);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = '12px ui-monospace,monospace';
+    ctx.fillText(`cls${d.cls} ${d.score.toFixed(2)}`, X(x1), Math.max(Y(y1) - 4, 12));
+  }
+  for (const p of (res.plates || [])){
+    const [x1, y1, x2, y2] = p.bbox;
+    ctx.strokeStyle = '#66ff66';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(X(x1), Y(y1), (x2 - x1) * scale, (y2 - y1) * scale);
+    ctx.fillStyle = '#66ff66';
+    ctx.font = 'bold 13px ui-monospace,monospace';
+    ctx.fillText(`${p.plate_no} ${p.score.toFixed(2)}`, X(x1), Math.max(Y(y1) - 5, 14));
+  }
+}
+requestAnimationFrame(_syncDraw);
 
 init();
 </script>

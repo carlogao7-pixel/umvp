@@ -1,7 +1,7 @@
 # UMVP 独立部署包
 
 **UMVP（Unified Modular Vision Pipeline / 统一模块化视觉分析管道）**的独立部署包：
-四模块管道（帧管理 / YOLO 识别 / VLM 研判 / 告警策略）+ 人脸识别检索分支 + 自定义链路测试。
+管道模块（帧管理 / YOLO 识别 / VLM 研判 / 告警策略）+ 人脸识别检索分支 + 自定义链路测试。
 代码库与模型权重自包含于本目录，不依赖 spaz 平台，也不依赖用户目录
 下的模型缓存（人脸模型默认读项目内 `face_models/buffalo_l/`）。
 
@@ -9,13 +9,15 @@
 
 | 目录 | 内容 |
 |------|------|
-| `umvp/pipe/` | 四模块 + `Pipeline` 装配器 |
+| `umvp/pipe/` | 管道模块 + `Pipeline` 装配器 + 通用裁剪 `Cropper`（cropper.py，人脸/车牌链共用） |
 | `umvp/face_detect/` | SCRFD 人脸检测 + 5 点对齐裁剪（`FaceDetector`） |
 | `umvp/face_embed/` | ArcFace 512d 嵌入（`FaceEmbedder`）+ 向量底库（`FaceStore`） |
 | `umvp/face_scan/` | 人脸管道编排（`FaceMonitor`，复用 `pipe.composer.FrameManager` 取帧） |
+| `umvp/plate_recog/` | 车牌识别（`PlateRecognizer`：HyperLPR3 从车图裁车牌+矫正+识别；`extract_plates` 消费目标裁剪车图并原图出牌） |
 | `models/` | YOLO 模型选择池（v8n/s、v9t、v10s、v11n/s/m，COCO person/car，放 .pt 即入选择） |
 | `face_models/` | InsightFace 模型包 `buffalo_l/`（已解压，含 det_10g.onnx / w600k_r50.onnx 等） |
-| `tests/` | 自定义链路测试 + YOLO 参数对比 + 测试视频/图片 |
+| `plate_models/` | HyperLPR3 车牌模型（`fetch_models.py` 拉取，不入库） |
+| `tests/` | 自定义链路测试 + YOLO 参数对比 + 人脸/车牌链路 + 测试视频/图片 |
 
 ## 环境与运行
 
@@ -25,20 +27,29 @@
 ```bash
 # 在项目根目录下
 
-# 1. 纯逻辑测试（不加载模型，最快）→ 27 项断言
+# 1. 纯逻辑测试（不加载模型，最快）→ 59 项断言
 conda run -n ai python umvp/pipe/test_composer.py
 
-# 2. 人脸链路注册+自检（读项目内 face_models/；用 test_imgs 建库并逐条自检 → 7/7 命中）
+# 2. 通用裁剪模块（纯逻辑 + 轻量性检查 → 26 项断言）
+conda run -n ai python tests/test_cropper.py
+
+# 3. 人脸链路注册+自检（读项目内 face_models/；用 test_imgs 建库并逐条自检 → 7/7 命中）
 conda run -n ai python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
 
-# 3. YOLO 推理参数对比（重叠场景截图，真实推理）
+# 4. YOLO 推理参数对比（重叠场景截图，真实推理）
 conda run -n ai python tests/test_yolo_params.py
 
-# 4. 唯一保留链路（警用无人机）逻辑断言（不加载模型，秒级）
+# 5. 警用链路（警用无人机）逻辑断言（不加载模型，秒级）
 conda run -n ai python tests/test_police_uav_pipeline.py
 
-# 5. 保留链路端到端（真实 YOLO + mock VLM，落 tests/data/out/police_uav）
+# 6. 保留链路端到端（真实 YOLO + mock VLM，落 tests/data/out/police_uav）
 conda run -n ai python tests/test_police_uav_video.py
+
+# 7. 车牌识别链路（整帧识别 + YOLO 识车→裁车放大→坐标还原 → 28 断言）
+conda run -n ai python tests/test_plate_recog_pipeline.py
+
+# 8. 拉取车牌模型到 plate_models/（换机/新克隆必跑一次）
+conda run -n ai python umvp/plate_recog/fetch_models.py
 ```
 
 > 若 `ai` 环境已激活（`conda activate ai`），上述命令简写为 `python ...`。

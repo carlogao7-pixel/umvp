@@ -202,13 +202,13 @@ class ResourceEstimator:
     MODULE_TYPE = {
         "frame_manager": TYPE_LOGIC,
         "yolo": TYPE_YOLO,
+        "target_crop": TYPE_LOGIC,     # 目标裁剪：纯裁剪，无模型开销
         "vlm": TYPE_VLM,
         "alarm": TYPE_LOGIC,
         "compose": TYPE_YOLO,          # compose 含 YOLO 主推理
         "face_detect": TYPE_SCRFD,
         "face_embed": TYPE_ARCFACE,
         "face_store": TYPE_FACESTORE,
-        "extract_faces": TYPE_YOLO,    # extract_faces = YOLO + SCRFD，取两者较重者
         "face_monitor": TYPE_SCRFD,    # 人脸监控 = SCRFD 主推理
     }
 
@@ -335,24 +335,11 @@ class ResourceEstimator:
         params = dict(params or {})
         mtype = self.MODULE_TYPE.get(module_id, self.TYPE_LOGIC)
 
-        # compose / extract_faces 用 yolo_* 前缀参数，统一映射到实测查表用的 model_path/imgsz
+        # 模块用 yolo_* 前缀参数时，统一映射到实测查表用的 model_path/imgsz
         if "yolo_model" in params:
             params.setdefault("model_path", params["yolo_model"])
         if "yolo_imgsz" in params:
             params.setdefault("imgsz", params["yolo_imgsz"])
-
-        # 特殊模块：extract_faces = YOLO 主推理 + SCRFD 人脸检测
-        if module_id == "extract_faces":
-            yolo = self._estimate_typed(self.TYPE_YOLO, params)
-            scrfd = self._estimate_typed(self.TYPE_SCRFD, params)
-            return ResourceFingerprint(
-                vram_mb=max(yolo.vram_mb, scrfd.vram_mb),
-                ram_mb=yolo.ram_mb + scrfd.ram_mb,
-                latency_ms_cpu=yolo.latency_ms_cpu + scrfd.latency_ms_cpu,
-                latency_ms_gpu=yolo.latency_ms_gpu + scrfd.latency_ms_gpu,
-                note=f"YOLO(人) + SCRFD 人脸: {yolo.note}; {scrfd.note}",
-                source=_merge_source(yolo.source, scrfd.source),
-            )
 
         # face_monitor = SCRFD 主推理 + ArcFace 嵌入（按检测命中折算）
         if module_id == "face_monitor":

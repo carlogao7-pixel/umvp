@@ -3,6 +3,17 @@
 > 层：L4-experience ｜ 读者：总装 / 组装工 ｜ 来源：原 `.claude/skills/face-extract-pipeline/SKILL.md`（2026-08-11 并入知识库 L4）
 > 状态：WIP 记录（2026-08-05 首版）。只验证过三张静态测试图，很多场景没试过，下文
 > "未验证场景"一节是诚实清单。本文件目的是把已跑通的链路、改造、坑先记下来，别丢。
+>
+> **更新（2026-09-22）**：下文的通用裁剪能力已从 crop_restore.py 提炼为
+> `pipe/cropper.py`（类 `Cropper`，方法 `crop`/`to_original`/`kps_to_original`/`extract`，
+> 纯 cv2+numpy 零检测器依赖）；文中 `CropRestore`/`crop_person`/`extract_face` 为当时
+> 历史命名，现为兼容别名。车牌链 `extract_plates` 复用同一 Cropper；crop_restore.py
+> 只留 `extract_faces` 人脸编排。
+>
+> **更新（2026-09-23）**：该链路已进一步拆为**目标裁剪 + 人脸检测**两个模块——
+> `pipe/target_crop.py`（按 YOLO 框裁人，输出分辨率可配）→ `face_detect.face_pipeline.FaceStage`
+> （子图检脸 + 原图出原分辨率脸）。`extract_faces` 降级为**兼容编排**（内部=YOLO→crop_targets→FaceStage）。
+> 目标有效性过滤（置信度/尺寸）归 YOLO `infer()` 输出处。下文的 `extract_faces` 用法属历史形态。
 
 ## 这是什么
 

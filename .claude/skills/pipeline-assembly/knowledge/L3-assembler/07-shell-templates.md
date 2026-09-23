@@ -25,7 +25,7 @@ from pipe.composer import compose
 
 SPEC = {
     "task_id": 1,
-    "algo_mode": "small_crop",             # small_only / small_crop / small_full / large_only
+    "algo_mode": "small_full",             # small_only / small_crop / small_full / large_only（兼容封装；small_crop/full 现均送全帧 full:cls，ROI 裁剪改由目标裁剪阶段）
     "extract_frame_rate": 3,               # analysis 抽帧间隔
     "class_limits": {0: (1, 300)},         # 类别:(数量下限,上限)，超界跳过该类
     "check_interval": 3.0,                 # 送审节拍(秒)
@@ -121,7 +121,7 @@ est = ResourceEstimator(project_root=".")          # 自动读 out/fingerprints.
 est_spec = {"stages": [
     {"module": "frame_manager", "params": {"sampling": "wall_clock", "interval_sec": 1.0}},
     {"module": "yolo", "params": {"model_path": "yolov8n.pt", "classes": "0"}},
-    {"module": "vlm", "params": {"ref": "crop:cls0", "check_interval": 3.0, "fps": 25}},
+    {"module": "vlm", "params": {"ref": "full:cls0", "check_interval": 3.0, "fps": 25}},
     {"module": "alarm", "params": {"kind": "window", "target_actions": "fire"}},
 ]}
 pe = est.estimate_pipeline(est_spec, streams=16, vram_budget_mb=8192)

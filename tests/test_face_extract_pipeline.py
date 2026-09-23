@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-原分辨率人脸提取链路测试：图片 → YOLO(识别人) → CropRestore(裁人+坐标还原) → SCRFD(识别人脸) → 原图裁原生分辨率人脸
+原分辨率人脸提取链路测试：图片 → YOLO(识别人) → Cropper(裁人+坐标还原) → SCRFD(识别人脸) → 原图裁原生分辨率人脸
 
 覆盖:
   1. 三张 tests/data/pic 图片，YOLO 只识别人
@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT / "umvp"))
 
 from face_detect.face_detector import FaceDetector
 from pipe.composer import YOLODetector
-from pipe.crop_restore import CropRestore, extract_faces
+from pipe.cropper import Cropper
+from pipe.crop_restore import extract_faces
 
 DATA = ROOT / "tests/data/pic"
 OUT = ROOT / "tests/data/out/faces"
@@ -40,7 +41,7 @@ def main() -> None:
     yolo = YOLODetector(model_path=str(YOLO_MODEL), conf=0.35, iou=0.7, imgsz=640,
                         max_det=300, classes=[CLS_PERSON])
     face_det = FaceDetector(det_thresh=0.4)  # 略降阈值召回小脸
-    tool = CropRestore(upscale=1.0, margin=0.15)
+    tool = Cropper(upscale=1.0, margin=0.15)
 
     images = sorted(DATA.glob("*.png"))
     for img in images:
@@ -82,9 +83,9 @@ def main() -> None:
                   f"conf={f.score:.3f} upscale={f.upscale} kps={len(f.kps)}")
 
         # 去重断言: 无两个人脸框重叠超过 IoU 0.5
-        from pipe.crop_restore import _iou
+        from pipe.cropper import iou
         dup = [1 for i in range(len(faces)) for j in range(i + 1, len(faces))
-               if _iou(faces[i].face_bbox, faces[j].face_bbox) > 0.5]
+               if iou(faces[i].face_bbox, faces[j].face_bbox) > 0.5]
         check(f"{img.stem} 人脸去重无重复", not dup, f"重复对: {len(dup)}")
 
     print(f"\n全部通过: {PASS} 项断言")
