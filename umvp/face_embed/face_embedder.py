@@ -33,7 +33,6 @@ DEFAULT_MODEL_ROOT = os.path.join(
 )
 DEFAULT_EMBED_NAME = "w600k_r50.onnx"
 EMBED_DIM = 512
-EMBED_INPUT_SIZE = (112, 112)  # ArcFace 标准输入尺寸
 
 
 class FaceEmbedder(DeviceAware):

@@ -78,6 +78,7 @@ _MODULE_ID_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 _ID_PREFIXES = {
     "frame_manager": "FM",
     "yolo": "YOLO",
+    "det_filter": "DF",
     "target_crop": "CROP",
     "annotate": "ANNO",
     "vlm": "VLM",

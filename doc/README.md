@@ -2,7 +2,7 @@
 
 > 本文件是 `doc/` 的总入口：**业务架构 → 技术结构 → 子模块/功能文件索引**。
 > 找文档先看这里；发现索引与实际不符时以文件为准，并顺手更新本页。
-> 最后更新：2026-09-22。
+> 最后更新：2026-09-29。
 
 ---
 
@@ -53,11 +53,16 @@ web_lab/（可视化测试台）
  └ server.py 全部 API + 链路运行器（_chain_from_spec 装配 → Pipeline 驱动）
      │
  umvp/pipe/（管道核心）
- ├ composer.py  FrameManager 帧管理(取帧节奏+背压) / YOLODetector 小模型识别 /
+ ├ composer.py  FrameManager 帧管理(取帧节奏+背压) / YOLODetector 小模型**纯推理** /
  │              VLMAnalyzer 大模型研判 / OutputPolicy 输出处理七道闸(原告警) / Pipeline 装配器
+ │              （有效性过滤→det_filter，节流/报送编排在 Pipeline）
  ├ cropper.py   通用裁剪工具 Cropper（按框裁图可缩放/坐标还原/原分辨率提取，纯 cv2+numpy）
  ├ target_crop.py  目标裁剪模块（按上游检测框裁子图，输出分辨率可配；车牌/人脸/VLM 链共用）
  ├ annotate.py  标注模块（在帧上画检测框，供 VLM 看"原图+画框"；纯绘制）
+ ├ det_filter.py 检测筛选 DetFilter（有效性：逐条条件 DSL + 成组数量判定）
+ ├ seq_filter.py 时序判定 SeqFilter（窗口确认闸 + 事件标注）
+ ├ conditions.py 条件 DSL 引擎（与/或/非/括号 + 派生尺寸量，筛选/裁剪/标注共用）
+ ├ records.py   通用记录 Record 约定 + to_record 对象适配
  └ crop_restore.py  extract_faces 兼容编排（已拆为「目标裁剪+人脸检测」两模块）
      │
  专用模块
@@ -115,6 +120,8 @@ web_lab/（可视化测试台）
 |---|---|
 | `输出处理模块设计.md` | 告警→输出处理的通用化设计（背景/拍板/改动清单；明细见模块分册） |
 | `实时播放叠加设计.md` | SSE 流式运行 + 视频叠加框的方案与约束 |
+| `历史视频回顾检索设计.md` | 语言询问→定位历史视频片段：离线片段索引（轻/语义/向量三档，PIPE0004）+ 三级检索 + 两级索引帧级精定位（设计稿，业务与实现方案总篇） |
+| `WeMM嵌入对接设计.md` | WeMM-Embedding 嵌入服务对接专篇：模型机制、serving 部署、WEMMClient 请求 schema、成本与联调清单（设计稿） |
 | `存储设计.md` | presets/pipelines 存储设计决策 |
 | `数据库结构.md` | 表结构/ID 前缀/播种清单/参数表机制/数据快照 |
 

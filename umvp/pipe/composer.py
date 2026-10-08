@@ -4,8 +4,11 @@
 
 按"参数归属模块"重构（用户确认的分工）:
   1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压（原 FrameScheduler 并入）
-  2. YOLODetector  小模型识别 —— 推理参数可调(conf/iou/imgsz/max_det/classes/device) +
-                     可插拔过滤链(顺序自定义) + 按识别类型(类别)报送 + 每类数量上下限
+  2. YOLODetector  小模型识别 —— **纯推理**（2026-10 起）：ultralytics 参数可调
+                     (conf/iou/imgsz/max_det/classes/device)，infer() 输出 Detection。
+                     有效性过滤/成组判定归「检测筛选 DetFilter」（pipe.det_filter，
+                     由 Pipeline.det_filter 承接）；向下传递节流与报送编排在
+                     Pipeline（check_interval / track_change_only / SubmitRequest 构造）
   3. VLMAnalyzer   大模型研判 —— 素材准备(crop_padding/缩放/prompt) + 推理
   4. OutputPolicy  输出处理（原告警策略）—— 统一漏斗：Finding → 驻留/词表/置信/规则/
                      滑窗/去重冷却 七道闸 → OutputEvent（AlarmPolicy 为兼容别名）
@@ -13,13 +16,13 @@
 装配器 compose(): 把四种分析模式（small_only/small_crop/small_full/large_only）
 映射为模块组合与参数，模式差异收敛为配置，不产生分支代码。
 
-YOLO 输出粒度（用户定义，2026-08-04 改）:
+YOLO 输出粒度（用户定义，2026-08-04 改; 2026-10 编排上移到 Pipeline）:
   class —— 按识别类型（类别）单独报送：画面里每出现一类识别对象（且数量在
-           "该类上下限"范围内）就发一条请求，一类多个目标合并成一条（ref=full:cls{类别}
-           送全帧、拼接层画该类框标注；或 ref=crop:cls{类别} 送该类 ROI 裁剪）。
+           "该类上下限"范围内——由 DetFilter.group_limits 判定）就发一条请求，
+           一类多个目标合并成一条（ref=full:cls{类别} 送全帧、拼接层画该类框标注）。
   scene —— 仅 large_only 的周期性整帧（ref=full:global），不经过小模型。
   说明: per_track（按目标独立报送）已删除；驻留告警(dwell)仍按 track 记首次出现，
-        但那是告警策略内部逻辑，不产生报送请求。
+         但那是告警策略内部逻辑，不产生报送请求。
 
 依赖: 纯 Python（抽帧+背压已在 FrameManager 内部，不再依赖 face_scan）
 """
@@ -30,6 +33,8 @@ import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from pipe.det_filter import DetFilter
 
 _NEG_INF = -1e18  # 首见必送：模拟 spaz 以 unix 时间戳减 0 的语义
 
@@ -248,53 +253,31 @@ class IntervalGate:
         self._last[key] = ts
 
 
-# ---------------- 模块 2: YOLO 识别 ----------------
+# ---------------- 模块 2: YOLO 识别（纯推理） ----------------
 GRAN_TRACK = "per_track"  # 仅驻留告警(dwell)事件标注用；报送不再按 track
 GRAN_SCENE = "scene"  # 周期性整帧（large_only）
 GRAN_CLASS = "class"  # 按识别类型（类别）报送
 
-# per-detection 过滤器（顺序可自定义，都是布尔谓词）
-Filter = Callable[[Detection], bool]
-
-
-def filter_model(path: str) -> Filter:
-    return lambda d: not d.model_path or d.model_path == path
-
-
-def filter_confidence(t: float) -> Filter:
-    return lambda d: d.score >= t
-
-
-def filter_classes(cs: List[int]) -> Filter:
-    return lambda d: d.cls_id in cs
-
-
-def filter_min_size(min_short: int, min_long: int) -> Filter:
-    def _f(d: Detection) -> bool:
-        w, h = d.bbox[2] - d.bbox[0], d.bbox[3] - d.bbox[1]
-        return min(w, h) >= min_short and max(w, h) >= min_long
-    return _f
-
 
 class YOLODetector:
-    """推理(可选) + 过滤链 + 按识别类型（类别）报送。
-    filters 为可自定义顺序的 per-detection 谓词序列。
+    """小模型识别（**纯推理**，2026-10 起过滤/报送外移）。
 
-    model_path 非空时支持 infer()：把推理参数(conf/iou/imgsz/max_det/classes/device)
-    收进模块，测试/拼接层直接实例化本模块传参即可，无需另写推理代码。
-    model_path 为空则退化为纯后处理（只过滤+报送，供外部已跑好的检测列表用）。
+    - 推理参数（conf/iou/imgsz/max_det/classes/device/tracker）收进模块，
+      测试/拼接层直接实例化传参即可，无需另写推理代码；model_path 为空时
+      保留旧"纯后处理"兼容（不推理、供外部检测列表直传 Pipeline）。
+    - 有效性过滤链与成组数量判定 → 「检测筛选 DetFilter」（pipe.det_filter，
+      Pipeline.det_filter 阶段承接，对所有下游一致生效）。
+    - 向下传递节流（check_interval）与按类报送编排（含 track_change_only、
+      SubmitRequest 构造）→ Pipeline（本文件的装配器）。
+    - 装配期翻译见 web_lab.server._chain_from_spec / compose()：preset 上的
+      filter_conf/min_short/min_long/class_limits/check_interval/track_change_only
+      仍可在 YOLO 参数面配置，由装配层译成 DetFilter/Pipeline 参数。
     """
 
     def __init__(
         self,
-        filters: Optional[List[Filter]] = None,
-        class_limits: Optional[Dict[int, Tuple[int, int]]] = None,
-        # 识别对象: 类别编号 -> (数量下限, 数量上限)，未登记的类别直接忽略；
-        # 数量按"过滤链后的该类目标数"算，不在范围内 → 该类不报送
-        check_interval: float = 3.0,  # 每类独立计时的送审节拍
-        track_change_only: bool = False,  # 只在 track_id 变化时才报送（需要跟踪）
-        # ---- 推理参数（model_path 为空则不推理，纯后处理） ----
-        model_path: Optional[str] = None,  # YOLO 权重路径 (.pt)
+        # ---- 推理参数 ----
+        model_path: Optional[str] = None,  # YOLO 权重路径 (.pt)；空=不推理（外部检测直传）
         conf: float = 0.35,  # 检出阈值（调低召回重叠/被遮挡目标）
         iou: float = 0.7,  # NMS 阈值（调低允许高度重叠的框并存）
         imgsz: int = 640,  # 推理分辨率（调高召回小目标/重叠目标，算力约平方增长）
@@ -303,10 +286,6 @@ class YOLODetector:
         device: Optional[str] = None,  # "0"/"cpu"/None=ultralytics 自动
         tracker: str = "bytetrack.yaml",  # 跟踪器配置（track=True 时用；必须显式传，否则本版 ultralytics 不分配 id）
     ) -> None:
-        self.filters = list(filters or [])
-        self.class_limits = dict(class_limits or {})
-        self.check_interval = check_interval
-        self.track_change_only = track_change_only
         self.model_path = model_path
         self.conf = conf
         self.iou = iou
@@ -316,14 +295,16 @@ class YOLODetector:
         self.device = device
         self.tracker = tracker
         self._model = None  # 惰性加载
-        self._gate = IntervalGate(check_interval)  # 向下游(VLM)报送的间隔门控（key=类别）
-        self._last_track_ids: Dict[int, set] = {}  # 类别 -> 上次 track_id 集合（track_change_only 模式）
 
-    # ---- 推理（model_path 非空时可用） ----
+    # ---- 推理 ----
     def infer(self, frame, track: bool = False) -> List[Detection]:
-        """跑 YOLO 推理，返回 Detection 列表（track=True 用跟踪器保持 track_id 稳定）。"""
+        """跑 YOLO 推理，返回 Detection 列表（track=True 用跟踪器保持 track_id 稳定）。
+
+        输出为**纯推理结果**（不做有效性过滤）；有效性（置信/尺寸/成组数量）
+        由链上的检测筛选阶段（Pipeline.det_filter）判定，对全部下游一致生效。
+        """
         if not self.model_path:
-            raise RuntimeError("YOLODetector 未配置 model_path，不能推理（纯后处理模式）")
+            raise RuntimeError("YOLODetector 未配置 model_path，不能推理（外部检测直传模式）")
         if self._model is None:
             from ultralytics import YOLO
             self._model = YOLO(self.model_path)
@@ -344,75 +325,7 @@ class YOLODetector:
                 track_id=int(tid), cls_id=int(r.boxes.cls[i].item()),
                 bbox=tuple(int(v) for v in b), score=float(r.boxes.conf[i].item()),
                 model_path=self.model_path.rsplit("/", 1)[-1]))
-        # 过滤链在输出处生效：置信度/尺寸（filter_conf/min_short/min_long 等）不达标的
-        # 目标视为"未识别"，不进入任何下游（VLM 报送 / 车牌·人脸传递 / 标注 / 计数）。
-        # 顺序保证：逐框过滤在前，class_limits 的按类计数只数过滤后的目标。
-        return [d for d in dets if all(f(d) for f in self.filters)]
-
-    # ---- 向非 VLM 下游传递（统一按识别类型门控） ----
-    def pass_dets(self, dets: List[Detection], ts: float) -> List[Detection]:
-        """按 check_interval（key=识别类型）放行检测结果——向非 VLM 下游（如车牌阶段）
-        传递数据的统一间隔门控，与 process()（VLM 报送）共用同一 gate 状态。
-
-        入参 dets 通常来自 infer()（已在输出处过完滤链，不达标目标不出现）；
-        本方法只做按类间隔门控，不再过滤。
-        同一帧内同一识别类型要么整类放行、要么整类拦截；0=每分析帧都放行。
-        新目标的入场延迟由帧管理取帧间隔与下游自身去重（如车牌按 track）兜底。
-        """
-        out: List[Detection] = []
-        passed: set = set()
-        for d in dets:
-            cls = d.cls_id
-            if cls not in passed and self._gate.allow(cls, ts):
-                self._gate.note(cls, ts)
-                passed.add(cls)
-            if cls in passed:
-                out.append(d)
-        return out
-
-    # ---- 过滤链（可自定义顺序，供纯过滤/dwell 复用） ----
-    def filter_only(self, dets: List[Detection]) -> List[Detection]:
-        """全局过滤链 + 识别对象白名单 + 每类数量范围。数量越界的那一类整体忽略。"""
-        valid = list(dets)
-        for f in self.filters:
-            valid = [d for d in valid if f(d)]
-        if not self.class_limits:
-            return []
-        by_cls: Dict[int, List[Detection]] = {}
-        for d in valid:
-            by_cls.setdefault(d.cls_id, []).append(d)
-        kept: List[Detection] = []
-        for cls, cdets in by_cls.items():
-            lo, hi = self.class_limits.get(cls, (-1, -1))
-            if lo >= 0 and lo <= len(cdets) <= hi:
-                kept += cdets
-        return kept
-
-    # ---- 主入口：dets -> 按识别类型报送 ----
-    def process(self, frame_idx: int, ts: float, dets: List[Detection]) -> List[SubmitRequest]:
-        valid = self.filter_only(dets)
-        if not valid:
-            return []
-        by_cls: Dict[int, List[Detection]] = {}
-        for d in valid:
-            by_cls.setdefault(d.cls_id, []).append(d)
-        reqs: List[SubmitRequest] = []
-        for cls, cdets in sorted(by_cls.items()):
-            # 每类独立计时：一类目标再多也只算一条请求
-            if self._gate.allow(cls, ts):
-                # track_change_only 模式：检查 track_id 是否变化
-                if self.track_change_only:
-                    current_track_ids = {d.track_id for d in cdets if d.track_id > 0}
-                    last_track_ids = self._last_track_ids.get(cls, set())
-                    if current_track_ids == last_track_ids and len(current_track_ids) > 0:
-                        # track_id 无变化，跳过报送
-                        continue
-                    self._last_track_ids[cls] = current_track_ids
-                
-                self._gate.note(cls, ts)
-                ref = f"full:cls{cls}"
-                reqs.append(SubmitRequest(cls, GRAN_CLASS, ref, dets=cdets))
-        return reqs
+        return dets
 
 
 # ---------------- 模块 3: VLM 研判 ----------------
@@ -687,10 +600,60 @@ class Pipeline:
     crop: Optional[object] = None  # 目标裁剪阶段（TargetCrop.run(frame, dets, ts)）
     annotate: Optional[object] = None  # 标注阶段（Annotator.run(frame, dets, ts) -> 带框图）
     plate: Optional[object] = None  # 车牌识别阶段（PlateStage.run(frame, crops, ts)）
+    det_filter: Optional[DetFilter] = None  # 检测筛选阶段（有效性：逐条+成组，2026-10 自 YOLO 迁入）
+    check_interval: float = 3.0  # 向下传递/报送的按类间隔门控（秒/类；0=每分析帧；原 YOLO 参数）
+    track_change_only: bool = False  # 报送抑制：同类 track_id 集合无变化不报送（原 YOLO 参数）
     last_plates: List = field(default_factory=list)  # 最近一帧识别到的车牌（供驱动层读取）
     last_crops: List = field(default_factory=list)  # 最近一帧目标裁剪产物（供驱动层读取）
     last_annotated: object = None  # 最近一帧标注图（供驱动层/VLM 素材读取）
     last_plate_input: List = field(default_factory=list)  # 最近一帧传给车牌阶段的车辆子图（门控后）
+    last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
+
+    def __post_init__(self) -> None:
+        self._gate = IntervalGate(self.check_interval)  # 传递/报送共用节拍（key=类别）
+        self._last_track_ids: Dict[int, set] = {}  # 类别 -> 上次 track_id 集合（track_change_only）
+
+    # ---- 编排：向下传递门控 + 按类报送构造（2026-10 自 YOLODetector 迁入） ----
+    def _pass_dets(self, dets: List[Detection], ts: float) -> List[Detection]:
+        """按 check_interval（key=识别类型）放行检测结果——向非 VLM 下游（如目标裁剪）
+        传递数据的统一间隔门控，与 _submits()（VLM 报送）共用同一 gate 状态。
+
+        入参 dets 应已过检测筛选（有效性）；本方法只做按类间隔门控，不再过滤。
+        同一帧内同一识别类型要么整类放行、要么整类拦截；0=每分析帧都放行。
+        新目标的入场延迟由帧管理取帧间隔与下游自身去重（如车牌按 track）兜底。
+        """
+        out: List[Detection] = []
+        passed: set = set()
+        for d in dets:
+            cls = d.cls_id
+            if cls not in passed and self._gate.allow(cls, ts):
+                self._gate.note(cls, ts)
+                passed.add(cls)
+            if cls in passed:
+                out.append(d)
+        return out
+
+    def _submits(self, dets: List[Detection], ts: float) -> List[SubmitRequest]:
+        """按识别类型（类别）构造报送请求（有效性/成组判定已由检测筛选阶段完成）。
+
+        每类独立计时，一类目标再多也只算一条请求；track_change_only 抑制
+        同类 track_id 集合无变化的重复送审（抑制时不消耗节拍）。
+        """
+        by_cls: Dict[int, List[Detection]] = {}
+        for d in dets:
+            by_cls.setdefault(d.cls_id, []).append(d)
+        reqs: List[SubmitRequest] = []
+        for cls, cdets in sorted(by_cls.items()):
+            if self._gate.allow(cls, ts):
+                if self.track_change_only:
+                    current_track_ids = {d.track_id for d in cdets if d.track_id > 0}
+                    last_track_ids = self._last_track_ids.get(cls, set())
+                    if current_track_ids == last_track_ids and len(current_track_ids) > 0:
+                        continue  # track_id 无变化，跳过报送（不消耗节拍）
+                    self._last_track_ids[cls] = current_track_ids
+                self._gate.note(cls, ts)
+                reqs.append(SubmitRequest(cls, GRAN_CLASS, f"full:cls{cls}", dets=cdets))
+        return reqs
 
     def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
              frame=None, force: bool = False):
@@ -706,11 +669,19 @@ class Pipeline:
         if dets is None and self.yolo is not None and frame is not None:
             dets = self.yolo.infer(frame, track=self.track_needed())
 
+        # 检测筛选阶段：有效性判定（逐条条件 + 成组数量；原 YOLO 输出过滤链）——
+        # 不达标的检测视为"未识别"，对**所有**下游（裁剪/标注/报送/驻留）一致生效。
+        self.last_filter = None
+        if dets and self.det_filter is not None:
+            n_in = len(dets)
+            dets = self.det_filter.run(dets, ts=ts, frame_idx=frame_idx)
+            self.last_filter = (n_in, len(dets))
+
         # 目标裁剪阶段：按上游 YOLO 框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
-        # 传递门控沿用 yolo.pass_dets（按识别类型 check_interval，key=类别）。
+        # 传递门控：按识别类型 check_interval（key=类别），与报送共用同一节拍。
         self.last_crops = []
         if self.crop is not None and frame is not None and dets is not None:
-            gated = self.yolo.pass_dets(dets, ts) if self.yolo is not None else dets
+            gated = self._pass_dets(dets, ts) if self.check_interval else dets
             self.last_crops = list(self.crop.run(frame, gated, ts))
 
         # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）
@@ -720,18 +691,14 @@ class Pipeline:
 
         if self.yolo is not None:
             if self.alarm.kind == ALARM_DWELL and dets is not None:
-                # small_only: 无 VLM，过滤后逐 track 驻留告警
-                for d in self.yolo.filter_only(dets):
+                # small_only: 无 VLM，有效性筛选后逐 track 驻留告警
+                for d in dets:
                     alarms += self.alarm.on_dwell(d.track_id, d.cls_id, ts)
             elif self.crop is not None:
                 pass  # 目标裁剪已产出，供下游阶段消费
-            elif self.plate is not None:
-                # yolo→车牌（无目标裁剪的旧形态）：按识别类型间隔统一门控
-                if dets is not None:
-                    dets = self.yolo.pass_dets(dets, ts)
             elif dets is not None and self.vlm is not None:
-                # 报送请求的唯一消费者是 VLM 阶段（门控在 process() 内生效）
-                submits = self.yolo.process(frame_idx, ts, dets)
+                # 报送请求的唯一消费者是 VLM 阶段（门控在 _submits() 内生效）
+                submits = self._submits(dets, ts)
         elif self.vlm is not None and self.alarm.kind != ALARM_DWELL:
             # large_only: 帧决策即送整帧
             submits = [SubmitRequest(-1, GRAN_SCENE, "full:global")]
@@ -780,13 +747,15 @@ def compose(spec: dict) -> Pipeline:
     extract_rate = spec.get("extract_frame_rate", 3)
     target_actions = spec.get("target_actions", [])
     smooth = spec.get("smooth_frames", 1)
-    filters = spec.get("filters")  # 自定义顺序的过滤链（可选）
+    # 有效性筛选（原 YOLO 过滤链+识别对象数量范围）：逐条谓词 + 成组数量判定
+    det_filter = DetFilter(predicates=spec.get("filters"),       # 自定义顺序过滤链（可选）
+                           group_limits=spec.get("class_limits", {}))  # 空 dict=全拦（旧语义）
 
     if mode == "small_only":
         return Pipeline(
             frame=FrameManager(sampling=SAMPLING_ANALYSIS, frame_skip=extract_rate),
-            yolo=YOLODetector(filters=filters, class_limits=spec.get("class_limits", {}),
-                              **_yolo_kw(spec)),
+            yolo=YOLODetector(**_yolo_kw(spec)),
+            det_filter=det_filter,
             alarm=AlarmPolicy(task_id=tid, kind=ALARM_DWELL, smooth_frames=smooth,
                               alarm_cooldown=spec.get("alarm_cooldown", 60.0)),
         )
@@ -796,10 +765,9 @@ def compose(spec: dict) -> Pipeline:
         # 需送该类 ROI 裁剪时，链路在设计器里 YOLO 之后插入「目标裁剪」阶段。
         return Pipeline(
             frame=FrameManager(sampling=SAMPLING_ANALYSIS, frame_skip=extract_rate),
-            yolo=YOLODetector(filters=filters,
-                              class_limits=spec.get("class_limits", {}),
-                              check_interval=spec.get("check_interval", 3.0),
-                              **_yolo_kw(spec)),
+            yolo=YOLODetector(**_yolo_kw(spec)),
+            det_filter=det_filter,
+            check_interval=spec.get("check_interval", 3.0),
             vlm=VLMAnalyzer(max_resolution=spec.get("vlm_max_resolution", (1280, 720)),
                             prompt=spec.get("vlm_prompt", "")),
             alarm=AlarmPolicy(task_id=tid, kind=ALARM_WINDOW, target_actions=target_actions,

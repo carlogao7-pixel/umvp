@@ -14,8 +14,21 @@ umvp/pipe/         模块 + Pipeline 装配器（FrameManager / YOLODetector / V
                      纯 cv2+numpy 零检测器依赖；旧名 CropRestore/PersonCrop 为兼容别名）
                    + target_crop.py（目标裁剪模块 TargetCrop：按上游检测框裁子图，
                      输出分辨率可配（默认原分辨率）；车牌/人脸/VLM 链共用）
-                   + annotate.py（标注模块 Annotator：在帧上画检测框，供 VLM 看"原图+画框"）
-                   + crop_restore.py（extract_faces 兼容编排，已拆为「目标裁剪+人脸检测」两模块）
+                    + annotate.py（标注模块 Annotator：在帧上画检测框，供 VLM 看"原图+画框"）
+                    + det_filter.py（检测筛选模块 DetFilter：通用下游筛选——逐条条件
+                      DSL 范围比较+与/或/非+括号组合 + 聚合谓词 count(字段)/count(子条件)/
+                      count()（同帧计数）+ 成组数量判定 group_limits，只取舍不改内容；已接入
+                      Pipeline.det_filter 承接原 YOLO 有效性过滤，web 已注册模块页/
+                      设计器阶段，见 doc/modules/检测筛选.md）
+                    + seq_filter.py（时序判定模块 SeqFilter/SeqRule：有序记录流规则确认闸——
+                      单条规则命中即放行/窗口规则 m 秒内 n 次确认才放行，放行时在记录上
+                      标注 event/event_info 字段（事件不造新对象）；二期未接 DB，
+                      OutputPolicy 替代路径见 doc/modules/时序判定.md）
+                    + conditions.py（条件 DSL 引擎：与/或/非/括号嵌套+派生字段
+                      w/h/short/long/area，检测筛选/目标裁剪/标注共用）
+                    + records.py（通用记录 Record 约定 + to_record 对象适配：dict 为
+                      模块间通用语，图像/向量走旁路字段；适配器路线，老模块输出不动）
+                    + crop_restore.py（extract_faces 兼容编排，已拆为「目标裁剪+人脸检测」两模块）
 umvp/face_detect/  SCRFD 人脸检测 + 5点对齐（FaceDetector，含 test_imgs/）
                    + face_pipeline.py（FaceStage 人脸检测阶段：在目标子图检脸 + 原图出原分辨率人脸）
                    + providers.py（公共加载：provider 选择/CUDA 回退/is_gpu，与 face_embed 共用）
@@ -54,19 +67,36 @@ tests/             警用链路测试 + YOLO 参数对比 + 人脸提取链路 +
   不依赖 `~/.hyperlpr3`；`PlateRecognizer(model_root=...)` 可覆盖。hyperlpr3 在 import 时
   会检查 `~/.hyperlpr3/<版本>/` 缺失则联网下载，本模块加载前自动从项目模型同步过去，
   故项目模型在即可完全离线。新克隆用 `umvp/plate_recog/fetch_models.py` 重建。
-- **保留链路**：三条——「警用无人机链路」（PIPE0001，帧管理→YOLO→**标注**→VLM研判→告警）、
-  「车牌识别链路」（PIPE0002，帧管理→YOLO识车→**目标裁剪(裁车)**→车牌识别→告警）与
-  「人脸截取链路」（PIPE0003，帧管理→YOLO识人→**目标裁剪(裁人)**→人脸检测(检脸+原图出脸)；
+- **保留链路**：三条——「警用无人机链路」（PIPE0001，帧管理→YOLO→**检测筛选**→标注→VLM研判→告警）、
+  「车牌识别链路」（PIPE0002，帧管理→YOLO识车→**检测筛选**→**目标裁剪(裁车)**→车牌识别→告警）与
+  「人脸截取链路」（PIPE0003，帧管理→YOLO识人→**检测筛选**→**目标裁剪(裁人)**→人脸检测(检脸+原图出脸)；
   无嵌入/检索/告警，截取落盘即目的；运行器同段代码兼容含 face_embed 的身份去重形态）。
   播种收敛在 server.py `_seed_pipeline()`（幂等，同名跳过，经 `_seed_chain()` 逐条播种；
   已存在链路阶段结构变化时自动重建）；各阶段引用自己的模块 preset。
-- **识别对象有效性过滤归 YOLO**：置信度/尺寸过滤（`filter_conf`/`min_short`/`min_long`）在
-  `YOLODetector.infer()` **输出处**生效——不达标目标视为"未识别"，对**所有**下游
-  （VLM 报送 / 目标裁剪·车牌·人脸传递 / 标注）统一生效，且先于 `class_limits` 按类计数。
+- **识别对象有效性过滤归「检测筛选」（2026-10 起）**：YOLODetector 已收敛为**纯推理**
+  （conf/iou/imgsz/max_det/classes/device/tracker）。置信度/尺寸/成组数量判定由
+  `umvp/pipe/det_filter.py` 的 DetFilter 承担（链路上 YOLO 之后的 `det_filter` 阶段，
+  `Pipeline.det_filter`），不达标目标视为"未识别"，对**所有**下游统一生效。YOLO preset
+  **不再含** filter_conf/min_short/min_long/class_limits（DB 列已删，链路由显式
+  det_filter 阶段承接）。节流（`check_interval`）与 track 变化抑制（`track_change_only`）
+  上移 `Pipeline` 编排，配置面仍挂 YOLO preset。
 - **裁剪职责边界**：YOLO 只检测、不裁剪、不做机械缩放；「目标裁剪」按上游检测框裁子图
   （输出分辨率可配，默认原分辨率），只做机械裁剪与缩放、不做有效性过滤；人脸/车牌的
   二次裁剪（检脸裁脸 / 检牌裁牌）留在各自识别模块内
   （人脸检测 `face_detect.face_pipeline.FaceStage`、车牌识别 `plate_recog.extract_plates`）。
+- **筛选职责边界（2026-10 起）**：「检测筛选 DetFilter」（`umvp/pipe/det_filter.py`）为通用
+  下游筛选（逐条条件 DSL：范围比较+与/或/非+括号，字段别名+派生 w/h/short/long/area；
+  + 聚合谓词 count(字段)/count(子条件)/count()（同帧分组/子条件计数）；+ 成组数量判定
+  group_limits），
+  只取舍不改内容、对象/dict 通吃（经 `records.to_record` 统一视图）；链路上 YOLO 之后
+  的独立 `det_filter` 阶段是有效性过滤的唯一来源（三条保留链路均已插入；YOLO preset
+  不再含有效性参数；web 已注册模块测试页/设计器阶段）。
+  有效性筛选（视为未识别）与消费侧选材（TargetCrop/Annotate 的 classes/filter 决定本阶段
+  用哪些框）两层并存、AND 叠加。节流/报送编排在 Pipeline（见上条）。
+- **通用记录（Record）约定**：模块间通用语为 dict 记录（必备 kind/ts/frame_idx，
+  通用字段 bbox/score/cls_id/track_id/label/text；图像/向量走旁路字段不进 JSON）；
+  老模块对象输出不动，边界处经 `records.to_record()` 适配（dataclass 自动转，
+  特殊类型 `@register_adapter` 注册）。
 - **数据库业务 ID**：presets/pipelines 主键为"前缀+4 位序号"（YOLO0001/FM0001/PIPE0001…），
   新建按前缀自动递增（前缀表见 db.py `_ID_PREFIXES`）；旧整数 schema 由 init_db 检测后
   自动 DROP 重建并重新播种（换机拉代码重启即迁移）。
@@ -128,6 +158,8 @@ $PY umvp/resources.py                     # 资源估算自检（不联网；读
 $PY web_lab/calibrate.py                  # 实测标定（遍历 models/*.pt 生成 out/fingerprints.json，换机必跑）
 $PY tests/test_target_crop.py             # 目标裁剪模块 35 断言（按坐标裁图/分辨率(长边/严格/倍数)/外扩/过滤(含条件DSL)/坐标还原）
 $PY tests/test_annotate.py                # 标注模块 16 断言（画框/classes/条件 DSL/Pipeline 集成）
+$PY tests/test_det_filter.py              # 检测筛选模块 39 断言（DSL 与或非/派生字段/Record 适配；改 conditions.py 后必连跑 target_crop+annotate 回归）
+$PY tests/test_seq_filter.py              # 时序判定模块 30 断言（窗口确认/key 分组/重臂冷却/事件标注/DetFilter 串联）
 $PY tests/test_face_extract_pipeline.py   # 人脸提取链路 28 断言（YOLO 识人→裁人→SCRFD 检脸→坐标还原）
 $PY tests/test_face_capture_pipeline.py   # 人脸截取链路（PIPE0003 形态）39 断言（帧管理门控+逐帧截取）
 $PY tests/test_plate_recog_pipeline.py    # 车牌识别链路 28 断言（整帧识别 + 目标裁剪裁车→识别→还原→原分辨率提取）

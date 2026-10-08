@@ -37,7 +37,6 @@ IMGSZ = 640
 DET_SIZE = "640,640"
 WARMUP = 2          # 预热次数
 REPEAT = 5          # 计时次数，取中位数
-MAX_FACES = 4       # 人脸模型一次批处理张数
 
 
 def _median(xs: list[float]) -> float:

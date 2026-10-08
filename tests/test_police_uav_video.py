@@ -15,8 +15,8 @@ import cv2
 from pipe.composer import (
     FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
     SAMPLING_ANALYSIS,
-    filter_confidence,
 )
+from pipe.det_filter import DetFilter
 
 ALARM_PROMPT = """你是一个警情分析专家。请分析画面中的情况，并以 JSON 格式返回分析结果：
 
@@ -127,14 +127,10 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
     print(f"警用无人机视频测试: {Path(video_path).name}")
     print("=" * 80)
     
-    # 构建链路
+    # 构建链路（YOLO 纯推理；有效性筛选/节流/报送编排在 Pipeline 与检测筛选阶段）
     fm = FrameManager(sampling=SAMPLING_ANALYSIS, frame_skip=15)
-    
+
     yolo = YOLODetector(
-        filters=[filter_confidence(0.35)],
-        class_limits=_class_limits("0:2,300;2:1,300"),
-        check_interval=5.0,
-        track_change_only=True,
         model_path=str(ROOT / "models/yolov8n.pt"),
         conf=0.35,
         iou=0.7,
@@ -143,6 +139,8 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
         classes=[0, 2],
         device=None,
     )
+    det_filter = DetFilter(filter="score >= 0.35",
+                           group_limits=_class_limits("0:2,300;2:2,300"))
     
     vlm = VLMAnalyzer(
         max_resolution=(1280, 720),
@@ -159,7 +157,8 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
         cooldown_by_action=True,
     )
     
-    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm, alarm=alarm)
+    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm, alarm=alarm,
+                    det_filter=det_filter, check_interval=5.0, track_change_only=True)
     
     print(f"✓ 链路构建成功")
     print(f"  - 抽帧间隔: 每 15 帧")

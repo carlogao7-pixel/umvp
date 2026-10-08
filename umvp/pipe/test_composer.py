@@ -3,13 +3,16 @@
 四模块管道拼接验证（纯逻辑，不加载模型）
 
 覆盖:
-  1. small_only —— 驻留告警 + 按类别冷却 + 过滤链
+  1. small_only —— 驻留告警 + 按类别冷却 + 有效性筛选（det_filter）
   2. small_crop —— 按识别类型(类别)报送 + 滑动窗口确认 + 全局冷却
   3. small_full —— 按识别类型送全帧
   4. large_only —— 全局墙钟定时 + 巡检直接落盘
   5. 每类数量上下限 —— 超出上限/不足下限的类别跳过，其它类照常
-  6. 过滤链自定义顺序 —— 不同顺序结果一致（交集语义）
+  6. 有效性筛选（检测筛选阶段承接）—— 谓词链顺序无关 + DSL 等价 + 成组判定
   7. FrameManager 三种取图节奏 —— analysis / wall_clock / frame_count
+  8. IntervalGate 传递门控
+  9. Pipeline 向下传递门控（_pass_dets，与 VLM 报送统一节拍）
+  11. infer 纯推理输出 + 检测筛选阶段过滤（对所有下游生效）
 
 运行: ai 环境 python pipe/test_composer.py
 """
@@ -27,13 +30,12 @@ from pipe.composer import (
     SAMPLING_ANALYSIS,
     SAMPLING_FRAME_COUNT,
     SAMPLING_WALL_CLOCK,
+    AlarmPolicy,
+    Pipeline,
     YOLODetector,
     compose,
-    filter_classes,
-    filter_confidence,
-    filter_min_size,
-    filter_model,
 )
+from pipe.det_filter import DetFilter
 
 
 PASS = 0
@@ -147,17 +149,22 @@ p3 = compose(dict(task_id=8, algo_mode="small_crop", class_limits={},
 s0, _ = p3.step(0, 0.0, [det(1)])
 check("未配置识别对象不报送", len(s0) == 0)
 
-# ============ 6. 过滤链自定义顺序 ============
-print("== 6. 过滤链顺序 ==")
-filters_a = [filter_model("m1"), filter_confidence(0.8), filter_classes([0])]
-filters_b = [filter_classes([0]), filter_model("m1"), filter_confidence(0.8)]
-ya = YOLODetector(filters=filters_a, class_limits={0: (1, 10)}, check_interval=1.0)
-yb = YOLODetector(filters=filters_b, class_limits={0: (1, 10)}, check_interval=1.0)
+# ============ 6. 有效性筛选（检测筛选阶段承接原 YOLO 过滤链） ============
+print("== 6. 有效性筛选 ==")
+pred_a = [lambda d: (not d.model_path or d.model_path == "m1"),
+          lambda d: d.score >= 0.8, lambda d: d.cls_id == 0]
+pred_b = list(reversed(pred_a))  # 顺序无关：交集语义
+dfa = DetFilter(predicates=pred_a, group_limits={0: (1, 10)})
+dfb = DetFilter(predicates=pred_b, group_limits={0: (1, 10)})
 dets = [det(1, 0, 0.9), det(2, 0, 0.5), det(3, 1, 0.9), det(4, 0, 0.9, model="m2")]
-sa = ya.process(0, 0.0, dets)
-sb = yb.process(0, 0.0, dets)
-check("不同顺序结果一致", len(sa) == 1 and len(sb) == 1
-      and sa[0].dets[0].track_id == sb[0].dets[0].track_id == 1)
+ka = dfa.run(dets)
+kb = dfb.run(dets)
+check("谓词链不同顺序结果一致", [d.track_id for d in ka] == [d.track_id for d in kb] == [1])
+dfd = DetFilter(filter="cls_id == 0, score >= 0.8", predicates=[lambda d: d.model_path in (None, "m1")],
+                group_limits={0: (1, 10)})
+check("DSL 与谓词等价（AND 叠加）", [d.track_id for d in dfd.run(dets)] == [1])
+check("成组判定：空表=全拦（旧 class_limits 语义）", DetFilter(group_limits={}).run(dets) == [])
+check("成组判定：None=不判定", [d.track_id for d in DetFilter().run(dets)] == [1, 2, 3, 4])
 
 # ============ 7. FrameManager 三种取图节奏 ============
 print("== 7. FrameManager 节奏 ==")
@@ -194,16 +201,18 @@ for t in (0.5, 1.5, 2.0, 3.9):
         seq.append(t)
 check("门控: 序列放行符合间隔", seq == [2.0], str(seq))
 
-# ============ 9. yolo→下游按识别类型传递门控（pass_dets，与 VLM 报送统一） ============
-print("== 9. pass_dets 按识别类型传递 ==")
-yg = YOLODetector(check_interval=2.0)
+# ============ 9. Pipeline 向下传递门控（_pass_dets，与 VLM 报送统一） ============
+print("== 9. 按识别类型传递 ==")
+pg = Pipeline(frame=FrameManager(frame_skip=1),
+              alarm=AlarmPolicy(task_id=1, kind="inspection"), check_interval=2.0)
 dl = [det(1, cls=0), det(2, cls=0), det(3, cls=2)]
-check("pass_dets: 首帧整类放行", len(yg.pass_dets(dl, 0.0)) == 3)
-check("pass_dets: 间隔内整类拦截", yg.pass_dets(dl, 1.0) == [])
-check("pass_dets: 到间隔再放行", len(yg.pass_dets(dl, 2.0)) == 3)
-yfree = YOLODetector(check_interval=0.0)
-check("pass_dets: interval=0 每帧放行",
-      len(yfree.pass_dets(dl, 0.0)) == 3 and len(yfree.pass_dets(dl, 0.1)) == 3)
+check("传递: 首帧整类放行", len(pg._pass_dets(dl, 0.0)) == 3)
+check("传递: 间隔内整类拦截", pg._pass_dets(dl, 1.0) == [])
+check("传递: 到间隔再放行", len(pg._pass_dets(dl, 2.0)) == 3)
+pf = Pipeline(frame=FrameManager(frame_skip=1),
+              alarm=AlarmPolicy(task_id=1, kind="inspection"), check_interval=0.0)
+check("传递: interval=0 每帧放行",
+      len(pf._pass_dets(dl, 0.0)) == 3 and len(pf._pass_dets(dl, 0.1)) == 3)
 
 # ============ 10. 输出漏斗（OutputPolicy，原告警策略通用化） ============
 print("== 10. 输出漏斗七道闸 ==")
@@ -280,8 +289,8 @@ check("window: 规则不命中不计入滑窗",
       pw.accept(fz(1.0, "西区")) == [] and pw.accept(fz(2.0, "东区")) == []
       and len(pw.accept(fz(3.0, "东区"))) == 1)  # 仅两次规则命中满足窗口
 
-# ============ 11. infer 输出处过滤（置信度+尺寸，对所有下游生效） ============
-print("== 11. infer 输出处过滤 ==")
+# ============ 11. infer 纯推理输出 + 检测筛选阶段过滤（对所有下游生效） ============
+print("== 11. infer 纯推理 + det_filter ==")
 class _Arr:
     """极简数组替身：支持 tolist() 与逐元素 .item()（绕过 numpy/ultralytics 依赖）。"""
     def __init__(self, v): self._v = v
@@ -301,13 +310,30 @@ class _Model:
     def predict(self, frame, **kw): return [self._res]
 
 # 三个框：小目标(10x10)、正常(100x60)、低置信(200x80 @0.3)
-yd = YOLODetector(model_path="x.pt", filters=[filter_confidence(0.5), filter_min_size(0, 50)])
+yd = YOLODetector(model_path="x.pt")
 yd._model = _Model(_Res(_Boxes([[0, 0, 10, 10], [0, 0, 100, 60], [0, 0, 200, 80]],
                                [0, 0, 0], [0.9, 0.9, 0.3])))
 d = yd.infer(None)
-check("infer: 小目标+低置信视为未识别，只留正常框",
-      len(d) == 1 and d[0].bbox == (0, 0, 100, 60), str([x.bbox for x in d]))
-check("infer: 过滤后可直接传递（pass_dets 不再过滤）",
-      len(yd.pass_dets(d, 0.0)) == 1)
+check("infer: 纯推理输出（不过滤，3 框全出）", len(d) == 3)
+dfy = DetFilter(filter="score >= 0.5, long >= 50")
+check("det_filter: 小目标+低置信视为未识别，只留正常框",
+      [x.bbox for x in dfy.run(d)] == [(0, 0, 100, 60)], str([x.bbox for x in dfy.run(d)]))
+# Pipeline 集成：det_filter 对裁剪/标注/报送一致生效
+class _Crop:
+    def __init__(self): self.n = []
+    def run(self, frame, dets, ts): self.n.append(len(dets)); return list(dets)
+cp = _Crop()
+pi = Pipeline(frame=FrameManager(frame_skip=1),
+              alarm=AlarmPolicy(task_id=1, kind="inspection"),
+              yolo=yd, crop=cp, det_filter=DetFilter(filter="score >= 0.5, long >= 50"),
+              check_interval=0.0)
+subs, _ = pi.step(0, 0.0, frame=None, force=True)  # frame=None → 不自推理，dets=None
+yd2 = YOLODetector(model_path="x.pt"); yd2._model = yd._model
+pi2 = Pipeline(frame=FrameManager(frame_skip=1),
+               alarm=AlarmPolicy(task_id=1, kind="inspection"),
+               yolo=yd2, crop=cp, det_filter=DetFilter(filter="score >= 0.5, long >= 50"),
+               check_interval=0.0)
+subs2, _ = pi2.step(0, 0.0, frame=object(), force=True)
+check("Pipeline: 裁剪拿到有效性筛选后的检测", cp.n[-1] == 1)
 
 print(f"\n全部通过: {PASS} 项断言")

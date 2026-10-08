@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from pipe.composer import IntervalGate
 from plate_recog.plate_recognizer import PlateRecognizer, PlateResult, extract_plates

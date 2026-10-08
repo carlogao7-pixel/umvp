@@ -16,13 +16,16 @@
 umvp/                                ← 项目根（独立部署包）
 ├── umvp/                            ← 模块根（管道模块 + 人脸管道，纯 Python + 推理封装）
 │   ├── pipe/
-│   │   ├── composer.py              ← 核心：模块 + 装配器（Frame/YOLO/TargetCrop/Annotate/VLM/Alarm）
+│   │   ├── composer.py              ← 核心：模块 + 装配器（FrameManager/YOLODetector纯推理/VLM/OutputPolicy/Pipeline编排）
 │   │   ├── cropper.py               ← 通用裁剪 Cropper（按框裁图可缩放/坐标还原/原分辨率提取，纯 cv2+numpy）
 │   │   ├── target_crop.py           ← 目标裁剪 TargetCrop（按上游检测框裁子图，输出分辨率可配）
 │   │   ├── annotate.py              ← 标注 Annotator（在帧上画检测框，供 VLM 看"原图+画框"）
-│   │   ├── conditions.py            ← 条件 DSL（框筛选：cls_id/track_id/score）
+│   │   ├── det_filter.py            ← 检测筛选 DetFilter（有效性：逐条条件+成组数量判定）
+│   │   ├── seq_filter.py            ← 时序判定 SeqFilter（窗口确认闸 + 事件标注）
+│   │   ├── conditions.py            ← 条件 DSL 引擎（与/或/非/括号 + 派生 w/h/short/long/area，筛选/裁剪/标注共用）
+│   │   ├── records.py               ← 通用记录 Record 约定 + to_record 对象适配
 │   │   ├── crop_restore.py          ← extract_faces 兼容编排（已拆为「目标裁剪+人脸检测」两模块）
-│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），60 项断言
+│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），64 项断言
 │   ├── face_detect/
 │   │   ├── face_detector.py         ← SCRFD 人脸检测 + 5点对齐裁剪（默认读项目内 face_models/）
 │   │   ├── test_face_detect.py      ← 人脸检测验证（--image/--video/--camera）

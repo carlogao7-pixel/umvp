@@ -34,6 +34,68 @@
 
 ## 记录
 
+### 2026-10-08(四) · 有效性参数从 YOLO preset 撤除，改由链路显式 det_filter 阶段承接（web+DB 收敛）
+- 变更内容：① web `PARAMS["yolo"]` 删除 `filter_conf`/`min_short`/`min_long`/`class_limits`
+  （隐藏页 frame_yolo 同删，另去未用的 check_interval）；删除装配期翻译层
+  `_yolo_dfilter()`，`h_yolo`/`h_frame_yolo` 改为纯推理展示，`_chain_from_spec` 的
+  det_filter 只来自显式 `det_filter` 阶段。② 三条保留链路种子在 YOLO 之后插入
+  `det_filter` 阶段：PIPE0001（DF0001，`group_limits="0:2,300;2:1,300"`）、PIPE0002
+  （DF0002，`filter="long >= 40"` + `group_limits="2:1,300"`）、PIPE0003（DF0003，
+  `filter="long >= 30"` + `group_limits="0:1,300"`），有效性等价。③ 顺带修复
+  `h_plate_recog` 里 `crop_targets(..., min_short=40)` 陈旧参数（target_crop 已无该参数，
+  历史遗留 TypeError 隐患）。
+- 影响面：DB（`preset_params_yolo` 删 4 列；`preset_params_det_filter` 新增 DF0001~0003；
+  三条链路 pipeline_steps 重建含 det_filter；表/列随 schema 双向收敛）、配置/结构
+  （web 模块参数与链路阶段变更；`det_filter` 成为有效性过滤唯一来源）
+- 部署注意：换机/重启 web_lab 服务时 init_db 自动完成（DROP 旧列 / 建参数表 / 重新播种；
+  已存在同名链路阶段结构变化时自动重建重用 preset）。无需手工迁移；行为等价。
+- 验证：起 server（连 DB）→ 实测 `preset_params_yolo` 剩 9 参数列（4 有效性列已删）、
+  `preset_params_det_filter` 有 DF0001~0003 且 filter/group_limits 正确、三条
+  pipeline_steps 顺序为 帧管理→YOLO→det_filter→下游；`_chain_from_spec` 装配冒烟；
+  回归 test_composer(64)/det_filter(59)/seq_filter(30)/target_crop(35)/annotate(16)/
+  police/plate/face 链路全绿。
+
+### 2026-10-08(四) · web 端注册「检测筛选 DetFilter」模块（模块页 + 设计器阶段 + DB 参数表）
+- 变更内容：① `web_lab/server.py` 新增模块 `det_filter`（PARAMS：`filter` 条件 DSL、
+  `group_limits` 成组判定 + 测试专用 `detections`/`ts`；handler `h_det_filter`——
+  模拟检测逐行输入 → 放行/筛掉明细 + 按类统计）。② `_chain_from_spec` 支持显式
+  `det_filter` 阶段（`_det_filter_of()`）：链路里显式配置时优先于 YOLO preset 翻译；
+  无显式阶段则沿用翻译路径。③ 链路时间线（批量 + 流式）新增「检测筛选」段，展示
+  本帧筛掉量（`Pipeline.last_filter` 统计，仅显式阶段时输出）。④ `db.py`
+  `_ID_PREFIXES` 加 `"det_filter": "DF"`。⑤ web 模块页/设计器由 `/api/schema`
+  动态驱动，无需改前端 HTML。
+- 影响面：DB（新参数表 `preset_params_det_filter`、preset 前缀 `DF`，启动 init_db
+  自动建表）、结构（web 模块/设计器阶段新增；`Pipeline` 加 `last_filter` 只读统计）
+- 部署注意：换机拉代码重启 web_lab 服务即自动建表；无依赖/模型变化。既有链路不配
+  显式 `det_filter` 阶段时行为不变（仍走 YOLO preset 翻译）。
+- 验证：`conda run -n ai python` 起 server（--no-db 与连 DB 两种）→ `/api/schema`
+  含 det_filter、`/api/test/det_filter` 返回明细正确、`/api/presets/save` 分配 `DF0001`
+  且 `preset_params_det_filter` 表存在（已清理测试 preset）；`_chain_from_spec`
+  显式阶段优先级冒烟；test_composer(64)/det_filter(39)/seq_filter(30) 全绿。
+
+### 2026-10-08(四) · YOLO 收敛为纯推理；有效性过滤归检测筛选、节流/报送编排上移 Pipeline
+- 变更内容：① `YOLODetector` 删除 `filters`/`class_limits`/`check_interval`/
+  `track_change_only` 及 `process()`/`pass_dets()`/`filter_only()`——只保留推理参数
+  （model_path/conf/iou/imgsz/max_det/classes/device/tracker）与 `infer()`（纯推理输出）。
+  ② 新增「检测筛选 DetFilter」成组数量判定 `group_limits` + 谓词口 `predicates`；接入
+  `Pipeline.det_filter` 阶段接管有效性过滤（原 YOLO 过滤链）。③ `Pipeline` 新增
+  `det_filter`/`check_interval`/`track_change_only` 及 `_pass_dets()`/`_submits()`——
+  向下传递节流与按类 `SubmitRequest` 构造上移装配器。④ web_lab 装配期翻译：
+  `_yolo_dfilter()` 把 preset 的 filter_conf/min_short/min_long→筛选条件、
+  class_limits→group_limits；`_chain_from_spec`/h_yolo/h_yolo_video 相应改造。
+  ⑤ 行为统一（唯一变化点）：成组数量判定此前只作用于报送/dwell，现对**所有**下游
+  一致生效；空 `class_limits`（未配置识别对象）的自定义链路此前传递路径仍放行，
+  现统一视为未识别。三条保留链路均配非空 class_limits，行为不变。
+- 影响面：结构（`umvp/pipe/det_filter.py` 语义扩展；无新目录）、配置（compose/Pipeline
+  参数与编排；preset 参数名/默认值不变，DB schema 不变）
+- 部署注意：无需迁移 DB/模型/依赖；换机拉代码重启即生效。自建链路若依赖"空
+  class_limits 仍向裁剪/车牌传检测"，需改为配非空 class_limits 或接受新统一语义。
+- 验证：`test_composer.py`(64)、`test_det_filter.py`(39)、`test_seq_filter.py`(30)、
+  `test_police_uav_pipeline.py`、`test_plate_recog_pipeline.py`(28)、
+  `test_face_extract_pipeline.py`(28)、`test_face_capture_pipeline.py`(39)、
+  `test_yolo_standalone.py`、`test_police_uav_video.py 人群1.MP4`（端到端有报送/告警）、
+  及其余模块回归（target_crop/annotate/cropper）全绿。
+
 ### 2026-09-23(七) · 识别对象有效性过滤统一到 YOLO 输出处；裁剪模块去过滤
 - 变更内容：① `YOLODetector.infer()` 返回前套过滤链（`filter_conf`/`min_short`/`min_long`/
   自定义 `filters`）——不达标目标**视为"未识别"**，对**所有下游**（VLM 报送 / 目标裁剪·

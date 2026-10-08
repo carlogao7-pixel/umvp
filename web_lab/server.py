@@ -50,7 +50,6 @@ MODELS_DIR = ROOT / "models"
 PIC_DIR = ROOT / "tests/data/pic"
 VID_DIR = ROOT / "tests/data/vid"
 TEST_IMGS = UMVP / "face_detect" / "test_imgs"
-OUT_DIR = ROOT / "tests/data/out"
 
 import cv2  # noqa: E402  （cv2 起步即用；ultralytics/insightface 保持惰性）
 import numpy as np  # noqa: E402
@@ -343,37 +342,27 @@ def h_frame_manager(p: dict) -> dict:
 
 
 def h_yolo(p: dict) -> dict:
-    from pipe.composer import YOLODetector, filter_confidence, filter_min_size
+    from pipe.composer import YOLODetector
     img_path, frame = _load_frame(p)
     model = _find_file(p.get("model_path", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
-    filters = []
-    fc = _float(p, "filter_conf", 0.0)
-    if fc > 0:
-        filters.append(filter_confidence(fc))
-    ms, ml = _int(p, "min_short", 0), _int(p, "min_long", 0)
-    if ms > 0 or ml > 0:
-        filters.append(filter_min_size(ms, ml))
-    yolo = YOLODetector(filters=filters,
-                        class_limits=_class_limits(p.get("class_limits", "")),
-                        check_interval=_float(p, "check_interval", 3.0),
-                        model_path=str(model),
+    yolo = YOLODetector(model_path=str(model),
                         conf=_float(p, "conf", 0.35), iou=_float(p, "iou", 0.7),
                         imgsz=_int(p, "imgsz", 640), max_det=_int(p, "max_det", 300),
                         classes=_int_list(p, "classes", None),
                         device=str(p.get("device", "")).strip() or None)
     t0 = time.time()
-    dets = yolo.infer(frame)
+    dets = yolo.infer(frame)  # 纯推理（有效性筛选由「检测筛选」模块承担）
     dt = time.time() - t0
-    valid = yolo.filter_only(dets)
-    submits = yolo.process(0, _float(p, "ts", 0.0), dets)
+    by_cls: dict = {}
+    for d in dets:
+        by_cls.setdefault(d.cls_id, []).append(d)
 
     canvas = frame.copy()
     _draw_dets(canvas, dets)
+    cls_desc = "、".join(f"cls{c}×{len(v)}" for c, v in sorted(by_cls.items())) or "无"
     text = [f"模型: {model.name} | 图片: {img_path.name}",
-            f"推理耗时: {dt:.2f}s | 检出 {len(dets)} 个",
-            f"过滤链后有效: {len(valid)} | 报送请求: {len(submits)}"]
-    for s in submits:
-        text.append(f"  → {s.ref} (gran={s.gran}, 该类目标数={len(s.dets)})")
+            f"推理耗时: {dt:.2f}s | 检出 {len(dets)} 个（{cls_desc}）",
+            "（纯推理输出；有效性筛选请用「检测筛选 DetFilter」模块）"]
     rows = [[i, d.track_id, d.cls_id, f"{d.score:.3f}", str(d.bbox),
              f"{d.bbox[2] - d.bbox[0]}x{d.bbox[3] - d.bbox[1]}"]
             for i, d in enumerate(dets)]
@@ -381,6 +370,66 @@ def h_yolo(p: dict) -> dict:
                "rows": rows}] if rows else []
     return res(text="\n".join(text),
                images=[{"title": "检测标注", "data": _img_data_url(canvas)}], tables=tables)
+
+
+def _det_filter_of(p: dict):
+    """det_filter 参数（filter 条件 DSL + group_limits 成组判定）→ DetFilter 实例。
+
+    group_limits 空 = 不判定（None）；非空 = 成组数量判定（越界/未登记类别剔除）。
+    """
+    from pipe.det_filter import DetFilter
+    gl_text = str(p.get("group_limits", "") or "").strip()
+    return DetFilter(filter=_str_param(p, "filter"),
+                     group_limits=(_class_limits(gl_text) if gl_text else None))
+
+
+def h_det_filter(p: dict) -> dict:
+    """检测筛选模块测试页：模拟检测列表 → 逐条筛选 + 成组判定 → 放行/筛掉明细。"""
+    from pipe.composer import Detection
+    try:
+        df = _det_filter_of(p)
+    except ValueError as e:
+        return res(ok=False, error=f"条件无法解析：{e}")
+    lines = [l.strip() for l in str(p.get("detections", "") or "").splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        return res(ok=False, error="请输入模拟检测（每行: 类别,track,置信度,x1,y1,x2,y2，"
+                                   "如 '0,1,0.9,100,100,200,200'）")
+    dets = []
+    for i, line in enumerate(lines, 1):
+        parts = [x.strip() for x in line.replace("，", ",").split(",") if x]
+        try:
+            if len(parts) != 7:
+                raise ValueError("应为 7 个数字：类别,track,置信度,x1,y1,x2,y2")
+            vals = [float(x) for x in parts]
+            dets.append(Detection(track_id=int(vals[1]), cls_id=int(vals[0]),
+                                  bbox=tuple(int(v) for v in vals[3:7]), score=vals[2]))
+        except ValueError as e:
+            return res(ok=False, error=f"第 {i} 行无法解析: {line!r}（{e}）")
+    ts = _float(p, "ts", 0.0)
+    keep = df.run(dets, ts=ts, frame_idx=0)
+    keep_ids = {id(d) for d in keep}
+    by_cls_in: dict = {}
+    by_cls_out: dict = {}
+    for d in dets:
+        by_cls_in[d.cls_id] = by_cls_in.get(d.cls_id, 0) + 1
+    for d in keep:
+        by_cls_out[d.cls_id] = by_cls_out.get(d.cls_id, 0) + 1
+    text = [f"输入 {len(dets)} 条 | 放行 {len(keep)} 条 | 筛掉 {len(dets) - len(keep)} 条",
+            f"条件: {df.filter or '（空=不筛选）'} | 成组判定: "
+            + ("；".join(f"cls{c}:{lo},{hi}" for c, (lo, hi) in sorted(df.group_limits.items()))
+               if df.group_limits else "（空=不判定）"),
+            "按类: " + "、".join(f"cls{c} {by_cls_out.get(c, 0)}/{by_cls_in[c]}"
+                                 for c in sorted(by_cls_in))]
+    rows = [[i, d.cls_id, d.track_id, f"{d.score:.3f}",
+             f"{d.bbox[2] - d.bbox[0]}x{d.bbox[3] - d.bbox[1]}",
+             min(d.bbox[2] - d.bbox[0], d.bbox[3] - d.bbox[1]),
+             "✓ 放行" if id(d) in keep_ids else "✗ 筛掉"]
+            for i, d in enumerate(dets)]
+    tables = [{"title": "逐条判定", "headers": ["#", "类别", "track", "置信度", "尺寸",
+                                                "短边", "结果"],
+               "rows": rows}]
+    return res(text="\n".join(text), tables=tables)
 
 
 def h_vlm(p: dict) -> dict:
@@ -570,7 +619,7 @@ def h_plate_recog(p: dict) -> dict:
                             classes=_int_list(p, "yolo_classes", [2]))
         dets = yolo.infer(frame, track=False)  # 测试页脚手架：造车辆框（生产由上游 yolo 阶段提供）
         # 目标裁剪：按车辆框裁车（测试页内联；生产链路由独立「目标裁剪」阶段完成）
-        crops = crop_targets(frame, dets, scale=2.0, margin=0.1, min_short=40,
+        crops = crop_targets(frame, dets, scale=2.0, margin=0.1,
                              classes=_int_list(p, "yolo_classes", [2]))
         tool = Cropper(upscale=1.0, margin=_float(p, "margin", 0.1))
         plates = extract_plates(frame, crops, rec, tool,
@@ -712,24 +761,14 @@ def h_frame_yolo(p: dict) -> dict:
     """
     from pipe.composer import (
         FrameManager, YOLODetector, SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK,
-        SAMPLING_FRAME_COUNT, filter_confidence, filter_min_size,
+        SAMPLING_FRAME_COUNT,
     )
     model = _find_file(p.get("model_path", ""), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
     fm = FrameManager(sampling=p.get("sampling", SAMPLING_ANALYSIS),
                       frame_skip=_int(p, "frame_skip", 3),
                       interval_sec=_float(p, "interval_sec", 3.0),
                       interval_frames=_int(p, "interval_frames", 30))
-    filters = []
-    fc = _float(p, "filter_conf", 0.0)
-    if fc > 0:
-        filters.append(filter_confidence(fc))
-    ms, ml = _int(p, "min_short", 0), _int(p, "min_long", 0)
-    if ms > 0 or ml > 0:
-        filters.append(filter_min_size(ms, ml))
-    yolo = YOLODetector(filters=filters,
-                        class_limits=_class_limits(p.get("class_limits", "")),
-                        check_interval=_float(p, "check_interval", 3.0),
-                        model_path=str(model),
+    yolo = YOLODetector(model_path=str(model),
                         conf=_float(p, "conf", 0.35), iou=_float(p, "iou", 0.7),
                         imgsz=_int(p, "imgsz", 640), max_det=_int(p, "max_det", 300),
                         classes=_int_list(p, "classes", None),
@@ -744,7 +783,7 @@ def h_frame_yolo(p: dict) -> dict:
         cap.release()
         return res(ok=False, error=f"无法打开视频: {vid}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    read = analyzed = total_det = total_valid = submits_total = 0
+    read = analyzed = total_det = 0
     max_det_once = 0
     cls_counts: dict = {}
     track_seen: dict = {}  # track_id -> [出现过的帧号, ...]
@@ -766,11 +805,7 @@ def h_frame_yolo(p: dict) -> dict:
         t0 = time.time()
         dets = yolo.infer(frame, track=track)
         infer_times.append(time.time() - t0)
-        valid = yolo.filter_only(dets)
-        submits = yolo.process(n, ts, dets)
-        submits_total += len(submits)
         total_det += len(dets)
-        total_valid += len(valid)
         max_det_once = max(max_det_once, len(dets))
         ids = {d.track_id for d in dets if d.track_id}
         for d in dets:
@@ -779,7 +814,7 @@ def h_frame_yolo(p: dict) -> dict:
                 track_seen.setdefault(d.track_id, []).append(n)
         per_cls = " ".join(f"c{k}:{sum(1 for d in dets if d.cls_id == k)}"
                            for k in sorted({d.cls_id for d in dets}))
-        rows.append([n, len(dets), len(valid), len(ids), len(submits), per_cls])
+        rows.append([n, len(dets), len(ids), per_cls])
         if len(images) < 4:
             canvas = frame.copy()
             _draw_tracks(canvas, dets)
@@ -799,14 +834,14 @@ def h_frame_yolo(p: dict) -> dict:
         f"视频: {vid.name} | 模型: {model.name} | 跟踪: {'BOTSORT 开' if track else '关'}",
         f"读取帧 {read} | 分析帧 {analyzed}（取图率 {analyzed / max(read, 1) * 100:.0f}%）",
         f"检出目标 {total_det}（平均 {avg_det:.1f}/帧，单帧最多 {max_det_once} 个）",
-        f"过滤后有效 {total_valid} | 报送请求 {submits_total} | 按类累计: {cls_summary}",
+        f"按类累计: {cls_summary}",
         f"唯一 track 数 {len(track_seen)}（跨≥2帧的稳定 track {stable} 个）",
         f"平均推理耗时 {avg_ms:.0f}ms/帧（首帧含模型加载）",
     ])
     tables = []
     if rows:
-        tables.append({"title": "逐帧时间线", "headers": ["帧号", "检出", "有效",
-                        "独立track", "报送", "各类别计数"], "rows": rows})
+        tables.append({"title": "逐帧时间线", "headers": ["帧号", "检出",
+                        "独立track", "各类别计数"], "rows": rows})
     if track and track_len:
         tables.append({"title": "track 汇总（按出现帧数排序）",
                        "headers": ["track_id", "出现帧数", "首帧", "末帧", "跨度(帧)"],
@@ -1052,6 +1087,13 @@ def h_pipeline_run(p: dict) -> dict:
         # 帧管理：帧决策（放行本帧）
         if "frame_manager" in _stage_order:
             _emit("frame", tag, ts, stage="frame_manager", frame_no=frame_no, log_line=True)
+
+        # 检测筛选：有效性判定（显式阶段时展示筛掉量；翻译路径不额外刷日志）
+        if "det_filter" in _stage_order:
+            fi = getattr(pipe, "last_filter", None)
+            if fi is not None and fi[0] != fi[1]:
+                _emit("info", f"有效性筛选 {fi[0]} → {fi[1]}（筛掉 {fi[0] - fi[1]} 条）", ts,
+                      stage="det_filter", frame_no=frame_no, log_line=True, prefix="    ")
 
         # YOLO 识别：检出统计 +（向下游）报送/传递
         if "yolo" in _stage_order:
@@ -1345,7 +1387,7 @@ def _chain_from_spec(spec: dict):
     from pipe.composer import (
         FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
         SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
-        filter_confidence, filter_min_size, backpressure_params,
+        backpressure_params,
     )
     stages = spec.get("stages") or []
     by_mod: dict = {}
@@ -1391,20 +1433,15 @@ def _chain_from_spec(spec: dict):
         # 人脸链等无告警阶段：占位策略（不产生告警，Pipeline.step 需要）
         alarm = AlarmPolicy(task_id=1, kind="inspection")
     yolo = None
+    det_filter = None
+    if "det_filter" in by_mod:
+        # 检测筛选阶段（有效性过滤的唯一来源；group_limits 空=不判定）
+        det_filter = _det_filter_of(_one("det_filter"))
     if "yolo" in by_mod:
         yp = _one("yolo")
         model = _find_file(_str_param(yp, "model_path"), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
-        filters = []
-        fc = _float(yp, "filter_conf", 0.0)
-        if fc > 0:
-            filters.append(filter_confidence(fc))
-        ms, ml = _int(yp, "min_short", 0), _int(yp, "min_long", 0)
-        if ms > 0 or ml > 0:
-            filters.append(filter_min_size(ms, ml))
+        # YOLO 纯推理；节流/track 抑制在 Pipeline 编排
         yolo = YOLODetector(
-            filters=filters, class_limits=_class_limits(_str_param(yp, "class_limits")),
-            check_interval=_float(yp, "check_interval", 3.0),
-            track_change_only=_bool(yp, "track_change_only"),
             model_path=str(model), conf=_float(yp, "conf", 0.35),
             iou=_float(yp, "iou", 0.7), imgsz=_int(yp, "imgsz", 640),
             max_det=_int(yp, "max_det", 300), classes=_int_list(yp, "classes", None),
@@ -1446,7 +1483,12 @@ def _chain_from_spec(spec: dict):
             track_dedup=(True if td in (None, "") else _bool(pp, "track_dedup")),
             track_cooldown=_float(pp, "track_cooldown", 5.0))
     return Pipeline(frame=fm, alarm=alarm, yolo=yolo, vlm=vlm,
-                    crop=crop, annotate=annotate, plate=plate)
+                    crop=crop, annotate=annotate, plate=plate,
+                    det_filter=det_filter,
+                    check_interval=(_float(_one("yolo"), "check_interval", 3.0)
+                                    if "yolo" in by_mod else 3.0),
+                    track_change_only=(_bool(_one("yolo"), "track_change_only")
+                                       if "yolo" in by_mod else False))
 
 
 # ---------------- 实时播放叠加：SSE 流式链路运行（方案 B） ----------------
@@ -1584,6 +1626,11 @@ def h_chain(p: dict) -> dict:
         """逐模块展示本帧处理内容（不管是否向下传递），每条带帧序数。"""
         if "frame_manager" in _so:
             log.append(_tag("frame_manager") + f"帧#{frame_no} 放行 ts={ts:.2f}s")
+        if "det_filter" in _so:
+            fi = getattr(pipe, "last_filter", None)
+            if fi is not None and fi[0] != fi[1]:
+                log.append("    " + _tag("det_filter")
+                           + f"帧#{frame_no} 有效性筛选 {fi[0]} → {fi[1]}（筛掉 {fi[0] - fi[1]} 条）")
         if "yolo" in _so:
             by_cls = {}
             for d in dets or []:
@@ -1755,21 +1802,30 @@ PARAMS = {
                     "help": "COCO: 0=人, 2=车"},
         "device": {"label": "推理设备（空=自动）", "type": "str", "default": "",
                    "help": "如 cpu 或 0"},
-        "filter_conf": {"label": "过滤链：置信度下限（0=不启用）", "type": "float", "default": 0.0,
-                        "help": "低于它的检出视为未识别（对所有下游生效，先于按类数量统计）"},
-        "min_short": {"label": "过滤链：短边最小像素（0=不启用）", "type": "int", "default": 0,
-                      "help": "目标短边小于它视为未识别（碎框/噪声过滤）"},
-        "min_long": {"label": "过滤链：长边最小像素（0=不启用）", "type": "int", "default": 0,
-                     "help": "目标长边小于它视为未识别（小目标过滤）"},
-        "class_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
-                         "default": "0:1,300", "help": "类别:下限,上限，分号分隔；数量按过滤后该类目标数算，不在范围内该类整体不报送；空=不报送"},
-        "check_interval": {"label": "报送节拍（秒/类）", "type": "float", "default": 3.0,
-                           "help": "同一类别每隔几秒才报一次，避免刷屏"},
+        "check_interval": {"label": "传递/报送节拍（秒/类）", "type": "float", "default": 3.0,
+                           "help": "Pipeline 编排：同一类别每隔几秒才向下游传/报送一次，避免刷屏"},
         "track_change_only": {"label": "只在 track_id 变化时报送", "type": "bool", "default": False,
                               "help": "开启后，只有 track_id 发生变化时才报送 VLM（需要启用跟踪）"},
         "ts": {"label": "报送时间戳（秒）", "type": "float", "default": 0.0,
                "test_only": True,
                "help": "本帧的时间戳，随报送结果一起带出"},
+    },
+    "det_filter": {
+        "filter": {"label": "筛选条件（条件 DSL）", "type": "text", "default": "",
+                   "help": "如 'cls_id in 0|2, short >= 30'；组内逗号=并且、分号=或者、not=非、括号分组；"
+                            "字段 cls_id/track_id/score + 派生 w/h/short/long/area + ts/帧号；"
+                            "聚合 count(字段)/count(子条件)/count()（同帧计数，如 'count(cls_id) >= 2'、"
+                            "'count(cls_id == 0, score >= 0.5) >= 2'）；空=不筛选"},
+        "group_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
+                         "default": "",
+                         "help": "成组数量判定：类别:下限,上限，分号分隔；数量越界/未登记的类别整类视为未识别；"
+                                 "空=不判定（等价 count 聚合谓词，见检测筛选.md）"},
+        "detections": {"label": "模拟检测（每行一条）", "type": "text", "default": "",
+                       "test_only": True,
+                       "help": "每行: 类别,track,置信度,x1,y1,x2,y2（如 '0,1,0.9,100,100,200,200'）"},
+        "ts": {"label": "帧时间戳（秒）", "type": "float", "default": 0.0,
+               "test_only": True,
+               "help": "条件里可用 ts（如 'ts >= 10' 表示 10 秒后才开始放行）"},
     },
     "vlm": {
         "max_resolution": {"label": "送审缩放上限（宽,高）", "type": "str", "default": "1280,720",
@@ -2043,21 +2099,6 @@ PARAMS = {
         "classes": {"label": "类别白名单（逗号分隔，空=不限）", "type": "str", "default": "0",
                     "group": "YOLO 识别 YOLODetector",
                     "help": "COCO: 0=人, 2=车"},
-        "filter_conf": {"label": "过滤链：置信度下限（0=不启用）", "type": "float",
-                        "default": 0.0, "group": "YOLO 识别 YOLODetector",
-                        "help": "低于它的检出直接丢弃，不参与报送"},
-        "min_short": {"label": "过滤链：短边最小像素（0=不启用）", "type": "int", "default": 0,
-                      "group": "YOLO 识别 YOLODetector",
-                      "help": "目标短边小于它就不报送"},
-        "min_long": {"label": "过滤链：长边最小像素（0=不启用）", "type": "int", "default": 0,
-                     "group": "YOLO 识别 YOLODetector",
-                     "help": "目标长边小于它就不报送"},
-        "class_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
-                         "default": "0:1,300", "group": "YOLO 识别 YOLODetector",
-                         "help": "类别:下限,上限，分号分隔；空=不报送"},
-        "check_interval": {"label": "报送节拍（秒/类）", "type": "float", "default": 3.0,
-                           "group": "YOLO 识别 YOLODetector",
-                           "help": "同一类别每隔几秒才报一次，避免刷屏"},
     },
 }
 
@@ -2068,8 +2109,14 @@ MODULES = {
         "params": PARAMS["frame_manager"], "handler": h_frame_manager},
     "yolo": {
         "name": "小模型识别 YOLODetector", "group": "管道四模块",
-        "desc": "复用 pipe.composer.YOLODetector：推理 + 过滤链 + 按类报送。",
+        "desc": "复用 pipe.composer.YOLODetector：**纯推理**（有效性过滤归「检测筛选」阶段，节流/报送编排在 Pipeline）。",
         "params": PARAMS["yolo"], "handler": h_yolo},
+    "det_filter": {
+        "name": "检测筛选 DetFilter", "group": "管道四模块",
+        "desc": "复用 pipe.det_filter.DetFilter：有效性筛选（逐条条件 DSL：范围+与/或/非+派生尺寸量"
+                "+ 聚合 count(字段)/count(子条件)/count()；+ 成组数量判定）。"
+                "链路里插在 YOLO 之后；有效性过滤的唯一来源（空条件+空上下限=不筛选）。",
+        "params": PARAMS["det_filter"], "handler": h_det_filter},
     "target_crop": {
         "name": "目标裁剪 TargetCrop", "group": "管道四模块",
         "desc": "按上游检测框裁子图（输出分辨率可配，默认原分辨率）；"
@@ -2783,9 +2830,10 @@ _SEED_STAGES = [
     ("yolo", "警用无人机·YOLO识别", {
         "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
         "imgsz": 1280, "max_det": 300, "classes": "0,2", "device": "",
-        "filter_conf": 0.0, "min_short": 0, "min_long": 0,
-        "class_limits": "0:2,300;2:1,300", "check_interval": 3.0,
-        "track_change_only": False}),
+        "check_interval": 3.0, "track_change_only": False}),
+    # 检测筛选：人≥2 才报、车≥1 才报（有效性对全下游生效）
+    ("det_filter", "警用无人机·检测筛选", {
+        "filter": "", "group_limits": "0:2,300;2:1,300"}),
     # 标注：把检出框画在原帧上，供 VLM 看"原图 + 画框"
     ("annotate", "警用无人机·标注", {
         "thickness": 2, "show_label": True, "classes": "", "filter": ""}),
@@ -2814,9 +2862,10 @@ _SEED_PLATE_STAGES = [
     ("yolo", "车牌识别·YOLO识车", {
         "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
         "imgsz": 1280, "max_det": 300, "classes": "2", "device": "",
-        "filter_conf": 0.0, "min_short": 0, "min_long": 40,
-        "class_limits": "2:1,300", "check_interval": 0.0,
-        "track_change_only": False}),
+        "check_interval": 0.0, "track_change_only": False}),
+    # 检测筛选：车长边≥40 才有效（小目标视为未识别）
+    ("det_filter", "车牌识别·检测筛选", {
+        "filter": "long >= 40", "group_limits": "2:1,300"}),
     # 目标裁剪：按 YOLO 车辆框裁车放大 2×（供车牌识别在车图里裁车牌）
     ("target_crop", "车牌识别·目标裁剪", {
         "out_size": "×2", "margin": 0.1,
@@ -2845,9 +2894,10 @@ _SEED_FACE_STAGES = [
     ("yolo", "人脸截取·YOLO识人", {
         "model_path": "models/yolov8n.pt", "conf": 0.3, "iou": 0.6,
         "imgsz": 1280, "max_det": 300, "classes": "0", "device": "",
-        "filter_conf": 0.0, "min_short": 0, "min_long": 30,
-        "class_limits": "0:1,300", "check_interval": 0.0,
-        "track_change_only": False}),
+        "check_interval": 0.0, "track_change_only": False}),
+    # 检测筛选：人长边≥30 才有效（小目标视为未识别）
+    ("det_filter", "人脸截取·检测筛选", {
+        "filter": "long >= 30", "group_limits": "0:1,300"}),
     # 目标裁剪：按 YOLO 人框裁人（供人脸检测在子图里检脸）
     ("target_crop", "人脸截取·目标裁剪", {
         "out_size": "", "margin": 0.0,

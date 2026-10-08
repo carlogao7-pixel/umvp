@@ -10,7 +10,8 @@
 | 模块 | 作用 | 关键参数（默认值） |
 |---|---|---|
 | FrameManager 帧管理 | 取帧节奏 + 背压 | sampling(analysis/wall_clock/frame_count)、frame_skip(3)、interval_sec(3.0)、interval_frames(30)、queue_threshold(32)、backpressure_multiplier(2)、adaptive_relax_ratio(1.2)、adaptive_recover_ratio(0.5) |
-| YOLODetector 小模型 | 框出目标（COCO：0=人 2=车）；过滤链在 infer() 输出处生效（视为未识别，对所有下游生效） | model_path、conf(0.35)、iou(0.7)、imgsz(640)、max_det(300)、classes("0")、filter_conf(0)、min_short(0)、min_long(0)、class_limits("0:1,300")、check_interval(3.0)、track_change_only(仅在 track_id 变化时报送) |
+| YOLODetector 小模型 | **纯推理**框出目标（COCO：0=人 2=车）；不做有效性过滤/报送 | model_path、conf(0.35)、iou(0.7)、imgsz(640)、max_det(300)、classes("0")、device |
+| DetFilter 检测筛选 | 有效性筛选：逐条条件 DSL（范围+与/或/非+括号+派生 w/h/short/long/area）+ 聚合 count(字段)/count(子条件)/count() + 成组数量判定 group_limits；链路里 YOLO 之后的独立阶段（有效性过滤唯一来源） | filter("")、group_limits(None)、predicates([]) |
 | TargetCrop 目标裁剪 | 按上游检测框裁子图（输出分辨率可配，默认原分辨率；只机械裁剪，不做有效性过滤） | out_size(""，640=长边/640,480=严格/×2=倍数)、margin(0.0)、classes("")、filter(""，条件DSL如 track_id == 1) |
 | Annotator 标注 | 在帧副本上画检测框（供 VLM 看"原图+画框"） | thickness(2)、show_label(True)、classes("")、filter(""，条件DSL如 track_id == 1) |
 | VLMAnalyzer 大模型 | 语义研判 + 素材准备 | max_resolution("1280,720")、prompt、ref(full:cls0/full:global)、use_real_vlm、vlm_endpoint、vlm_model(qwen3-vl-32b) |

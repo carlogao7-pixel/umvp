@@ -37,7 +37,6 @@ except ImportError:  # pragma: no cover - 脚本运行时的兜底
 DEFAULT_MODEL_ROOT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "face_models"
 )
-DEFAULT_PACK_NAME = "buffalo_l"
 DEFAULT_DET_NAME = "det_10g.onnx"
 
 # 按 pack 优先级依次尝试（优先大模型，缺哪个用哪个）

@@ -22,7 +22,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]  # umvp 项目根
 sys.path.insert(0, str(ROOT / "umvp"))
 
-from pipe.composer import YOLODetector, filter_min_size
+from pipe.composer import YOLODetector
+from pipe.det_filter import DetFilter
 from pipe.cropper import Cropper
 from pipe.target_crop import crop_targets, TargetCrop
 from plate_recog.plate_recognizer import PlateRecognizer, extract_plates
@@ -92,11 +93,11 @@ def main() -> None:
         _draw(frame, direct, f"{stem}_direct")
 
         # ---- 2. 目标裁剪(裁车) → 车牌识别(裁车牌+识别) → 坐标还原 ----
-        # 小目标过滤归 YOLO 输出处（长边 <40 视为未识别），裁剪模块只做机械裁剪
+        # 小目标过滤归检测筛选（长边 <40 视为未识别），裁剪模块只做机械裁剪
         yolo = YOLODetector(model_path=str(YOLO_MODEL), conf=0.25, iou=0.6,
-                            imgsz=1280, max_det=300, classes=[CLS_CAR],
-                            filters=[filter_min_size(0, 40)])
-        dets = yolo.infer(frame, track=False)  # 上游 yolo 模块的输出（已过滤）
+                            imgsz=1280, max_det=300, classes=[CLS_CAR])
+        dets = yolo.infer(frame, track=False)  # 纯推理输出
+        dets = DetFilter("long >= 40").run(dets)  # 有效性筛选（视为未识别）
         crops = crop_targets(frame, dets, scale=2.0, margin=0.1,
                              classes=[CLS_CAR])  # 目标裁剪
         tool = Cropper(upscale=1.0, margin=0.1)
@@ -130,12 +131,13 @@ def main() -> None:
 
     frame = cv2.imread(str(DATA / "车牌620.jpg"))
     yolo = YOLODetector(model_path=str(YOLO_MODEL), conf=0.25, iou=0.6, imgsz=1280,
-                        max_det=300, classes=[CLS_CAR], filters=[filter_min_size(0, 40)])
+                        max_det=300, classes=[CLS_CAR])
     crop_stage = TargetCrop(scale=2.0, margin=0.1, classes=[CLS_CAR])
     stage = PlateStage(rec, Cropper(upscale=1.0, margin=0.1), mode="crop")
     pipe = Pipeline(frame=FrameManager(frame_skip=1),
                     alarm=AlarmPolicy(task_id=2, kind="inspection"),
-                    yolo=yolo, crop=crop_stage, plate=stage)
+                    yolo=yolo, crop=crop_stage, plate=stage,
+                    det_filter=DetFilter("long >= 40"))
     _, al = pipe.step(0, 0.0, frame=frame, force=True)
     check("链路: 车牌阶段产出", len(pipe.last_plates) >= 1, f"{len(pipe.last_plates)} 张")
     check("链路: 车牌阶段带原分辨率图",

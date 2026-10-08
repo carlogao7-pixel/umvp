@@ -11,6 +11,8 @@
 | [YOLO识别.md](YOLO识别.md) | 小模型识别 + 过滤 + 按类报送 | `YOLODetector` | YOLO0001/0002/0003 |
 | [目标裁剪.md](目标裁剪.md) | 按上游检测框裁子图（输出分辨率可配） | `crop_targets` / `TargetCrop` | CROP0001+ |
 | [标注.md](标注.md) | 在帧上画检测框（供 VLM 看"原图+画框"） | `annotate_frame` / `Annotator` | ANNO0001+ |
+| [检测筛选.md](检测筛选.md) | 通用下游筛选（逐条条件 DSL：范围+与或非+成组判定；已接 Pipeline + web 模块页/设计器阶段） | `DetFilter` | DF0001+ |
+| [时序判定.md](时序判定.md) | 窗口计数确认闸 + 事件标注（有序记录流；二期未接 DB） | `SeqFilter` / `SeqRule` | —（暂无 preset） |
 | [VLM研判.md](VLM研判.md) | 大模型研判 + 素材准备 | `VLMAnalyzer` | VLM0001 |
 | [输出处理.md](输出处理.md) | **输出处理**统一漏斗（七道闸 + 规则 DSL） | `OutputPolicy`（原告警策略；module_id 仍为 `alarm`，preset 名如 AL0001「警用无人机·告警策略」） | AL0001/AL0002 |
 
@@ -41,6 +43,8 @@
 | 工具 | 代码 | 说明 |
 |---|---|---|
 | `Cropper` 通用裁剪 | `umvp/pipe/cropper.py` | 按框裁图可缩放 / 坐标还原 / 原分辨率提取；人脸、车牌链共用（旧名 `CropRestore`/`PersonCrop` 为兼容别名） |
+| 条件 DSL 引擎 | `umvp/pipe/conditions.py` | 框/记录筛选通用语法（与 `,` / 或 `;` / 非 `not` / 括号嵌套 + 派生字段 w/h/short/long/area）；检测筛选、目标裁剪、标注共用 |
+| Record 记录适配 | `umvp/pipe/records.py` | 模块间通用记录约定（dict 通用语，图像/向量走旁路字段）+ `to_record` 对象适配（适配器路线，老模块输出不动） |
 
 ## 相关文档（本目录之外）
 
