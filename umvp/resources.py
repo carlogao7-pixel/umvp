@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
-# 数据结构（与需求文档-开发版 §3.2 一致）
+# 数据结构（与 doc/requirements/development.md §3.2 一致）
 # ---------------------------------------------------------------------------
 
 
@@ -146,7 +146,7 @@ def _parse_wh(s: str, dw: int, dh: int) -> tuple[int, int]:
 
 # 静态耗时基线（CPU，RTX 3060 基准机；GPU 基线单独在 _STATIC 里）
 _STATIC_LATENCY_CPU_MS = {
-    "yolo": 1700.0,          # YOLO 单帧 CPU（CLAUDE.md 基线）
+    "yolo": 1700.0,          # YOLO 单帧 CPU（历史静态基线；权威值见 out/fingerprints.json）
     "scrfd": 110.0,          # SCRFD 640 CPU 90–130ms，取中值
     "arcface": 10.0,         # ArcFace 单张 CPU
     "facestore_query": 1.0,  # 千级底库检索 <1ms
@@ -154,7 +154,7 @@ _STATIC_LATENCY_CPU_MS = {
     "logic": 0.0,            # 帧管理/告警策略，纯逻辑
 }
 
-# GPU 基线：CLAUDE.md 实测 YOLO GPU ~0.02s/帧；SCRFD/ArcFace 按 CPU 的 8~20 倍加速粗估
+# GPU 基线：YOLO GPU ~0.02s/帧（历史实测）；SCRFD/ArcFace 按 CPU 的 8~20 倍加速粗估
 _STATIC_LATENCY_GPU_MS = {
     "yolo": 20.0,
     "scrfd": 8.0,
@@ -204,7 +204,8 @@ class ResourceEstimator:
         "yolo": TYPE_YOLO,
         "target_crop": TYPE_LOGIC,     # 目标裁剪：纯裁剪，无模型开销
         "vlm": TYPE_VLM,
-        "alarm": TYPE_LOGIC,
+        "det_filter": TYPE_LOGIC,      # 检测筛选：纯逻辑
+        "seq_filter": TYPE_LOGIC,      # 时序判定：纯逻辑
         "compose": TYPE_YOLO,          # compose 含 YOLO 主推理
         "face_detect": TYPE_SCRFD,
         "face_embed": TYPE_ARCFACE,
@@ -396,12 +397,12 @@ class ResourceEstimator:
     ) -> PipelineEstimate:
         """按 pipeline spec 聚合整链路估算。
 
-        spec 示例（与需求文档 §4.1 一致）：
+        spec 示例（与 doc/requirements/development.md §4.1 一致）：
             {"name": "巡检链路", "stages": [
                 {"module": "frame_manager", "params": {...}},
                 {"module": "yolo", "params": {...}},
                 {"module": "vlm", "params": {...}},
-                {"module": "alarm", "params": {...}},
+                {"module": "seq_filter", "params": {...}},
             ], "streams": 16, "budget": {"vram_mb": 8192}}
         """
         stages = spec.get("stages") or []
@@ -554,7 +555,7 @@ if __name__ == "__main__":
             {"module": "frame_manager", "params": {"sampling": "wall_clock", "interval_sec": 1.0}},
             {"module": "yolo", "params": {"model_path": "yolov8n.pt", "imgsz": 640, "classes": "0"}},
             {"module": "vlm", "params": {"ref": "crop:cls0", "check_interval": 3.0}},
-            {"module": "alarm", "params": {"kind": "window", "target_actions": "fire"}},
+            {"module": "seq_filter", "params": {"rules": [{"match": "label in 治安类"}]}},
         ],
         "streams": 16,
         "budget": {"vram_mb": 8192},

@@ -125,8 +125,9 @@ def main() -> None:
                   f"{p.plate_crop_bbox} vs {(ex1, ey1, ex2, ey2)}")
         _draw(frame, two, f"{stem}_crop")
 
-    # ---- 3. 链路装配：Pipeline + 目标裁剪 + PlateStage（识别 → 告警 → 跨帧去重） ----
-    from pipe.composer import FrameManager, AlarmPolicy, Pipeline
+    # ---- 3. 链路装配：Pipeline + 目标裁剪 + PlateStage（识别 → 事件尾 → 跨帧去重） ----
+    from pipe.composer import FrameManager, Pipeline
+    from pipe.seq_filter import SeqFilter, SeqRule
     from plate_recog.plate_pipeline import PlateStage
 
     frame = cv2.imread(str(DATA / "车牌620.jpg"))
@@ -134,19 +135,21 @@ def main() -> None:
                         max_det=300, classes=[CLS_CAR])
     crop_stage = TargetCrop(scale=2.0, margin=0.1, classes=[CLS_CAR])
     stage = PlateStage(rec, Cropper(upscale=1.0, margin=0.1), mode="crop")
+    # 事件尾（原「告警策略」inspection 等价）：同车牌号只一次
+    tail = SeqFilter(rules=[SeqRule(match="kind == plate", event="{label}",
+                                    key="label", cooldown=-1.0)])
     pipe = Pipeline(frame=FrameManager(frame_skip=1),
-                    alarm=AlarmPolicy(task_id=2, kind="inspection"),
                     yolo=yolo, crop=crop_stage, plate=stage,
-                    det_filter=DetFilter("long >= 40"))
-    _, al = pipe.step(0, 0.0, frame=frame, force=True)
+                    det_filter=DetFilter("long >= 40"), event_filter=tail)
+    _, ev = pipe.step(0, 0.0, frame=frame, force=True)
     check("链路: 车牌阶段产出", len(pipe.last_plates) >= 1, f"{len(pipe.last_plates)} 张")
     check("链路: 车牌阶段带原分辨率图",
           all(p.plate_img is not None for p in pipe.last_plates))
-    check("链路: 首帧触发告警", len(al) >= 1, f"{len(al)} 条")
-    _, al2 = pipe.step(1, 1.0, frame=frame, force=True)
+    check("链路: 首帧事件尾出事件", len(ev) >= 1, f"{len(ev)} 条")
+    _, ev2 = pipe.step(1, 1.0, frame=frame, force=True)
     check("链路: 同 track 跨帧跳过重复识别", len(pipe.last_plates) == 0,
           f"{len(pipe.last_plates)} 张")
-    check("链路: 同车牌跨帧去重（不再告警）", len(al2) == 0, f"{len(al2)} 条")
+    check("链路: 同车牌跨帧去重（不再出事件）", len(ev2) == 0, f"{len(ev2)} 条")
     check("阶段: 空车辆框不回退整帧识别", stage.run(frame, [], 0.0) == [])
 
     print(f"\n全部通过: {PASS} 项断言 | 总耗时 {time.time()-t0:.1f}s")

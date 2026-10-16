@@ -34,6 +34,276 @@
 
 ## 记录
 
+### 2026-10-16(五) · 多代理协作基建入 git（.opencode/ + opencode.json）
+- 变更内容：`.opencode/`（agent/ 五代理定义、command/curate.md、memory/ 收件箱与工单、
+  tool/ticket.py 工单工具、package*.json 插件依赖；node_modules/ 已内部 ignore）与根
+  `opencode.json`（default_agent=orchestrator）纳入版本控制，换机 `git pull` 即得整套协作配置。
+- 影响面：结构（新增入库目录）
+- 部署注意：新机克隆后 opencode 直接可用五代理与工单流；`.opencode/node_modules/` 由 opencode
+  按需重建，不入库。工单/收件箱自此跨机同步，多机同时开发时注意先 pull 再写。
+- 验证：`git status` 显示上述文件全部 staged；`python3 .opencode/tool/ticket.py check` 通过。
+
+### 2026-10-16(五) · doc/ 文档目录重整（分类入目录 + 文件名英文化 + 链路抽篇）
+- 变更内容：① doc/ 顶层文档分类入目录，且**目录与文件均改英文小写＋下划线**（各篇 H1 保留中文）：
+  `requirements/`（business/development）、`modules/`（11 篇=module_id：frame_manager/yolo/
+  det_filter/seq_filter/target_crop/annotate/vlm/face_detect/face_embed/face_store/plate_recog，
+  INDEX 按数据流角色分组）、`chains/`（pipe0001_police_uav / pipe0002_plate / pipe0003_face_capture，
+  PIPE0002/0003 自模块分册抽篇）、`guides/`（runbook / database_schema）、`design/`
+  （storage_design / live_overlay / video_review_search / wemm_integration）、`agent/`
+  （static_prompts / full_run_record，标注自动生成勿手改）、`research/`（face_search_survey /
+  plate_recog_survey）；各板块代理同步梳理内容去冗余并修正过期事实（车牌库内值、警用链路
+  AL0001/alarm kind、presets 快照 15→23 行、SSE 事件表删未实现 info 等）。
+  ② 入口默认参数：`web_lab/dump_prompts.py --out` 与 `web_lab/agent_run.py --out` 默认值改指
+  `doc/agent/static_prompts.md` / `doc/agent/full_run_record.md`；静态提示词快照已按新提示词重生成。
+  ③ 引用同步：`CLAUDE.md`、`.opencode/agent/{pipe-chain,web}.md`、`web_lab/db.py|server.py|index.html`
+  与 `umvp/resources.py` 注释、`umvp/pipe/seq_filter.py` docstring、`.claude/agents/` 两角色提示词
+  与 `web_lab/agent.py` 示例路径。
+- 影响面：结构（doc 目录）、入口（两个脚本 --out 默认值）
+- 部署注意：换机拉代码即得；无依赖/模型/DB/环境变量变化。重新生成挂载 agent 文档用新路径
+  （脚本默认值已指向）。引用旧中文文档路径的第三方脚本需自查。
+- 验证：`tests/test_agent_runtime.py` 39 断言全绿；`web_lab/validate_chain.py` 对 PIPE0001 spec
+  `[OK]`；`umvp/pipe/test_composer.py` 36、`tests/test_seq_filter.py` 43 通过；doc 全目录相对链接
+  与旧文件名扫描零残留（仅本台账历史条目与 inbox 存档保留旧名）。
+
+### 2026-10-13(二) · 挂载 agent 全流程记录器 + 示例记录文档
+- 变更内容：① 新增 `web_lab/agent_run.py`：真跑「需求 → 总装工 → 组装工 → 链路 spec」，
+  把**完整对话、工具调用记录、最终产出**落成一份 Markdown（`--ask` 指定需求，`--out` 指定输出）。
+  ② 生成示例记录 `doc/挂载Agent全流程记录.md`。
+- 影响面：入口（新增脚本 `web_lab/agent_run.py`）；无依赖/模型/DB 变化
+- 部署注意：运行需 `LLM_API_KEY`（或 `SILICONFLOW_API_KEY`）/ `LLM_BASE_URL` / `LLM_MODEL`。
+- 验证：`deepseek-chat` 实跑——总装工 ok（工具 `list_modules`/`list_pipelines`）、组装工 ok
+  （工具 `read_doc`×4 / `list_modules` / `validate_spec` / `estimate`）；产出 spec 过
+  `validate_spec` = `0 error`，资源估算在 8G 预算内。
+
+### 2026-10-13(二) · 清理技能库 .claude/skills/pipeline-assembly（web agent 已脱离）
+- 变更内容：删除 `.claude/skills/pipeline-assembly/`（SKILL/INDEX + knowledge L1-L4）及空目录
+  `.claude/skills/`——两角色提示词已**自包含**、组装 know-how 迁入 `.claude/agents/assembler/`、
+  `read_doc` 改读**项目内 Markdown**，web agent 不再依赖该库。同步更新引用：`CLAUDE.md`（结构块 +
+  「挂载 agent 技术文档」约定）、`doc/README.md`（文档索引）、`doc/需求文档-开发版.md`（§五/§六/P3）。
+- 影响面：结构（删除技能库目录）、配置（agent 文档来源不再含 `.claude/skills/`）
+- 部署注意：无依赖/模型/DB/入口变化；换机拉代码即得。仓库内已无脚本/文档引用该技能路径。
+- 验证：`tests/test_agent_runtime.py` 39 断言全绿；全仓 `grep -r pipeline-assembly` 仅剩
+  `DEPLOYMENT.md` 历史条目与"已移除"说明。
+
+### 2026-10-13(二) · 组装工提示词自包含重写 + 新增组装工技术文档目录（脱离技能库）
+- 变更内容：① 新增 `.claude/agents/assembler/` 技术文档目录，承载原技能库 L3/L4 的组装 know-how：
+  `README.md`（索引 + 维护规则 + 动态事实来源）、`01-shell-standard.md`（链路壳标准：spec schema /
+  硬规则 / 参数·DSL·事件 / 标准壳 / 自检清单 / 红线）、`02-assembly-workflow.md`（工作流 / 交付包 /
+  汇报）、`03-patterns-and-extension.md`（拼装套路 / 胶水 / 槽位判定 + **新模块接入四件套 / 新编排演进**）、
+  `04-pitfalls-and-checklist.md`（坑 + 已验证 / 未验证）、`05-decision-table.md`（参数初值）。
+  ② 按 8 段结构重写 `.claude/agents/pipeline-assembler.md`（§1 项目介绍 / §2 角色及职能 / §3 链路壳与模块 /
+  §4 工作流 / §5 交付包与汇报 / §6 职责红线 / §7 技术文档索引 / §8 可用工具），**正文不再引用技能库**。
+  ③ `web_lab/agent.py`：`read_doc` 改为读**项目内 Markdown**（`doc/` 与 `.claude/agents/`，仅 `.md`、
+  须在项目根内），`knowledge_index` → `docs_index`，删除 `SKILL` 常量与技能库读取；`read_doc` 工具描述更新。
+  ④ 重生成 `doc/挂载Agent静态提示词.md`。
+- 影响面：配置（agent 运行时文档来源去技能库依赖）、结构（新增 `.claude/agents/assembler/` 目录）
+- 部署注意：无依赖/模型/DB/入口变化；重启 web_lab 生效。技能库 `.claude/skills/pipeline-assembly/`
+  现不再被 web agent 使用（保留为历史/其他消费者，可后续清理）。
+- 验证：`tests/test_agent_runtime.py` 39 断言全绿（含两角色提示词自包含、文档索引无技能库路径、
+  `read_doc` 读项目文档、非 `.md` / 越界被拒）。
+
+### 2026-10-13(二) · 总装工提示词自包含重写（脱离技能库）+ 运行时上下文精简
+- 变更内容：① 按 8 段结构重写 `.claude/agents/pipeline-architect.md`：§1 项目介绍 / §2 角色及职能简述 /
+  §3 概念介绍（链路基本机制 + 模块地图，取自原 `L2-architect/14-chain-mechanism-and-module-map.md`）/
+  §4 工作流 / §5 约定产出格式（build 语义链条、optimize 模块+缺陷）/ §6 可参考文件索引 /
+  §7 系统介绍与模块详情文件索引 / §8 可用工具。**正文不再引用 `.claude/skills/pipeline-assembly`**，
+  改为索引项目内 `doc/`。② `web_lab/agent.py`：删除 `_SYSTEM_INTRO`、`module_intro()`（内容已内联进
+  提示词）；`context_blocks` / `build_context` 改为「自包含提示词单块 + 工具 JSON Schema」，未内联工具表
+  的角色（组装工）运行时补一块工具清单；返回体不再含 `knowledge`。③ 重生成 `doc/挂载Agent静态提示词.md`。
+- 影响面：配置（agent 运行时 system 提示词内容与来源；总装工去技能库依赖）
+- 部署注意：无依赖/模型/DB/入口变化；重启 web_lab 生效。**组装工提示词与 `read_doc` 仍指向技能库**，
+  待后续同样改造。
+- 验证：`tests/test_agent_runtime.py` 37 断言全绿；总装工提示词中 `knowledge/` / `.claude/skills`
+  出现 0 次；`agent.py context architect` 返回无 `knowledge` 键、system 即提示词全文。
+
+### 2026-10-13(二) · 挂载 agent 上下文精简：直注系统简介+模块介绍，去索引/角色聚焦/壳摘要
+- 变更内容：① `web_lab/agent.py:build_context` 重构：删除「本角色聚焦（总装/组装）」
+  （原 `_ROLE_HINTS`）与「链路壳标准（要点）」（原 `_spec_digest`）两块，**不再注入知识索引**
+  （返回去掉 `knowledge` 字段）；改为**直接内联**「系统简介」（`_SYSTEM_INTRO`，≤100 字）与
+  「模块介绍」（`module_intro()` = `L2-architect/14-chain-mechanism-and-module-map.md` 正文，
+  去掉标题与元信息），随后接「可用工具」清单。② 修正 `knowledge/L1-shared/01-umvp-intro.md`
+  §管道模块：原 5 行无序表格 → 按「取帧 / 产出 / 筛选 / 修改 / 事件」四类分组的完整模块表。
+  ③ 重生成 `doc/挂载Agent静态提示词.md`。
+- 影响面：配置（agent 运行时 system 提示词内容与行为）
+- 部署注意：无依赖/模型/DB/入口变化；重启 web_lab 生效。
+- 验证：`tests/test_agent_runtime.py` 37 断言全绿；`agent.py context architect` 的系统提示词含
+  「系统简介 / 模块介绍 / 可用工具」、无「本角色聚焦 / 链路壳标准（要点）」、返回无 `knowledge` 键。
+
+### 2026-10-13(二) · 挂载 agent 静态提示词快照：新增导出脚本与文档
+- 变更内容：① 新增 `web_lab/dump_prompts.py`：对两角色各调 `agent.build_context(role)`，
+  导出运行时静态 system 提示词 + 工具 JSON Schema 到文档（可重跑）。② 生成
+  `doc/挂载Agent静态提示词.md`（总装工 / 组装工两份快照）。③ `doc/README.md` 索引加该篇。
+- 影响面：入口（新增脚本 `web_lab/dump_prompts.py`）、文档（快照，无运行配置/DB 变化）
+- 部署注意：无依赖/模型/DB 变化；提示词或 `agent.py` 变更后可重跑脚本刷新快照。
+- 验证：`conda run -n ai python web_lab/dump_prompts.py` 生成 442 行文档；
+  `tests/test_agent_runtime.py` 36 断言全绿。
+
+### 2026-10-13(二) · 总装工模块认知：新增「链路机制与模块地图」+ 提示词补认知渠道
+- 变更内容：① 新增 `knowledge/L2-architect/14-chain-mechanism-and-module-map.md`（总装底图）：
+  链路基本机制（JSON 主干 + 图像旁路两条流 → 产出/筛选/修改/事件生成）+ 每个模块的机制角色、
+  业务职责、"可改什么"（自然语言）+ 按诉求/抱怨定位模块。② `pipeline-architect.md` §1 补
+  "链路机制"认知 + §1.1 模块认知渠道三条（`list_modules` 实时权威 / 本篇机制地图 /
+  `modules/<id>.md` 深读分篇），去掉不相关的 `03-module-reference.md` 引用。③ `INDEX.md`
+  文件清单加该篇。
+- 影响面：文档 / 技能库（agent 运行时知识，无依赖/DB/入口变化）
+- 部署注意：无；换机拉代码即得（agent 运行时按 `read_doc` 读取）。
+- 验证：`tests/test_agent_runtime.py` 36 断言全绿（含机制地图可读性断言）。
+
+### 2026-10-13(二) · 挂载 agent（web 端智能助手）：两角色提示词 + 运行时 + 接口 + 抽屉
+- 变更内容：落地挂在 web 端的链路组装 agent（答疑 / 组装 / 修改链路）。① 两角色初始提示词
+  `.claude/agents/pipeline-architect.md`（总装工：整理复述需求 + 业务层链路设计，输出语义模块
+  链条 `[{id,module,description}]`，不落参数/代码）与 `pipeline-assembler.md`（组装工：把链条
+  落成合规 stages spec，侧重代码参数逻辑与职责红线，负责校验/估算/测试）。② 运行时
+  `web_lab/agent.py`（工具层 + 上下文披露：read_doc / list_modules / validate_spec / estimate /
+  list_pipelines / get_pipeline）与 `web_lab/agent_llm.py`（OpenAI 兼容 function-calling 循环，
+  纯 stdlib，无新依赖）。③ `server.py` 的 `/api/pipeline/agent` 由占位壳改为真实处理器
+  `_agent_chat`（返回 {ok,role,text,tool_calls,steps}）。④ `index.html` 链路设计器"智能助手"
+  按钮改为聊天抽屉（角色可选总装/组装，携带"链路场景描述"）。
+- 影响面：环境变量（新增 `LLM_BASE_URL` / `LLM_API_KEY`（或 `SILICONFLOW_API_KEY`）/ `LLM_MODEL`）、
+  入口（`/api/pipeline/agent` 行为由占位改为真实调用）
+- 部署注意：使用智能助手前需导出 `LLM_API_KEY`（或 `SILICONFLOW_API_KEY`）后重启 web_lab；
+  未配置时接口返回 `configured=false` 提示，不影响其余功能。端点默认 SiliconFlow
+  （`https://api.siliconflow.cn/v1`）、默认模型 `Qwen/Qwen2.5-32B-Instruct`，可经
+  `LLM_BASE_URL` / `LLM_MODEL` 覆盖。运行时只读代码与知识库，不改核心模块。
+- 验证：`conda run -n ai python tests/test_agent_runtime.py` 33 断言全绿（提示词/上下文/知识索引/
+  工具/循环，离线 monkeypatch `_chat`）；`server.py --no-db` 起服后 `GET /` 返回 200，
+  `POST /api/pipeline/agent` 未配置 key 时返回 `configured=false`。
+
+### 2026-10-08(四) · 链路壳标准化：技能库对齐当前架构 + 新增 spec 校验脚本
+- 变更内容：① 重写 `pipeline-assembly` 技能库的**链路壳标准**
+  （`L3-assembler/07-shell-templates.md` v2.0）：唯一权威规范 = `stages spec`（模块白名单 +
+  精确参数 + 硬性规则）+ 标准壳模板（spec/驱动/测试）+ 装配自检清单 + 红线（禁用旧概念
+  alarm/OutputPolicy/on_vlm_result/filter_conf/check_interval/compose 四模式）。② 同步更新
+  `08/09`（工作流/套路）、`L1 01/02/03`（介绍/环境/模块速查）、`L2 04/05/06`、`L4 10/11/12`、
+  `INDEX/SKILL`（版本 v1.1）。③ 新增 `web_lab/validate_chain.py`：链路 `stages spec` 校验器
+  （frame_manager 必首唯一 / 无重复模块 / 终段集合 / 模块与参数白名单 / select 取值），
+  供低参 LLM 与组装工机械自检。
+- 影响面：入口（新增脚本 `web_lab/validate_chain.py`）、文档/技能库（无运行配置/DB 变化）
+- 部署注意：无依赖/模型/DB 变化；换机拉代码即得校验脚本。
+- 验证：`validate_chain.py` 对 PIPE0001/PIPE0002 spec 输出 `[OK]`，对含缺 frame_manager/
+  重复模块/未知模块/未知参数的坏 spec 逐条报 `[ERR]`。
+
+### 2026-10-08(四) · PIPE0001 阶段顺序调整：时序判定移至链路尾（显示对齐）
+- 变更内容：警用无人机链路（PIPE0001）阶段顺序由 `…→检测筛选→时序判定→标注→VLM→` 调整为
+  `…→检测筛选→标注→VLM→时序判定`——把承担事件尾的 **seq_filter 阶段放到 VLM 之后**，使链路
+  末段直观显示为"时序判定（链路尾）"。**执行语义不变**：`_chain_from_spec` 按参数把该阶段的
+  `throttle/change`→检测流门控、`rules`→事件尾（`event_filter`），与阶段位置无关；VLM 结果
+  仍经 `Pipeline.publish` 走事件尾。
+- 影响面：DB（PIPE0001 pipeline_steps 顺序变化，重启自动重建；复用 SEQ0001 preset 不新增）
+- 部署注意：换机/重启 web_lab 自动重建该链路顺序。
+- 验证：DB 实测 PIPE0001 = fm→yolo→det_filter→annotate→vlm→seq_filter；PIPE0001 跑 人群1.MP4
+  → 事件 1；test_composer(36)/test_seq_filter(43) 全绿。
+
+### 2026-10-08(四) · 弃用删除「输出处理 OutputPolicy」（代码 + web 页面 + DB）
+- 变更内容：① `composer.py` 删除 OutputPolicy/AlarmPolicy/Finding/AlarmEvent/规则 DSL
+  (`parse_rules`)/`ALARM_*`/`GRAN_TRACK`；`Pipeline` 去掉 `alarm` 字段与 dwell/告警分支，
+  `step()` 返回 `(submits, events)`；车牌分支只经事件尾 `publish` 出事件；`compose()` 去
+  `small_only`（驻留模式）与各模式 alarm。② web 删除 `alarm` 模块页（MODULES/PARAMS/h_alarm）
+  与 stage 标签；`_chain_from_spec`/runner/seeds 去 alarm；事件行阶段标签 `seq_filter`。
+  ③ `db.py` 前缀表去 alarm、`_PRUNED_MODULES` 加 `alarm` → 启动幂等剪除 `preset_params_alarm`
+  表与 AL presets。④ `resources.py` 去 alarm 类型映射与示例。⑤ 测试重写（composer 36、
+  police/video/plate/annotate/target_crop/face_capture）。⑥ 文档：删除 `doc/modules/输出处理.md`，
+  改 INDEX/CLAUDE/README/INSTALL/数据库结构/模块文档/技能库 L1·L3。
+- 影响面：结构（模块删除）、配置（`small_only` 不再支持；Pipeline 接口 `alarm`→去）、
+  DB（`preset_params_alarm` 表与 AL 预设剪除）
+- 部署注意：换机/重启 web_lab 自动剪除 alarm 表/preset；自建链路若含 `alarm` 阶段需改由
+  `seq_filter`/`det_filter` 事件尾收尾；`compose(spec)` 的 `small_only` 已报错。
+- 验证：全量测试绿（composer 36 / seq_filter 43 / det_filter 66 / target_crop 35 / annotate 16 /
+  cropper 26 / face 28·39 / plate 28 / police / resources 自检）；DB 实测 alarm 表与预设已删；
+  PIPE0001 跑 人群1.MP4 → 事件 1；PIPE0002 跑 车牌620.jpg → 事件 1。
+
+### 2026-10-08(四) · 保留链路切换到筛选事件尾（PIPE0001/0002 弃用告警阶段）+ 配置表重置
+- 变更内容：① 三条保留链路不再用 OutputPolicy：PIPE0001 的 `alarm` 阶段换成 seq_filter 规则
+  （词表 `label in 治安类|交警类|群体性事件类|救援救助类`、动态事件名 `{label}`、按警情冷却 30s）；
+  PIPE0002 的 `alarm` 换成 seq_filter 规则（`match=kind==plate`、`event={label}`、`key=label`、
+  `cooldown<0`=同车牌号一次）。② `Pipeline.publish(records,ts)` 经 `event_filter` 出事件；
+  `Pipeline.step` 车牌分支：有 `event_filter` 时车牌记录经 publish 出事件（否则保持 alarm.accept 兼容）。
+  ③ `_chain_from_spec`：`seq_filter` 阶段的参数按用途拆两个实例——`throttle/change`→`Pipeline.seq_filter`
+  （检测流门控）、`rules`→`Pipeline.event_filter`（事件尾）——避免一条链路出现同模块两次
+  （pipeline 模型每模块最多一次）。④ web seq_filter 模块新增 `rules` 参数（SeqRule JSON 规格）。
+  ⑤ runner：事件行阶段标签改 `seq_filter`；无 alarm 链路的 VLM 结果经 publish 出事件（前一轮已接）。
+- 影响面：DB（**清空并重建 config 表**：pipelines/presets 全删后按新种子重播，业务 ID 恢复
+  PIPE0001~0003；PIPE0001 结构变为 fm→yolo→det_filter→seq_filter→annotate→vlm；PIPE0002 末段
+  alarm→seq_filter）、结构/配置（Pipeline.event_filter、车牌分支、seq_filter 参数拆用、web rules 参数）
+- 部署注意：本次为强制重建——**清空了 pipelines/presets 表**（配置皆代码播种，可重建；如你在此
+  DB 存过自定义 preset 需重新保存）；换机/重启自动重新播种。OutputPolicy 类仍保留（small_only 驻留/
+  模块测试页/自定义链路用），但三条保留链路已不依赖它。
+- 验证：起 server（DB）重播种 OK；**PIPE0001** 跑 人群1.MP4（mock 研判"治安类"）→ `事件 1`（动态名
+  "治安类"、30s 冷却，等价旧 window 告警）；**PIPE0002** 跑 车牌620.jpg → `事件 粤ACJ0710`（同车牌一次，
+  等价旧 inspection）；回归 composer/seq_filter(43)/det_filter(66)/target_crop(35)/annotate(16)/
+  police/plate(28)/face(39) 全绿。
+
+### 2026-10-08(四) · VLM 原始 JSON 落 content 字段（链路尾内容输出）
+- 变更内容：① `_vlm_real` 返回 `(action, description, raw)`（raw=模型原始回复）；
+  新增 `_vlm_content(raw)`（去 ```json 围栏后尽量解析为 JSON，失败退回原文）。② `h_pipeline_run`
+  无 alarm 阶段的链路，VLM 结果记录 `content` 字段改用**原始 JSON**（解析失败退回原文），
+  经 `Pipeline.publish` 走链路尾出事件；模拟回填时 content={result,description}。③ 顺带修
+  `h_vlm` 测试页 `action = _vlm_real(...)` 未解包的显示问题。④ 上一轮已更新 VLM 提示词
+  （默认 + ALARM_PROMPT：强制 JSON、含 confidence）。
+- 影响面：配置/行为（VLM 原始内容进入记录/链路尾产出；提示词变更影响新播种/默认为 VLM 的链路）
+- 部署注意：无 DB/依赖变化。DB 里既有 VLM preset 的 prompt 仍是旧文本（同名播种跳过），
+  如需新提示词要改 preset 或重建链路。
+- 验证：`_vlm_content`（dict/围栏/非 JSON/空）与 `_parse_vlm_result` 实测正确；server 导入 OK；
+  pipe 侧回归（seq_filter 43/composer 66/det_filter 66/police/plate/face）全绿。
+
+### 2026-10-08(四) · SeqFilter 三个扩展：同对象一次 / 计数窗比例 / 动态事件名
+- 变更内容：① `SeqRule.cooldown` 允许 <0 = **同 key 只触发一次**（不重报，等价旧
+  inspection `key_cooldown=-1`）。② 新增 `window_n`（计数窗，最近 N 条到达）与 `hit_ratio`
+  （窗口命中比例阈值，需求=max(min_n, ceil(分母×比例))，计数窗需先凑满 window_n）；与
+  `span` 时间窗二选一。③ `event` 支持 `{字段}` 占位 → **动态事件名**（如 "{label}"、
+  "警情-{cls_id}"）。至此 SeqFilter 覆盖 OutputPolicy 的窗口/词表/冷却/同对象一次/动态取值。
+- 影响面：结构（SeqRule 字段与判定逻辑扩展；`SeqFilter._hits`→`_win`（记录到达+命中标记，
+  支撑比例分母））
+- 部署注意：无 DB/依赖变化；向后兼容（新字段有默认值；单条/时间窗旧行为不变）。
+- 验证：test_seq_filter 43 断言（新增 once / 计数窗 / hit_ratio / 动态事件名）全绿。
+
+### 2026-10-08(四) · 三期接线：det_filter 事件参数上 web + runner 暴露 last_events（链路尾输出）
+- 变更内容：① web `det_filter` 模块新增 `events` 参数（JSON 事件规格，可作链路尾）+ 测试页
+  展示事件；`web_lab.server._det_filter_of()` 解析。② `_chain_from_spec` 终段校验放宽：
+  `det_filter`/`seq_filter` 也可作链路终段（不必非 alarm/face_*/plate）。③ `Pipeline.publish(
+  records, ts, frame_idx)`：外部记录（如 VLM 结果）经链上 det_filter/seq_filter 尾部处理并汇总
+  事件（通用、不绑定来源）。④ runner：`h_pipeline_run` 逐帧把 `pipe.last_events` 作为通用「事件」
+  行刷入时间线并计入结果头；无 `alarm` 阶段的链路，VLM 结果改经 `pipe.publish()` 出事件
+  （有 alarm 的链路仍走原 `on_vlm_result`）。
+- 影响面：结构/配置（web 模块参数与设计器终段规则、runner 时间线新增事件行与计数）
+- 部署注意：无 DB/依赖变化；OutputPolicy 仍在（有 alarm 的链路行为不变）。MySQL 需在起
+  server 前就绪（本次实测时本机 MySQL 未运行，DB 链路的端到端冒烟未跑）。
+- 验证：det_filter(66)/seq_filter(39)/composer(66)/target_crop(35)/annotate(16)/cropper(26)/
+  police/plate(28)/face(28,39) 全绿；server 导入 OK；`h_det_filter` 带 events 实测输出「事件 1 条 — 警情」。
+
+### 2026-10-08(四) · 三期起步：通用事件约定（events 列表）+ DetFilter 事件标注（可作链路尾）
+- 变更内容：① `records.py` 新增通用事件约定——记录携带 `events` **列表**
+  （`{"name","ts","detail"}`，一记录可多事件）+ `add_event/get_events/collect_events`。
+  ② `DetFilter` 新增 `events` 规格参数（`{name, when?, detail?}`，可多条）→ 放行记录追加事件，
+  **可直接作链路结尾**（把 VLM 的 JSON 内容字段等经 `detail` 带出）。③ `SeqFilter` 事件标注
+  由单 `event`/`event_info` 改为 `events` 列表，规则各自独立、一条记录可命中多条规则（多事件）。
+  ④ `Pipeline` 新增 `last_events`（`collect_events` 末段记录）= 通用链路输出，不绑定模块。
+- 影响面：结构（模块能力扩展；`SeqFilter` 事件字段形态 `event`/`event_info` → `events`）
+- 部署注意：无 DB/依赖变化。**若有外部消费 `event`/`event_info` 需改读 `events` 列表**；
+  OutputPolicy 仍在（三期未切换）。
+- 验证：test_det_filter(66)/test_seq_filter(39)/test_composer(65) 全绿；事件多规格/多规则/
+  when/detail/Pipeline.last_events 断言通过。
+
+### 2026-10-08(四) · check_interval/track_change_only 由 Pipeline 迁入 SeqFilter（web 注册 + 链路阶段）
+- 变更内容：① `Pipeline` 删 `check_interval`/`track_change_only` 字段与 `_gate`/`_pass_dets`，
+  新增 `seq_filter` 槽位（`step` 里 det_filter 之后运行）；`_submits` 只做分组 + 语料构造
+  （不节流）。② `SeqFilter` 加两类门控 `throttle`（整类节流=原 check_interval）/
+  `change`（track 集合变化=原 track_change_only），支持纯门控模式；输出改为**原元素进出**
+  （对象进对象出、dict 进 dict 出；事件 dict 原地写、对象挂属性）。③ `compose()` 由 spec
+  的 check_interval/track_change_only 构造 seq_filter（向后兼容）。④ web：注册 `seq_filter`
+  模块（PARAMS `throttle`/`change` + 测试页 + 设计器阶段）；YOLO preset 删 `check_interval`/
+  `track_change_only`（DB 列删）；`_chain_from_spec` 读 seq_filter 阶段。⑤ 种子：PIPE0001
+  加 seq_filter 阶段（SEQ0001 `throttle=cls_id:3.0`），三条链 YOLO 种子去编排参数。
+- 影响面：DB（`preset_params_yolo` 删 2 列；`preset_params_seq_filter` 新建；PIPE0001
+  pipeline_steps 重建含 seq_filter）、配置/结构（Pipeline 参数、web 阶段、seq_filter 前缀 `SEQ`）
+- 部署注意：换机/重启 web_lab 自动迁移（删列/建表/重建链路）。行为等价（PIPE0001 节流
+  仍是 3 秒/类）。**唯一行为变化**：门控在链路中位于 det_filter 之后、对所有下游一致生效，
+  PIPE0001 的标注从"不节流"变为"跟报送节奏节流"——对齐 VLM 素材节奏，无功能损失。
+- 验证：DB 实测（yolo 余 7 参数列、`preset_params_seq_filter` 建表、SEQ0001 落表、
+  PIPE0001 步骤=帧管理→YOLO→检测筛选→时序判定→标注→VLM→告警）；回归 test_composer(64)/
+  seq_filter(39)/det_filter(59)/target_crop(35)/annotate(16)/cropper(26)/police/plate/face 全绿；
+  web schema/seq_filter 测试页/装配冒烟通过。
+
 ### 2026-10-08(四) · 有效性参数从 YOLO preset 撤除，改由链路显式 det_filter 阶段承接（web+DB 收敛）
 - 变更内容：① web `PARAMS["yolo"]` 删除 `filter_conf`/`min_short`/`min_long`/`class_limits`
   （隐藏页 frame_yolo 同删，另去未用的 check_interval）；删除装配期翻译层

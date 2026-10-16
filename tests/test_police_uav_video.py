@@ -13,10 +13,11 @@ sys.path.insert(0, str(ROOT / "web_lab"))
 
 import cv2
 from pipe.composer import (
-    FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
+    FrameManager, YOLODetector, VLMAnalyzer, Pipeline,
     SAMPLING_ANALYSIS,
 )
 from pipe.det_filter import DetFilter
+from pipe.seq_filter import SeqFilter, SeqRule
 
 ALARM_PROMPT = """你是一个警情分析专家。请分析画面中的情况，并以 JSON 格式返回分析结果：
 
@@ -147,25 +148,23 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
         prompt=ALARM_PROMPT,
     )
     
-    alarm = AlarmPolicy(
-        task_id=1,
-        kind="window",
-        target_actions=["治安类", "交警类", "群体性事件类", "救援救助类"],
-        smooth_frames=1,
-        hit_ratio=1.0,
-        alarm_cooldown=30.0,
-        cooldown_by_action=True,
-    )
-    
-    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm, alarm=alarm,
-                    det_filter=det_filter, check_interval=5.0, track_change_only=True)
-    
+    # 事件尾（原「告警策略」window 等价）：词表命中 + 按警情类型独立冷却 30s
+    tail = SeqFilter(rules=[SeqRule(
+        match="label in 治安类|交警类|群体性事件类|救援救助类",
+        event="{label}", key="label", cooldown=30.0)])
+
+    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm,
+                    det_filter=det_filter,
+                    seq_filter=SeqFilter(throttle={"key": "cls_id", "interval": 5.0},
+                                         change={"key": "cls_id", "watch": "track_id"}),
+                    event_filter=tail)
+
     print(f"✓ 链路构建成功")
     print(f"  - 抽帧间隔: 每 15 帧")
     print(f"  - YOLO 报送间隔: 5.0 秒")
     print(f"  - YOLO track_id 变化检测: 开启")
     print(f"  - VLM 警情类型: 治安类/交警类/群体性事件类/救援救助类")
-    print(f"  - 告警冷却: 30 秒（按警情类型独立）")
+    print(f"  - 事件尾冷却: 30 秒（按警情类型独立）")
     
     # 打开视频
     cap = cv2.VideoCapture(video_path)
@@ -201,65 +200,41 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
             
             ts = frame_idx / fps
             
-            # 链路处理
-            submits, alarms = pipe.step(frame_idx, ts, frame=frame)
-            
-            if frame_idx % 50 == 0 or submits or alarms:
-                status = "● 分析" if submits or alarms else "○ 跳过"
+            # 链路处理（step 返回 (报送, 事件)）
+            submits, events = pipe.step(frame_idx, ts, frame=frame)
+
+            if frame_idx % 50 == 0 or submits or events:
+                status = "● 分析" if submits else "○ 跳过"
                 print(f"帧 {frame_idx:4d} ts={ts:6.1f}s {status} "
-                      f"→ 报送:{len(submits)} 告警:{len(alarms)}")
-            
+                      f"→ 报送:{len(submits)} 事件:{len(events)}")
+
             if submits:
                 analyzed_count += 1
                 submit_count += len(submits)
-                
-                # 模拟 VLM 调用
+
+                # 模拟 VLM 调用 → 事件尾出事件
                 for submit in submits:
                     payload = vlm.prepare(submit, frame)
                     vlm_result = _mock_vlm_infer(payload)
                     alert_type, description = _parse_vlm_action(vlm_result)
                     vlm_call_count += 1
-                    
-                    # VLM 结果回填告警
-                    new_alarms = pipe.on_vlm_result(submit.track_key, alert_type, ts, description)
-                    
-                    if new_alarms:
-                        alarm_count += len(new_alarms)
-                        for alarm in new_alarms:
-                            print(f"  🚨 告警: ts={alarm.ts:.1f}s "
-                                  f"警情={alarm.action} "
-                                  f"描述={alarm.description}")
-                            
-                            # 记录告警输出
-                            alarm_outputs.append({
-                                "timestamp": round(alarm.ts, 2),
-                                "alert_type": alarm.action,
-                                "description": alarm.description,
-                                "frame_idx": frame_idx,
-                                "track_key": alarm.track_key
-                            })
-                            
-                            # 保存告警帧
-                            alarm_frame_path = out_dir / f"alarm_{alarm_count:03d}_ts{alarm.ts:.1f}s.jpg"
-                            cv2.imwrite(str(alarm_frame_path), frame)
-            
-            if alarms:
-                # 直接告警（如驻留告警）
-                for alarm in alarms:
-                    print(f"  🚨 直接告警: ts={alarm.ts:.1f}s action={alarm.action}")
-                    
-                    alarm_outputs.append({
-                        "timestamp": round(alarm.ts, 2),
-                        "alert_type": alarm.action,
-                        "description": alarm.description,
-                        "frame_idx": frame_idx,
-                        "track_key": alarm.track_key
-                    })
-                    
-                    # 保存告警帧
-                    alarm_frame_path = out_dir / f"alarm_{alarm_count:03d}_ts{alarm.ts:.1f}s.jpg"
-                    cv2.imwrite(str(alarm_frame_path), frame)
-                    alarm_count += 1
+                    new_events = pipe.publish(
+                        [{"kind": "vlm", "label": alert_type, "text": description}],
+                        ts=ts, frame_idx=frame_idx)
+                    for ev in new_events:
+                        alarm_count += 1
+                        nm = ev.get("name", "事件")
+                        print(f"  🚨 事件: ts={ev.get('ts', ts):.1f}s "
+                              f"警情={nm} 描述={description}")
+                        alarm_outputs.append({
+                            "timestamp": round(float(ev.get("ts", ts)), 2),
+                            "alert_type": nm,
+                            "description": description,
+                            "frame_idx": frame_idx,
+                            "track_key": alert_type,
+                        })
+                        alarm_frame_path = out_dir / f"alarm_{alarm_count:03d}_ts{float(ev.get('ts', ts)):.1f}s.jpg"
+                        cv2.imwrite(str(alarm_frame_path), frame)
             
             frame_idx += 1
             

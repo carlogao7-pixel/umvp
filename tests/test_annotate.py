@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "umvp"))
 
 from pipe.annotate import annotate_frame, Annotator, parse_condition
-from pipe.composer import Detection, FrameManager, AlarmPolicy, Pipeline
+from pipe.composer import Detection, FrameManager, Pipeline
 
 PASS = 0
 
@@ -95,11 +95,7 @@ def main() -> None:
         def infer(self, frame, track=False):
             return [d0]
 
-        def pass_dets(self, dets, ts):
-            return dets
-
     p = Pipeline(frame=FrameManager(frame_skip=1),
-                 alarm=AlarmPolicy(task_id=1, kind="inspection"),
                  yolo=FakeYolo(), annotate=Annotator())
     p.step(0, 0.0, frame=frame, force=True)
     check("Pipeline: 产出标注图",

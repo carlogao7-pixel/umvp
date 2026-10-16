@@ -1,0 +1,44 @@
+{
+  "note": "链路组装 agent 评测问题集：覆盖 答疑 / 构建 / 修改 / 升级通道 / 需求不清 / VLM 提示词，尽量多样。kind 决定走法（qa/prompt/upgrade/ambiguous 只过总装；build/modify 总装→组装）。",
+  "scenarios": [
+    {"id": "qa-capability", "kind": "qa", "focus": "系统能力边界（识别什么、能否判行为）",
+     "message": "这套系统能识别什么？它能判断画面里的人在干嘛吗？"},
+    {"id": "qa-mechanism", "kind": "qa", "focus": "链路机制与数据流（总装须知）",
+     "message": "一条链路里模块之间是怎么串起来的？一条帧进来之后数据是怎么一层层往后传的？"},
+
+    {"id": "build-parking", "kind": "build", "focus": "车辆数量判定/拥堵；成组数量或VLM",
+     "message": "我有 16 路 1080p 摄像头、8G 显存，想检测停车场拥堵——车多到堵住通道就报警。"},
+    {"id": "build-fight", "kind": "build", "focus": "行为研判（VLM）+ 事件尾 + 词表",
+     "message": "商场门口单路摄像头，拍到有人打架斗殴就报警。"},
+    {"id": "build-plate", "kind": "build", "focus": "车牌链：识车→裁车→车牌识别",
+     "message": "小区门口识别进出车辆的车牌，把结果存下来。"},
+    {"id": "build-face-capture", "kind": "build", "focus": "人脸截取：识人→裁人→检脸出原图",
+     "message": "把画面里的人脸截取出来归档，尽量清晰。"},
+    {"id": "build-face-identity", "kind": "build", "focus": "人脸身份：裁人→检脸→嵌入→底库",
+     "message": "在视频监控里找出特定的几个人是谁，我有他们的照片底库。"},
+    {"id": "build-drone-far", "kind": "build", "focus": "远角小目标：imgsz/conf + 无人机场景",
+     "message": "无人机高空俯拍，画面里远处的小目标和车辆，要尽量不漏。"},
+    {"id": "build-smoking", "kind": "build", "focus": "VLM 行为识别 + 事件尾",
+     "message": "车间里检测有没有人抽烟，拍到就告警。"},
+    {"id": "build-firelane", "kind": "build", "focus": "车辆停留/时序判定（持续占用）",
+     "message": "消防通道被车辆占用（车一直停着不动）要报警。"},
+    {"id": "build-crowd", "kind": "build", "focus": "人群聚集（成组数量 + 确认）",
+     "message": "广场上人突然聚集很多，要提示。"},
+
+    {"id": "mod-interval", "kind": "modify", "focus": "省资源：帧管理抽帧间隔",
+     "message": "现在这条链路抽帧太密了，CPU 占用太高，帮我省点资源。"},
+    {"id": "mod-falsepos", "kind": "modify", "focus": "误报：检测筛选/YOLO置信度",
+     "message": "误报太多了，经常把不是目标的框也报出来。"},
+    {"id": "mod-plate-repeat", "kind": "modify", "focus": "同车牌反复报：时序判定同对象一次/冷却",
+     "message": "同一个车牌被反复上报，怎么让它只报一次？"},
+    {"id": "mod-face-blur", "kind": "modify", "focus": "人像糊：目标裁剪输出分辨率",
+     "message": "截出来的人像太糊了，看不清。"},
+
+    {"id": "upgrade-core", "kind": "upgrade", "focus": "升级通道：不擅自动核心模块",
+     "message": "给核心的 composer 加一个新的判定模式，支持跨帧目标匹配。"},
+    {"id": "ambiguous", "kind": "ambiguous", "focus": "信号不足：先澄清不硬猜",
+     "message": "帮我做个监控。"},
+    {"id": "prompt-vlm", "kind": "prompt", "focus": "VLM 提示词 + 词表对齐",
+     "message": "让 VLM 顺便识别画面里有没有人吸烟，输出词表该怎么定？"}
+  ]
+}

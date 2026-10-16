@@ -16,7 +16,7 @@
 umvp/                                ← 项目根（独立部署包）
 ├── umvp/                            ← 模块根（管道模块 + 人脸管道，纯 Python + 推理封装）
 │   ├── pipe/
-│   │   ├── composer.py              ← 核心：模块 + 装配器（FrameManager/YOLODetector纯推理/VLM/OutputPolicy/Pipeline编排）
+│   │   ├── composer.py              ← 核心：模块 + 装配器（FrameManager/YOLODetector纯推理/VLM/DetFilter/SeqFilter/Pipeline编排）
 │   │   ├── cropper.py               ← 通用裁剪 Cropper（按框裁图可缩放/坐标还原/原分辨率提取，纯 cv2+numpy）
 │   │   ├── target_crop.py           ← 目标裁剪 TargetCrop（按上游检测框裁子图，输出分辨率可配）
 │   │   ├── annotate.py              ← 标注 Annotator（在帧上画检测框，供 VLM 看"原图+画框"）

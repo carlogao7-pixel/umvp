@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-四模块管道拼接验证（纯逻辑，不加载模型）
+管道拼接验证（纯逻辑，不加载模型）
 
 覆盖:
-  1. small_only —— 驻留告警 + 按类别冷却 + 有效性筛选（det_filter）
-  2. small_crop —— 按识别类型(类别)报送 + 滑动窗口确认 + 全局冷却
+  1. small_only 已弃用（compose 报错，随输出处理删除）
+  2. small_crop —— 按识别类型(类别)报送 + 类节拍(seq_filter 节流)
   3. small_full —— 按识别类型送全帧
-  4. large_only —— 全局墙钟定时 + 巡检直接落盘
+  4. large_only —— 全局墙钟定时
   5. 每类数量上下限 —— 超出上限/不足下限的类别跳过，其它类照常
   6. 有效性筛选（检测筛选阶段承接）—— 谓词链顺序无关 + DSL 等价 + 成组判定
   7. FrameManager 三种取图节奏 —— analysis / wall_clock / frame_count
   8. IntervalGate 传递门控
-  9. Pipeline 向下传递门控（_pass_dets，与 VLM 报送统一节拍）
-  11. infer 纯推理输出 + 检测筛选阶段过滤（对所有下游生效）
+  9. 时序门控（seq_filter 整类节流，原 Pipeline 编排迁入）
+  11. infer 纯推理 + 检测筛选 + 事件尾（last_events / publish）
 
 运行: ai 环境 python pipe/test_composer.py
 """
@@ -30,7 +30,6 @@ from pipe.composer import (
     SAMPLING_ANALYSIS,
     SAMPLING_FRAME_COUNT,
     SAMPLING_WALL_CLOCK,
-    AlarmPolicy,
     Pipeline,
     YOLODetector,
     compose,
@@ -53,28 +52,18 @@ def det(tid: int, cls: int = 0, score: float = 0.9, model: str = "m1") -> Detect
                      model_path=model)
 
 
-# ============ 1. small_only：驻留告警 + 按类别冷却 ============
-print("== 1. small_only ==")
-p = compose(dict(task_id=1, algo_mode="small_only", smooth_frames=3,
-                 alarm_cooldown=10, extract_frame_rate=3,
-                 class_limits={0: (1, 10), 1: (1, 10)}))
-_, a0 = p.step(0, 0.0, [det(1)])
-_, a1 = p.step(1, 1.0, [det(1)])
-_, a2 = p.step(2, 2.0, [det(1)])
-check("驻留<3s 不告警", not a0 and not a1 and not a2)
-_, a3 = p.step(3, 3.0, [det(1)])
-check("驻留>=3s 告警", len(a3) == 1 and a3[0].action == "dwell:0")
-# 注意: 帧管理抽帧(3 帧取 1)，有效分析帧为 0,3,6,9...
-_, a6 = p.step(6, 6.0, [det(1)])
-check("冷却期内不重复告警", not a6)
-_, b6 = p.step(6, 6.0, [det(1, cls=1)])
-check("按类别冷却独立", len(b6) == 1 and b6[0].action == "dwell:1")
+# ============ 1. small_only 已弃用 ============
+print("== 1. small_only 弃用 ==")
+try:
+    compose(dict(task_id=1, algo_mode="small_only", class_limits={0: (1, 10)}))
+    check("small_only 已弃用（报错）", False)
+except ValueError:
+    check("small_only 已弃用（报错）", True)
 
-# ============ 2. small_crop：按识别类型报送 + 滑动窗口 + 冷却 ============
+# ============ 2. small_crop：按识别类型报送 + 类节拍 ============
 print("== 2. small_crop ==")
 p = compose(dict(task_id=2, algo_mode="small_crop", class_limits={0: (1, 10)},
-                 check_interval=2.0, smooth_frames=2, target_actions=["fire"],
-                 alarm_cooldown=10, extract_frame_rate=3))
+                 check_interval=2.0, extract_frame_rate=3))
 # 注意: 帧门控(extract_frame_rate=3) 只分析帧 0,3,6,9...；ts 为墙钟秒
 s0, _ = p.step(0, 0.0, [det(1), det(2)])   # t=0: 同类多个目标合并成一条"类"请求
 check("同类目标合并为一条类请求", len(s0) == 1 and s0[0].track_key == 0
@@ -86,50 +75,30 @@ s6, _ = p.step(6, 3.0, [det(1)])           # t=3: 距上次3s≥2s 再送
 check("类节拍: 3s≥2s 再送", len(s6) == 1 and s6[0].ref == "full:cls0")
 # 双类别：各自独立计时、各自一条请求
 p2 = compose(dict(task_id=2, algo_mode="small_crop",
-                  class_limits={0: (1, 10), 1: (1, 10)},
-                  check_interval=2.0, smooth_frames=1, target_actions=["fire"],
-                  alarm_cooldown=10))
+                  class_limits={0: (1, 10), 1: (1, 10)}, check_interval=2.0))
 s0, _ = p2.step(0, 0.0, [det(1, 0), det(3, 1)])
 check("两类各一条请求", len(s0) == 2 and sorted(r.track_key for r in s0) == [0, 1])
 _, _ = p2.step(1, 1.0, [det(1, 0), det(3, 1)])   # 1s 内都不再送
 s3, _ = p2.step(3, 3.0, [det(3, 1)])             # cls1 距上次3s 再送; cls0 无目标
 check("类别独立计时: 仅 cls1 送", len(s3) == 1 and s3[0].track_key == 1)
-# VLM 滑动窗口（p 的 smooth_frames=2）
-al = p.on_vlm_result(0, "fire", ts=4.0)
-check("窗口未满不告警", not al)
-al = p.on_vlm_result(0, "fire", ts=5.0)
-check("窗口满+全部命中告警", len(al) == 1 and al[0].action == "fire"
-      and al[0].gran == GRAN_CLASS and al[0].track_key == 0)
-al = p.on_vlm_result(0, "fire", ts=6.0)
-check("冷却期内不重复", not al)
 
 # ============ 3. small_full：按识别类型送全帧 ============
 print("== 3. small_full ==")
 p = compose(dict(task_id=3, algo_mode="small_full", class_limits={0: (1, 10)},
-                 check_interval=2.0, smooth_frames=1, target_actions=["fight"],
-                 alarm_cooldown=10))
+                 check_interval=2.0))
 s0, _ = p.step(0, 0.0, [det(7)])
 check("small_full 送该类全帧", len(s0) == 1 and s0[0].ref == "full:cls0"
       and s0[0].gran == GRAN_CLASS)
-al = p.on_vlm_result(0, "fight", ts=1.0)
-check("smooth_frames=1 立即告警", len(al) == 1)
 
-# ============ 4. large_only：全局墙钟 + 巡检 ============
+# ============ 4. large_only：全局墙钟 ============
 print("== 4. large_only ==")
-p = compose(dict(task_id=4, algo_mode="large_only", check_interval=5.0,
-                 smooth_frames=1, target_actions=["issue"], alarm_cooldown=10))
+p = compose(dict(task_id=4, algo_mode="large_only", check_interval=5.0))
 s0, _ = p.step(0, 0.0, None)
 s1, _ = p.step(4, 4.0, None)
 check("墙钟: t=0 首送", len(s0) == 1 and s0[0].track_key == -1 and s0[0].gran == GRAN_SCENE)
 check("墙钟: t=4 未到5s不送", len(s1) == 0)
 s2, _ = p.step(5, 5.0, None)
 check("墙钟: t=5 到间隔再送", len(s2) == 1)
-al = p.on_vlm_result(-1, "issue", ts=6.0)
-check("常规模式命中告警", len(al) == 1 and al[0].gran == GRAN_SCENE)
-p2 = compose(dict(task_id=5, algo_mode="large_only", check_interval=5.0))  # 无 target_actions
-s0, _ = p2.step(0, 0.0, None)
-al = p2.on_vlm_result(-1, "任意内容", ts=1.0)
-check("巡检结果直接落盘", len(al) == 1 and al[0].action == "inspection")
 
 # ============ 5. 每类数量上下限 ============
 print("== 5. 每类数量上下限 ==")
@@ -201,93 +170,17 @@ for t in (0.5, 1.5, 2.0, 3.9):
         seq.append(t)
 check("门控: 序列放行符合间隔", seq == [2.0], str(seq))
 
-# ============ 9. Pipeline 向下传递门控（_pass_dets，与 VLM 报送统一） ============
-print("== 9. 按识别类型传递 ==")
-pg = Pipeline(frame=FrameManager(frame_skip=1),
-              alarm=AlarmPolicy(task_id=1, kind="inspection"), check_interval=2.0)
+# ============ 9. 时序门控（seq_filter 整类节流，原 Pipeline 编排迁入） ============
+print("== 9. 整类节流门控 ==")
+from pipe.seq_filter import SeqFilter
+g = SeqFilter(throttle={"key": "cls_id", "interval": 2.0})
 dl = [det(1, cls=0), det(2, cls=0), det(3, cls=2)]
-check("传递: 首帧整类放行", len(pg._pass_dets(dl, 0.0)) == 3)
-check("传递: 间隔内整类拦截", pg._pass_dets(dl, 1.0) == [])
-check("传递: 到间隔再放行", len(pg._pass_dets(dl, 2.0)) == 3)
-pf = Pipeline(frame=FrameManager(frame_skip=1),
-              alarm=AlarmPolicy(task_id=1, kind="inspection"), check_interval=0.0)
-check("传递: interval=0 每帧放行",
-      len(pf._pass_dets(dl, 0.0)) == 3 and len(pf._pass_dets(dl, 0.1)) == 3)
-
-# ============ 10. 输出漏斗（OutputPolicy，原告警策略通用化） ============
-print("== 10. 输出漏斗七道闸 ==")
-from pipe.composer import AlarmPolicy, Finding, OutputPolicy, parse_rules
-
-check("别名: AlarmPolicy is OutputPolicy", AlarmPolicy is OutputPolicy)
-
-# ---- 规则 DSL 解析 ----
-rs = parse_rules("conf >= 0.8, features.color == green;features.level == 高")
-check("规则: 两组三条件解析", len(rs) == 2 and len(rs[0]) == 2 and len(rs[1]) == 1)
-check("规则: 值类型（数字/字符串）", rs[0][0][2] == 0.8 and rs[0][1][2] == "green")
-rs2 = parse_rules("label in 交警类|治安类")
-check("规则: in 多值解析", isinstance(rs2[0][0][2], list) and len(rs2[0][0][2]) == 2)
-check("规则: 空串=关闸", parse_rules("") == [] and parse_rules(None) == [])
-for bad in ("不合法表达式", "conf ~ 8", "features.reading >= "):
-    try:
-        parse_rules(bad)
-        check(f"规则: 非法表达式报错 {bad!r}", False)
-    except ValueError as e:
-        check(f"规则: 非法表达式报错 {bad!r}", "无法解析" in str(e) or "为空" in str(e), str(e))
-
-def fd(key, label, ts, conf=1.0, features=None):
-    return Finding(key=key, label=label, ts=ts, conf=conf, features=features or {})
-
-# ---- 求值：数值/字符串/contains/in/缺字段 ----
-dash = Finding(key="g1", label="仪表", ts=10.0,
-               features={"reading": 82.5, "unit": "℃", "level": "高", "description": "读数超限"})
-p = OutputPolicy(task_id=9, kind="inspection", rules="features.reading >= 80, features.unit == ℃")
-check("漏斗: 规则命中输出", len(p.accept(dash)) == 1)
-p2 = OutputPolicy(task_id=9, kind="inspection", rules="features.reading >= 90")
-check("漏斗: 规则不命中拦截", p2.accept(dash) == [])
-p3 = OutputPolicy(task_id=9, kind="inspection", rules="features.level in 高|低")
-check("求值: in 命中", len(p3.accept(dash)) == 1)
-p4 = OutputPolicy(task_id=9, kind="inspection", rules="description contains 超限")
-check("求值: contains 命中", len(p4.accept(dash)) == 1)
-p5 = OutputPolicy(task_id=9, kind="inspection", rules="features.absent >= 1")
-check("求值: 缺字段=不通过", p5.accept(dash) == [])
-p6 = OutputPolicy(task_id=9, kind="inspection",
-                  rules="features.reading < 60;features.level == 高")
-check("求值: OR 任一组命中", len(p6.accept(dash)) == 1)
-
-# ---- 置信度闸 + 事件字段透传 ----
-pc = OutputPolicy(task_id=9, kind="inspection", min_conf=0.9)
-ev = pc.accept(Finding(key="plate:粤A1", label="粤A1", ts=1.0, conf=0.95,
-                       features={"plate_no": "粤A1", "color": "green"}))
-check("漏斗: min_conf 放行+事件带特征", len(ev) == 1 and ev[0].conf == 0.95
-      and ev[0].features["color"] == "green" and ev[0].action == "inspection")
-check("漏斗: min_conf 拦截", pc.accept(fd("plate:粤A2", "粤A2", 2.0, conf=0.5)) == [])
-
-# ---- 巡检同 key 只一次 / key_cooldown 语义 ----
-po = OutputPolicy(task_id=9, kind="inspection")
-check("巡检: 同 key 只输出一次",
-      len(po.accept(fd("plate:粤B2", "粤B2", 1.0))) == 1
-      and po.accept(fd("plate:粤B2", "粤B2", 2.0)) == []
-      and len(po.accept(fd("plate:粤B3", "粤B3", 2.0))) == 1)
-pk = OutputPolicy(task_id=9, kind="inspection", key_cooldown=3.0)
-check("巡检: key_cooldown>0 冷却后可再报",
-      len(pk.accept(fd("k1", "x", 0.0))) == 1 and pk.accept(fd("k1", "x", 2.0)) == []
-      and len(pk.accept(fd("k1", "x", 3.5))) == 1)
-pz = OutputPolicy(task_id=9, kind="inspection", key_cooldown=0)
-check("巡检: key_cooldown=0 逐条落盘",
-      len(pz.accept(fd("k1", "x", 1.0))) == 1 and len(pz.accept(fd("k1", "x", 2.0))) == 1)
-
-# ---- 驻留闸（inspection + min_dwell；dwell 档自动映射见 §1 旧断言） ----
-pd = OutputPolicy(task_id=9, kind="inspection", min_dwell=2.0)
-check("驻留: 不足 N 秒拦截", pd.accept(fd("k9", "x", 0.0)) == []
-      and pd.accept(fd("k9", "x", 1.9)) == [] and len(pd.accept(fd("k9", "x", 2.0))) == 1)
-
-# ---- window + 规则（"命中"含规则结果，滑窗计数随之） ----
-pw = OutputPolicy(task_id=9, kind="window", target_actions=["fire"],
-                  smooth_frames=2, rules="features.zone == 东区")
-fz = lambda ts, zone: Finding(key=0, label="fire", ts=ts, features={"zone": zone})
-check("window: 规则不命中不计入滑窗",
-      pw.accept(fz(1.0, "西区")) == [] and pw.accept(fz(2.0, "东区")) == []
-      and len(pw.accept(fz(3.0, "东区"))) == 1)  # 仅两次规则命中满足窗口
+check("节流: 首帧整类放行", len(g.run(dl, ts=0.0)) == 3)
+check("节流: 间隔内整类拦截", g.run(dl, ts=1.0) == [])
+check("节流: 到间隔再放行", len(g.run(dl, ts=2.0)) == 3)
+p0 = compose(dict(task_id=2, algo_mode="small_crop", class_limits={0: (1, 10)},
+                  check_interval=0.0, smooth_frames=1, target_actions=["x"]))
+check("check_interval=0：不建门控（每帧放行）", p0.seq_filter is None)
 
 # ============ 11. infer 纯推理输出 + 检测筛选阶段过滤（对所有下游生效） ============
 print("== 11. infer 纯推理 + det_filter ==")
@@ -324,16 +217,22 @@ class _Crop:
     def run(self, frame, dets, ts): self.n.append(len(dets)); return list(dets)
 cp = _Crop()
 pi = Pipeline(frame=FrameManager(frame_skip=1),
-              alarm=AlarmPolicy(task_id=1, kind="inspection"),
-              yolo=yd, crop=cp, det_filter=DetFilter(filter="score >= 0.5, long >= 50"),
-              check_interval=0.0)
+              yolo=yd, crop=cp, det_filter=DetFilter(filter="score >= 0.5, long >= 50"))
 subs, _ = pi.step(0, 0.0, frame=None, force=True)  # frame=None → 不自推理，dets=None
 yd2 = YOLODetector(model_path="x.pt"); yd2._model = yd._model
 pi2 = Pipeline(frame=FrameManager(frame_skip=1),
-               alarm=AlarmPolicy(task_id=1, kind="inspection"),
-               yolo=yd2, crop=cp, det_filter=DetFilter(filter="score >= 0.5, long >= 50"),
-               check_interval=0.0)
+                yolo=yd2, crop=cp,
+               det_filter=DetFilter(filter="score >= 0.5, long >= 50", events=["筛出"]))
 subs2, _ = pi2.step(0, 0.0, frame=object(), force=True)
 check("Pipeline: 裁剪拿到有效性筛选后的检测", cp.n[-1] == 1)
+check("Pipeline: last_events 汇总末段记录事件（链路尾通用输出）",
+      len(pi2.last_events) == 1 and pi2.last_events[0]["name"] == "筛出")
+# Pipeline.publish：外部记录（如 VLM 结果）经事件尾出事件
+pp = Pipeline(frame=FrameManager(frame_skip=1),
+              event_filter=DetFilter(filter="cls_id == 0",
+                                     events=[{"name": "vlm", "detail": ["content"]}]))
+evs = pp.publish([{"cls_id": 0, "content": {"r": 1}}, {"cls_id": 2, "content": {}}], ts=1.0)
+check("publish：外部记录经尾部出事件",
+      len(evs) == 1 and evs[0]["name"] == "vlm" and evs[0]["detail"]["content"] == {"r": 1})
 
 print(f"\n全部通过: {PASS} 项断言")

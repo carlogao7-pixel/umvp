@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "umvp"))
 
 from pipe.target_crop import crop_targets, TargetCrop
-from pipe.composer import Detection, FrameManager, AlarmPolicy, Pipeline
+from pipe.composer import Detection, FrameManager, Pipeline
 
 PASS = 0
 
@@ -150,7 +150,6 @@ def main() -> None:
 
     fp = FakePlate()
     p = Pipeline(frame=FrameManager(frame_skip=1),
-                 alarm=AlarmPolicy(task_id=1, kind="inspection"),
                  yolo=FakeYolo(), crop=TargetCrop(scale=2.0, classes=[2]), plate=fp)
     p.step(0, 0.0, frame=frame, force=True)
     check("Pipeline: 产出裁剪", len(p.last_crops) == 1 and p.last_crops[0].scale == 2.0)

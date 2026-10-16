@@ -1,40 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-模块化管道拼接器（重构版）：四模块 + 装配器
+模块化管道拼接器（重构版）：模块 + 装配器
 
-按"参数归属模块"重构（用户确认的分工）:
-  1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压（原 FrameScheduler 并入）
-  2. YOLODetector  小模型识别 —— **纯推理**（2026-10 起）：ultralytics 参数可调
-                     (conf/iou/imgsz/max_det/classes/device)，infer() 输出 Detection。
-                     有效性过滤/成组判定归「检测筛选 DetFilter」（pipe.det_filter，
-                     由 Pipeline.det_filter 承接）；向下传递节流与报送编排在
-                     Pipeline（check_interval / track_change_only / SubmitRequest 构造）
-  3. VLMAnalyzer   大模型研判 —— 素材准备(crop_padding/缩放/prompt) + 推理
-  4. OutputPolicy  输出处理（原告警策略）—— 统一漏斗：Finding → 驻留/词表/置信/规则/
-                     滑窗/去重冷却 七道闸 → OutputEvent（AlarmPolicy 为兼容别名）
+按"参数归属模块"重构:
+  1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压
+  2. YOLODetector  小模型识别 —— **纯推理**：ultralytics 参数可调(conf/iou/imgsz/
+                     max_det/classes/device)，infer() 输出 Detection。有效性过滤/成组判定
+                     归「检测筛选 DetFilter」（Pipeline.det_filter）；时序门控归「时序判定
+                     SeqFilter」（Pipeline.seq_filter / event_filter）
+  3. VLMAnalyzer   大模型研判 —— 素材准备(缩放/prompt) + 推理
+  （原「输出处理 OutputPolicy」已弃用删除：链路输出 = 事件尾产出的事件（记录携带 events，
+    见 pipe.records）；有效性/时序/冷却/同对象一次由 DetFilter/SeqFilter 承担。）
 
-装配器 compose(): 把四种分析模式（small_only/small_crop/small_full/large_only）
-映射为模块组合与参数，模式差异收敛为配置，不产生分支代码。
+装配器 compose(): 把分析模式（small_crop/small_full/large_only）映射为模块组合与参数。
 
-YOLO 输出粒度（用户定义，2026-08-04 改; 2026-10 编排上移到 Pipeline）:
+YOLO 输出粒度（2026-10 编排上移到 Pipeline）:
   class —— 按识别类型（类别）单独报送：画面里每出现一类识别对象（且数量在
            "该类上下限"范围内——由 DetFilter.group_limits 判定）就发一条请求，
            一类多个目标合并成一条（ref=full:cls{类别} 送全帧、拼接层画该类框标注）。
   scene —— 仅 large_only 的周期性整帧（ref=full:global），不经过小模型。
-  说明: per_track（按目标独立报送）已删除；驻留告警(dwell)仍按 track 记首次出现，
-         但那是告警策略内部逻辑，不产生报送请求。
 
 依赖: 纯 Python（抽帧+背压已在 FrameManager 内部，不再依赖 face_scan）
 """
 
 from __future__ import annotations
 
-import math
-import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pipe.det_filter import DetFilter
+from pipe.records import collect_events
+from pipe.seq_filter import SeqFilter
 
 _NEG_INF = -1e18  # 首见必送：模拟 spaz 以 unix 时间戳减 0 的语义
 
@@ -52,27 +48,13 @@ class Detection:
 
 @dataclass
 class SubmitRequest:
-    """一次报送请求（YOLO → VLM 或 直接告警）。"""
+    """一次报送请求（检测 → VLM）。"""
 
     track_key: int  # 按识别类型=类别编号; large_only 整帧=-1
     gran: str  # "class"（按识别类型） | "scene"（周期性整帧）
-    ref: str  # "full:cls{类别}" / "crop:cls{类别}" / "full:global"
+    ref: str  # "full:cls{类别}" / "full:global"
     det: Optional[Detection] = None  # 保留字段（单目标素材用）；按类报送时为空
     dets: List[Detection] = field(default_factory=list)  # 该类全部有效检测（large_only 为空）
-
-
-@dataclass
-class AlarmEvent:
-    """一次输出/告警事件。"""
-
-    task_id: int
-    gran: str
-    track_key: Any  # 对象标识：int（track/类别）或 str（如 "plate:粤ACJ0710"）
-    action: str  # dwell:{cls} / 命中 action / inspection
-    ts: float
-    description: str = ""  # VLM 返回的警情描述 / 车牌摘要
-    conf: float = 1.0  # 来源置信度（车牌 score / 人脸相似度…；无则 1.0）
-    features: Optional[dict] = None  # 特征包（车牌号/颜色/读数等，原样透传）
 
 
 # ---------------- 模块 1: 帧管理 ----------------
@@ -230,7 +212,7 @@ class IntervalGate:
     现有两处使用（同一机制，不同 key/interval）：
       yolo→vlm 报送（key=类别, interval=check_interval）、
       yolo→plate 车辆框（key=track_id, interval=track_cooldown）。
-    （原 plate→alarm 新车牌门控已并入输出漏斗 OutputPolicy 的 ⑦去重冷却闸。）
+    （原 plate→alarm 新车牌门控已由「时序判定 SeqFilter」的同对象一次（cooldown<0）承担。）
     """
 
     def __init__(self, interval: float = 0.0) -> None:
@@ -254,7 +236,6 @@ class IntervalGate:
 
 
 # ---------------- 模块 2: YOLO 识别（纯推理） ----------------
-GRAN_TRACK = "per_track"  # 仅驻留告警(dwell)事件标注用；报送不再按 track
 GRAN_SCENE = "scene"  # 周期性整帧（large_only）
 GRAN_CLASS = "class"  # 按识别类型（类别）报送
 
@@ -357,243 +338,20 @@ class VLMAnalyzer:
         return infer(payload)
 
 
-# ---------------- 模块 4: 输出处理（原告警策略） ----------------
-ALARM_WINDOW = "window"  # VLM 滑动窗口确认
-ALARM_DWELL = "dwell"  # 驻留秒数（small_only）
-ALARM_INSPECTION = "inspection"  # 巡检：结果直接落盘（同 key 只一次，见 key_cooldown）
-
-
-@dataclass
-class Finding:
-    """一次发现（输出漏斗的统一输入）：多帧视觉分析的公共形态 =
-    对象(key) + 主分类(label) + 置信度(conf) + 特征包(features) + 时间(ts)。"""
-
-    key: Any  # 对象标识：track_id / 类别编号 / "plate:粤ACJ0710" / "scene"
-    label: str  # 主分类标签：VLM action 词 / 车牌号 / "dwell:{cls}"
-    ts: float
-    gran: str = "class"  # 报送粒度（class/scene/track，进事件透传）
-    conf: float = 1.0  # 置信度
-    features: Optional[dict] = None  # 特征包：车牌号/颜色/读数/VLM 描述等，原样透传到事件
-
-
-# ---- 规则 DSL：组内逗号 AND、组间分号 OR；条件 = 字段 操作符 值 ----
-# 字段: conf | dwell | label | key | features.<名>（缺字段 → 该条不通过）
-# 操作符: >= > <= < == != contains in（in 值用 | 分隔多选）；值: 数字或字符串（可带引号）
-# 语法约定：操作符两侧必须留空格（如 conf >= 0.8），否则按无法解析报错——
-# 这同时阻止正则回退把字段内的 "in"、孤立的 ">=" 误当操作符。
-_RULE_RE = re.compile(
-    r"^\s*([A-Za-z_][\w.]*)\s+(>=|<=|==|!=|>(?!=)|<(?!=)|contains|in)\s+(.+?)\s*$")
-
-
-def _to_num(v) -> Optional[float]:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_rule_value(text: str):
-    """值解析：数字 → float；引号包裹 → 去引号；其余原样字符串。"""
-    t = text.strip()
-    if len(t) >= 2 and t[0] in ("'", '"') and t[-1] == t[0]:
-        return t[1:-1]
-    n = _to_num(t)
-    return n if n is not None else t
-
-
-def parse_rules(rules) -> List[List[Tuple[str, str, Any]]]:
-    """规则 DSL → [[(字段, 操作符, 值), ...](组内 AND), ...](组间 OR)。空 → []（闸关）。
-
-    非法表达式抛 ValueError（通俗报错：指明第几组第几条、错在哪）——供保存/装配时快速失败。
-    """
-    if rules is None or (isinstance(rules, str) and not rules.strip()):
-        return []
-    if not isinstance(rules, str):  # 已解析的结构直接透传（内部便利）
-        return list(rules)
-    groups: List[List[Tuple[str, str, Any]]] = []
-    for gi, gtext in enumerate(str(rules).split(";"), 1):
-        conds: List[Tuple[str, str, Any]] = []
-        parts = [c for c in (p.strip() for p in gtext.split(",")) if c]
-        if not parts:
-            raise ValueError(f"输出规则第 {gi} 组为空（组内逗号=并且，组间分号=或者）")
-        for ci, cond in enumerate(parts, 1):
-            m = _RULE_RE.match(cond)
-            if not m:
-                raise ValueError(
-                    f"输出规则第 {gi} 组第 {ci} 条无法解析: {cond!r}"
-                    "（应为 字段 操作符 值，如 features.reading >= 80）")
-            f, op, vtext = m.group(1), m.group(2), m.group(3)
-            value = ([_parse_rule_value(x) for x in vtext.split("|")]
-                     if op == "in" else _parse_rule_value(vtext))
-            conds.append((f, op, value))
-        groups.append(conds)
-    return groups
-
-
-def _rule_field(f: Finding, dwell: float, name: str):
-    """取字段值；缺字段 → None（该条件视为不通过，适配上游能力差异）。"""
-    if name == "conf":
-        return f.conf
-    if name == "dwell":
-        return dwell
-    if name == "label":
-        return f.label
-    if name == "key":
-        return f.key
-    return (f.features or {}).get(name[9:] if name.startswith("features.") else name)
-
-
-def _cond_pass(cond: Tuple[str, str, Any], f: Finding, dwell: float) -> bool:
-    field, op, value = cond
-    a = _rule_field(f, dwell, field)
-    if a is None:
-        return False
-    if op in (">", ">=", "<", "<="):
-        x, y = _to_num(a), _to_num(value)
-        if x is None or y is None:
-            return False
-        return x > y if op == ">" else x >= y if op == ">=" else x < y if op == "<" else x <= y
-    if op == "==":
-        return a == value or str(a) == str(value)
-    if op == "!=":
-        return not (a == value or str(a) == str(value))
-    if op == "contains":
-        return str(value) in str(a)
-    if op == "in":
-        return str(a) in [str(v) for v in value]
-    return False
-
-
-class OutputPolicy:
-    """通用输出漏斗：Finding → 七道闸 → AlarmEvent。闸门全可关，默认组合=旧三 kind 行为。
-
-    闸序：①登记(驻留记账) → ②min_dwell 驻留 → ③词表(仅 window) → ④min_conf 置信度
-         → ⑥rules 规则 DSL → ⑤滑窗(仅 window，"命中"=通过③④⑥) → ⑦去重冷却。
-    kind = 预设档位：window(词表+滑窗+按 action 冷却) / dwell(驻留+按类冷却，
-    smooth_frames 旧语义=驻留秒数自动映射 min_dwell) / inspection(全收+同 key 只一次，
-    key_cooldown 可改：0=不去重逐条落盘、>0=同 key 冷却后可再报)。
-    """
-
-    def __init__(
-        self,
-        task_id: int,
-        kind: str = ALARM_WINDOW,
-        target_actions: Optional[Sequence[str]] = None,  # 空 = 巡检（kind 自动 inspection）
-        smooth_frames: int = 1,  # 双语义: dwell=驻留秒数阈值; window=滑动窗口长度
-        hit_ratio: float = 1.0,  # window: 命中比例
-        alarm_cooldown: float = 60.0,
-        cooldown_by_action: bool = False,  # window: 是否按警情类型独立冷却
-        min_conf: float = 0.0,  # ④ 置信度闸（0=关）
-        min_dwell: float = 0.0,  # ② 驻留闸秒数（0=关；dwell 预设未显式给时取 smooth_frames）
-        key_cooldown: float = -1.0,  # inspection: -1=同 key 只一次(默认) / 0=不去重 / >0=冷却间隔
-        rules: str = "",  # ⑥ 规则 DSL（空=关；语法见 parse_rules）
-    ) -> None:
-        self.task_id = task_id
-        self.target_actions = list(target_actions or [])
-        # 巡检模式仅在 VLM 窗口模式下由"无 target_actions"自动派生；
-        # dwell（驻留）模式天然无 target_actions，不能误判为巡检
-        self.kind = ALARM_INSPECTION if (not self.target_actions and kind == ALARM_WINDOW) else kind
-        self.smooth_frames = max(1, int(smooth_frames))
-        self.hit_ratio = hit_ratio
-        self.alarm_cooldown = alarm_cooldown
-        self.cooldown_by_action = cooldown_by_action
-        self.min_conf = float(min_conf or 0.0)
-        if self.kind == ALARM_DWELL and not float(min_dwell or 0):
-            self.min_dwell = float(self.smooth_frames)  # 兼容：dwell 旧语义 smooth_frames=驻留秒数
-        else:
-            self.min_dwell = float(min_dwell or 0.0)
-        self.key_cooldown = -1.0 if key_cooldown is None else float(key_cooldown)
-        self._rules = parse_rules(rules)  # 非法表达式在此快速失败
-        self._history: Dict[Any, List[str]] = {}
-        self._first_seen: Dict[Any, float] = {}
-        self._cooldown_until: Dict[Tuple, float] = {}
-
-    def _cooling(self, scope: Tuple, ts: float) -> bool:
-        return self._cooldown_until.get(scope, _NEG_INF) > ts
-
-    # ---- 统一入口：漏斗 ----
-    def accept(self, f: Finding) -> List[AlarmEvent]:
-        # ① 登记（驻留记账：按 key 记首次出现）
-        first = self._first_seen.setdefault(f.key, f.ts)
-        dwell = max(0.0, f.ts - first)
-        # ② 驻留闸
-        if self.min_dwell > 0 and dwell < self.min_dwell:
-            return []
-        # ③ 词表闸（window 专属；inspection/dwell 全收）
-        if self.kind == ALARM_WINDOW and f.label not in self.target_actions:
-            return []
-        # ④ 置信度闸
-        if self.min_conf > 0 and (f.conf is None or f.conf < self.min_conf):
-            return []
-        # ⑥ 规则闸（"命中" = 通过 ③④⑥，供 ⑤ 滑窗计数）
-        if self._rules and not any(all(_cond_pass(c, f, dwell) for c in g)
-                                   for g in self._rules):
-            return []
-        # ⑤ 滑窗闸（window 专属）
-        if self.kind == ALARM_WINDOW:
-            h = self._history.setdefault(f.key, [])
-            h.append(f.label)
-            if len(h) > self.smooth_frames:
-                h.pop(0)
-            required = max(1, math.ceil(self.smooth_frames * self.hit_ratio))
-            hits = sum(1 for a in h if a in self.target_actions)
-            if not (f.label in self.target_actions
-                    and len(h) >= self.smooth_frames and hits >= required):
-                return []
-        # ⑦ 去重冷却闸（scope 规则随 kind 显式指定）
-        if self.kind == ALARM_WINDOW:
-            scope = ((self.task_id, self.task_id, f.label) if self.cooldown_by_action
-                     else (self.task_id, self.task_id))
-            cooldown = self.alarm_cooldown
-        elif self.kind == ALARM_DWELL:
-            scope = (self.task_id, f.label)  # label="dwell:{cls}" ≡ 旧按类别冷却
-            cooldown = self.alarm_cooldown
-        else:  # inspection：按对象 key（车牌号/巡检对象）
-            scope = (self.task_id, "key", f.key)
-            cooldown = self.key_cooldown
-        if cooldown < 0:  # 同 key 只输出一次
-            if scope in self._cooldown_until:
-                return []
-            self._cooldown_until[scope] = math.inf
-        elif cooldown == 0:  # 不去重（巡检逐条落盘）
-            pass
-        elif self._cooling(scope, f.ts):
-            return []
-        else:
-            self._cooldown_until[scope] = f.ts + cooldown
-        action = "inspection" if self.kind == ALARM_INSPECTION else f.label
-        desc = (f.features or {}).get("description", "")
-        return [AlarmEvent(self.task_id, f.gran, f.key, action, f.ts, desc,
-                           conf=f.conf, features=f.features)]
-
-    # ---- 兼容入口（旧调用形态，内部走统一漏斗） ----
-    def on_vlm_result(self, track_key: int, action: str, ts: float, description: str = "") -> List[AlarmEvent]:
-        gran = GRAN_SCENE if track_key == -1 else GRAN_CLASS
-        return self.accept(Finding(key=track_key, label=action, ts=ts, gran=gran,
-                                   features=({"description": description} if description else None)))
-
-    def on_dwell(self, track_id: int, cls_id: int, ts: float) -> List[AlarmEvent]:
-        return self.accept(Finding(key=track_id, label=f"dwell:{cls_id}", ts=ts,
-                                   gran=GRAN_TRACK))
-
-
-# 兼容别名：历史命名（表/文档/外部调用零改动）
-AlarmPolicy = OutputPolicy
 
 
 # ---------------- 装配器 ----------------
 @dataclass
 class Pipeline:
-    """组装好的分析管道。step() 驱动：帧决策 → YOLO → 目标裁剪 → 报送/告警。
+    """组装好的分析管道。step() 驱动：帧决策 → YOLO → 目标裁剪 → 报送/事件（无输出处理模块）。
 
     crop 为可选的"目标裁剪阶段"（鸭子类型：需实现 run(frame, dets, ts) -> list），
     plate 为可选的"车牌识别阶段"（需实现 run(frame, crops, ts) -> list），
     均由拼接层注入（pipe.target_crop.TargetCrop / plate_recog.PlateStage），
-    本模块不引入 cv2/onnx 依赖。
+    本模块不引入 cv2/onnx 依赖。链路输出 = 事件尾（event_filter）产出的事件（last_events）。
     """
 
     frame: FrameManager
-    alarm: AlarmPolicy
     yolo: Optional[YOLODetector] = None
     vlm: Optional[VLMAnalyzer] = None
     infer: Optional[Callable[[dict], str]] = None  # 外部 VLM 推理回调
@@ -601,88 +359,68 @@ class Pipeline:
     annotate: Optional[object] = None  # 标注阶段（Annotator.run(frame, dets, ts) -> 带框图）
     plate: Optional[object] = None  # 车牌识别阶段（PlateStage.run(frame, crops, ts)）
     det_filter: Optional[DetFilter] = None  # 检测筛选阶段（有效性：逐条+成组，2026-10 自 YOLO 迁入）
-    check_interval: float = 3.0  # 向下传递/报送的按类间隔门控（秒/类；0=每分析帧；原 YOLO 参数）
-    track_change_only: bool = False  # 报送抑制：同类 track_id 集合无变化不报送（原 YOLO 参数）
+    seq_filter: Optional[object] = None  # 时序判定阶段（节流/变化门控 + 事件，2026-10 自 Pipeline 迁入）
+    event_filter: Optional[object] = None  # 事件尾（VLM/车牌等外部记录经 publish 走它出事件，可作链路尾）
     last_plates: List = field(default_factory=list)  # 最近一帧识别到的车牌（供驱动层读取）
     last_crops: List = field(default_factory=list)  # 最近一帧目标裁剪产物（供驱动层读取）
     last_annotated: object = None  # 最近一帧标注图（供驱动层/VLM 素材读取）
     last_plate_input: List = field(default_factory=list)  # 最近一帧传给车牌阶段的车辆子图（门控后）
     last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
+    last_events: List = field(default_factory=list)  # 最近一帧末段记录携带的事件（链路尾通用输出，见 records.events）
 
-    def __post_init__(self) -> None:
-        self._gate = IntervalGate(self.check_interval)  # 传递/报送共用节拍（key=类别）
-        self._last_track_ids: Dict[int, set] = {}  # 类别 -> 上次 track_id 集合（track_change_only）
+    def _submits(self, dets: List[Detection]) -> List[SubmitRequest]:
+        """按识别类型（类别）构造报送请求（有效性/门控已由 det_filter/seq_filter 完成）。
 
-    # ---- 编排：向下传递门控 + 按类报送构造（2026-10 自 YOLODetector 迁入） ----
-    def _pass_dets(self, dets: List[Detection], ts: float) -> List[Detection]:
-        """按 check_interval（key=识别类型）放行检测结果——向非 VLM 下游（如目标裁剪）
-        传递数据的统一间隔门控，与 _submits()（VLM 报送）共用同一 gate 状态。
-
-        入参 dets 应已过检测筛选（有效性）；本方法只做按类间隔门控，不再过滤。
-        同一帧内同一识别类型要么整类放行、要么整类拦截；0=每分析帧都放行。
-        新目标的入场延迟由帧管理取帧间隔与下游自身去重（如车牌按 track）兜底。
-        """
-        out: List[Detection] = []
-        passed: set = set()
-        for d in dets:
-            cls = d.cls_id
-            if cls not in passed and self._gate.allow(cls, ts):
-                self._gate.note(cls, ts)
-                passed.add(cls)
-            if cls in passed:
-                out.append(d)
-        return out
-
-    def _submits(self, dets: List[Detection], ts: float) -> List[SubmitRequest]:
-        """按识别类型（类别）构造报送请求（有效性/成组判定已由检测筛选阶段完成）。
-
-        每类独立计时，一类目标再多也只算一条请求；track_change_only 抑制
-        同类 track_id 集合无变化的重复送审（抑制时不消耗节拍）。
+        只分组 + 造语料：一类目标再多也只算一条请求（ref=full:cls{cls}）。何时报、
+        报不报由链上 det_filter（有效性）与 seq_filter（节流/变化门控）决定。
         """
         by_cls: Dict[int, List[Detection]] = {}
         for d in dets:
             by_cls.setdefault(d.cls_id, []).append(d)
-        reqs: List[SubmitRequest] = []
-        for cls, cdets in sorted(by_cls.items()):
-            if self._gate.allow(cls, ts):
-                if self.track_change_only:
-                    current_track_ids = {d.track_id for d in cdets if d.track_id > 0}
-                    last_track_ids = self._last_track_ids.get(cls, set())
-                    if current_track_ids == last_track_ids and len(current_track_ids) > 0:
-                        continue  # track_id 无变化，跳过报送（不消耗节拍）
-                    self._last_track_ids[cls] = current_track_ids
-                self._gate.note(cls, ts)
-                reqs.append(SubmitRequest(cls, GRAN_CLASS, f"full:cls{cls}", dets=cdets))
-        return reqs
+        return [SubmitRequest(cls, GRAN_CLASS, f"full:cls{cls}", dets=cdets)
+                for cls, cdets in sorted(by_cls.items())]
+
+    def publish(self, records, ts: float = 0.0, frame_idx: int = 0) -> List[dict]:
+        """把外部产生的记录（如 VLM 结果/车牌结果）经**事件尾**（event_filter）处理后
+        汇总事件返回（collect_events）。
+
+        通用：不绑定记录来源与内容；供以筛选模块收尾（无 alarm 阶段）的链路把
+        VLM 的 JSON 内容等作为链路尾输出。记录用 dict 携带字段（如 content/label）。
+        """
+        items = list(records or [])
+        if items and self.event_filter is not None:
+            items = self.event_filter.run(items, ts=ts, frame_idx=frame_idx)
+        return collect_events(items)
 
     def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
              frame=None, force: bool = False):
-        """处理一帧。返回 (submits, alarms)。
+        """处理一帧。返回 (submits, events)。
         dets 由拼接层在 wants_frame 为真时做 YOLO 推理提供（无 YOLO 的模式传 None）；
-        不传 dets 但配置了 yolo 时，传 frame 由模块自推理（dwell 用 track=True 保持
-        track_id 稳定，其它模式 track=False）。force=True 时跳过帧决策检查——
-        供调用方已先行 wants_frame() 门控（如 h_chain 视频驱动）避免重复采样。"""
+        不传 dets 但配置了 yolo 时，传 frame 由模块自推理（车牌按 track 去重时 track=True）。
+        force=True 时跳过帧决策检查——供调用方已先行 wants_frame() 门控避免重复采样。"""
         submits: List[SubmitRequest] = []
-        alarms: List[AlarmEvent] = []
         if not force and not self.frame.wants_frame(frame_idx, ts):
-            return submits, alarms
+            return submits, []
         if dets is None and self.yolo is not None and frame is not None:
             dets = self.yolo.infer(frame, track=self.track_needed())
 
         # 检测筛选阶段：有效性判定（逐条条件 + 成组数量；原 YOLO 输出过滤链）——
-        # 不达标的检测视为"未识别"，对**所有**下游（裁剪/标注/报送/驻留）一致生效。
+        # 不达标的检测视为"未识别"，对**所有**下游（裁剪/标注/报送/事件）一致生效。
         self.last_filter = None
         if dets and self.det_filter is not None:
             n_in = len(dets)
             dets = self.det_filter.run(dets, ts=ts, frame_idx=frame_idx)
             self.last_filter = (n_in, len(dets))
 
-        # 目标裁剪阶段：按上游 YOLO 框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
-        # 传递门控：按识别类型 check_interval（key=类别），与报送共用同一节拍。
+        # 时序判定阶段：节流/变化门控（原 Pipeline check_interval/track_change_only）——
+        # 门控下游可见的检测集。
+        if dets and self.seq_filter is not None:
+            dets = self.seq_filter.run(dets, ts=ts, frame_idx=frame_idx)
+
+        # 目标裁剪阶段：按上游检测框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
         self.last_crops = []
         if self.crop is not None and frame is not None and dets is not None:
-            gated = self._pass_dets(dets, ts) if self.check_interval else dets
-            self.last_crops = list(self.crop.run(frame, gated, ts))
+            self.last_crops = list(self.crop.run(frame, dets, ts))
 
         # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）
         self.last_annotated = None
@@ -690,41 +428,37 @@ class Pipeline:
             self.last_annotated = self.annotate.run(frame, dets, ts)
 
         if self.yolo is not None:
-            if self.alarm.kind == ALARM_DWELL and dets is not None:
-                # small_only: 无 VLM，有效性筛选后逐 track 驻留告警
-                for d in dets:
-                    alarms += self.alarm.on_dwell(d.track_id, d.cls_id, ts)
-            elif self.crop is not None:
+            if self.crop is not None:
                 pass  # 目标裁剪已产出，供下游阶段消费
             elif dets is not None and self.vlm is not None:
-                # 报送请求的唯一消费者是 VLM 阶段（门控在 _submits() 内生效）
-                submits = self._submits(dets, ts)
-        elif self.vlm is not None and self.alarm.kind != ALARM_DWELL:
+                # 报送请求的唯一消费者是 VLM 阶段（门控已在上游 det_filter/seq_filter 生效）
+                submits = self._submits(dets)
+        elif self.vlm is not None:
             # large_only: 帧决策即送整帧
             submits = [SubmitRequest(-1, GRAN_SCENE, "full:global")]
 
-        # 车牌识别阶段：识别 → 输出漏斗（inspection 默认同车牌号只输出一次，key_cooldown 可调）
+        # 车牌识别阶段：识别 → 事件尾（event_filter 经 publish 出事件，幸存者=告警载体）
         self.last_plates = []
         self.last_plate_input = []
+        plate_events: List[dict] = []
         if self.plate is not None and frame is not None:
             self.last_plate_input = list(self.last_crops)
             self.last_plates = list(self.plate.run(frame, self.last_crops, ts))
             for p in self.last_plates:
-                if p.plate_no:
-                    alarms += self.alarm.accept(Finding(
-                        key=f"plate:{p.plate_no}", label=p.plate_no, ts=ts, conf=p.score,
-                        features={"plate_no": p.plate_no, "type_name": p.type_name,
-                                  "color": p.color, "bbox": list(p.bbox),
-                                  "description": f"{p.plate_no} {p.type_name} {p.score:.2f}"}))
-        return submits, alarms
+                if not p.plate_no:
+                    continue
+                rec = {"kind": "plate", "label": p.plate_no, "score": p.score,
+                       "content": {"plate_no": p.plate_no, "type_name": p.type_name,
+                                   "color": p.color, "bbox": list(p.bbox)}}
+                plate_events += self.publish([rec], ts, frame_idx)
+        # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
+        # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
+        self.last_events = (collect_events(dets) if dets else []) + plate_events
+        return submits, self.last_events
 
     def track_needed(self) -> bool:
-        """是否需要 YOLO 跟踪（dwell 按 track 驻留；车牌阶段按 track 去重）。"""
-        return (self.alarm.kind == ALARM_DWELL
-                or bool(getattr(self.plate, "use_track", False)))
-
-    def on_vlm_result(self, track_key: int, action: str, ts: float, description: str = "") -> List[AlarmEvent]:
-        return self.alarm.on_vlm_result(track_key, action, ts, description)
+        """是否需要 YOLO 跟踪（车牌阶段按 track 去重时需要）。"""
+        return bool(getattr(self.plate, "use_track", False))
 
 
 def _yolo_kw(spec: dict) -> dict:
@@ -740,25 +474,40 @@ def _yolo_kw(spec: dict) -> dict:
     }.items() if v is not None}
 
 
+def _seq_filter_of_spec(spec: dict):
+    """spec 的 check_interval/track_change_only → SeqFilter 门控（无则 None）。
+
+    兼容旧代码级 spec：check_interval → throttle(key=cls_id)；track_change_only →
+    change(key=cls_id, watch=track_id)。2026-10 起这两个语义由 seq_filter 承担。
+    """
+    throttle = change = None
+    try:
+        ci = float(spec.get("check_interval", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ci = 0.0
+    if ci > 0:
+        throttle = {"key": "cls_id", "interval": ci}
+    if spec.get("track_change_only"):
+        change = {"key": "cls_id", "watch": "track_id"}
+    if throttle is None and change is None:
+        return None
+    return SeqFilter(throttle=throttle, change=change)
+
+
 def compose(spec: dict) -> Pipeline:
-    """把任务配置映射为模块组合。spec 各字段来自数据库任务配置。"""
+    """把任务配置映射为模块组合。spec 各字段来自数据库任务配置。
+
+    注：`small_only`（小模型驻留告警）已随「输出处理」弃用删除；链路输出改用
+    事件尾（det_filter/seq_filter 的 events）。
+    """
     mode = spec["algo_mode"]
-    tid = spec["task_id"]
     extract_rate = spec.get("extract_frame_rate", 3)
-    target_actions = spec.get("target_actions", [])
-    smooth = spec.get("smooth_frames", 1)
+    if mode == "small_only":
+        raise ValueError("small_only（驻留告警）已弃用：改用检测筛选/时序判定的链路事件尾")
     # 有效性筛选（原 YOLO 过滤链+识别对象数量范围）：逐条谓词 + 成组数量判定
     det_filter = DetFilter(predicates=spec.get("filters"),       # 自定义顺序过滤链（可选）
                            group_limits=spec.get("class_limits", {}))  # 空 dict=全拦（旧语义）
-
-    if mode == "small_only":
-        return Pipeline(
-            frame=FrameManager(sampling=SAMPLING_ANALYSIS, frame_skip=extract_rate),
-            yolo=YOLODetector(**_yolo_kw(spec)),
-            det_filter=det_filter,
-            alarm=AlarmPolicy(task_id=tid, kind=ALARM_DWELL, smooth_frames=smooth,
-                              alarm_cooldown=spec.get("alarm_cooldown", 60.0)),
-        )
+    seq_filter = _seq_filter_of_spec(spec)  # 节流/变化门控（原 check_interval/track_change_only）
 
     if mode in ("small_crop", "small_full"):
         # 报送粒度固定为"按识别类型"；均送该类全帧(full:cls)、由拼接层画该类框标注。
@@ -767,13 +516,9 @@ def compose(spec: dict) -> Pipeline:
             frame=FrameManager(sampling=SAMPLING_ANALYSIS, frame_skip=extract_rate),
             yolo=YOLODetector(**_yolo_kw(spec)),
             det_filter=det_filter,
-            check_interval=spec.get("check_interval", 3.0),
+            seq_filter=seq_filter,
             vlm=VLMAnalyzer(max_resolution=spec.get("vlm_max_resolution", (1280, 720)),
                             prompt=spec.get("vlm_prompt", "")),
-            alarm=AlarmPolicy(task_id=tid, kind=ALARM_WINDOW, target_actions=target_actions,
-                              smooth_frames=smooth,
-                              hit_ratio=spec.get("vlm_hit_ratio", 1.0),
-                              alarm_cooldown=spec.get("alarm_cooldown", 60.0)),
         )
 
     if mode == "large_only":
@@ -781,10 +526,6 @@ def compose(spec: dict) -> Pipeline:
             frame=FrameManager(sampling=SAMPLING_WALL_CLOCK, interval_sec=spec.get("check_interval", 3.0)),
             vlm=VLMAnalyzer(max_resolution=spec.get("vlm_max_resolution", (1280, 720)),
                             prompt=spec.get("vlm_prompt", "")),
-            alarm=AlarmPolicy(task_id=tid, kind=ALARM_WINDOW, target_actions=target_actions,
-                              smooth_frames=smooth,
-                              hit_ratio=spec.get("vlm_hit_ratio", 1.0),
-                              alarm_cooldown=spec.get("alarm_cooldown", 60.0)),
         )
 
     raise ValueError(f"未知模式: {mode}")

@@ -3,13 +3,13 @@
 
 职责：把各模块/链路的命名配置（preset）存进 MySQL，供前端"命名暂存/取用"。
 
-存储模型（2026-08-10 起，详见 doc/存储设计.md）:
+存储模型（2026-08-10 起，详见 doc/design/storage_design.md）:
   - presets 保留为"注册表"：id / kind / name / module_id / 时间戳；
   - 每个模块（module_id，如 yolo/vlm）一张参数表 preset_params_<module_id>，
     参数从 JSON 展开为类型化列（由 server.py 启动时 configure_modules 注册 schema）；
   - kind='pipeline' 仍是整份 JSON 快照（params_json），结构不固定不适合列式。
 
-ID 规则（2026-09-20 起，见 doc/数据库结构.md）:
+ID 规则（2026-09-20 起，见 doc/guides/database_schema.md）:
   - presets.id / pipelines.id 不再用自增整数，改"模块前缀 + 4 位序号"的业务编号，
     如 YOLO0001 / FM0001 / PIPE0001；新建时按前缀自动递增；
   - init_db 检测到旧整数 schema 时自动 DROP 全部相关表并重建（播种数据可再生）。
@@ -21,7 +21,7 @@ ID 规则（2026-09-20 起，见 doc/数据库结构.md）:
   - 命名即身份：同 kind 下 name 重复保存 = 覆盖旧配置（重新保存即更新）；
   - 连接参数可用 MYSQL_* 环境变量覆盖（换机器/换库零改码）。
 
-运行实例（本项目自含，免 sudo，见 doc）:
+运行实例（本项目自含，免 sudo，见 doc/guides/database_schema.md）:
   mysqld --datadir=项目/.mysql/data --socket=项目/.mysql/mysql.sock \
          --port=3307 --bind-address=127.0.0.1
 """
@@ -57,7 +57,7 @@ _conn = None  # 惰性连接
 _LOCK = threading.RLock()
 
 # 模块参数 schema：module_id -> {参数名: 参数类型}。由 server.py 启动时 configure_modules 注册，
-# db 据此建参数表 / 类型强转（设计见 doc/存储设计.md）。
+# db 据此建参数表 / 类型强转（设计见 doc/design/storage_design.md）。
 _SCHEMAS: dict[str, dict[str, str]] = {}
 
 # 参数类型 -> 列类型（类型映射见设计文档 §2.3）
@@ -79,10 +79,10 @@ _ID_PREFIXES = {
     "frame_manager": "FM",
     "yolo": "YOLO",
     "det_filter": "DF",
+    "seq_filter": "SEQ",
     "target_crop": "CROP",
     "annotate": "ANNO",
     "vlm": "VLM",
-    "alarm": "AL",
     "face_detect": "FDET",
     "face_embed": "FEMB",
     "face_store": "FSTO",
@@ -100,8 +100,10 @@ _PRESET_ID_RE = re.compile(r"^[A-Z]{2,4}\d{4}$")  # 合法业务 ID 形如 YOLO0
 # 非产品模块），参数 preset 统一不落库，空参数表清理。
 # 2026-09-23: extract_faces（原分辨率提取）拆分为「目标裁剪 target_crop + 人脸检测
 # face_detect」，模块下线，参数表/preset 清理。
+# 2026-10: alarm（输出处理 OutputPolicy）弃用删除——输出改由 检测筛选/时序判定 事件尾
+# 承担，参数表/preset 清理。
 _PRUNED_MODULES = {"frame_scheduler", "compose", "utest",
-                   "chain", "face_monitor", "frame_yolo", "extract_faces"}
+                   "chain", "face_monitor", "frame_yolo", "extract_faces", "alarm"}
 
 
 def _preset_prefix(module_id: str) -> str:
@@ -180,7 +182,7 @@ _DDLS = [
   UNIQUE KEY uk_kind_name (kind, name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
     # 链路拼装：链路自身字段（streams/budget/meta）+ 有序步骤引用模块 preset
-    # （设计见 doc/存储设计.md）
+    # （设计见 doc/design/storage_design.md）
     """CREATE TABLE IF NOT EXISTS pipelines (
   id VARCHAR(24) NOT NULL PRIMARY KEY,
   name VARCHAR(64) NOT NULL,

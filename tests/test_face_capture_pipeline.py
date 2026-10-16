@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]  # umvp 项目根
 sys.path.insert(0, str(ROOT / "umvp"))
 
 from face_detect.face_detector import FaceDetector
-from pipe.composer import FrameManager, Pipeline, AlarmPolicy, YOLODetector
+from pipe.composer import FrameManager, Pipeline, YOLODetector
 from pipe.cropper import Cropper, iou
 from pipe.crop_restore import extract_faces
 
@@ -47,7 +47,7 @@ def main() -> None:
     yolo = YOLODetector(model_path=str(YOLO_MODEL), conf=0.3, iou=0.6, imgsz=1280,
                         max_det=300, classes=[CLS_PERSON])
     fm1 = FrameManager(sampling="analysis", frame_skip=1)
-    pipe = Pipeline(frame=fm1, alarm=AlarmPolicy(task_id=3, kind="inspection"), yolo=yolo)
+    pipe = Pipeline(frame=fm1, yolo=yolo)
     check("装配: 人脸截取链无 vlm/plate 依赖", pipe.vlm is None and pipe.plate is None)
     check("装配: 无车牌/驻留阶段不需跟踪", pipe.track_needed() is False)
 

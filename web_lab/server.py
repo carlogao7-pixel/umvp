@@ -29,6 +29,7 @@ import datetime
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -66,7 +67,7 @@ _TEST_LOCK = threading.Lock()
 # 阶段短标签：链路运行日志按"阶段→下一级"展示（不依赖具体链路类型）
 _STAGE_LABELS = {
     "frame_manager": "帧管理", "yolo": "YOLO识别", "target_crop": "目标裁剪",
-    "annotate": "标注", "vlm": "VLM研判", "alarm": "输出处理",
+    "annotate": "标注", "vlm": "VLM研判", "det_filter": "检测筛选", "seq_filter": "时序判定",
     "plate_recog": "车牌识别", "face_detect": "人脸检测", "face_embed": "人脸嵌入",
     "face_store": "向量底库", "extract_faces": "原分辨率提取",
 }
@@ -265,8 +266,10 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
         raise RuntimeError("帧转 JPEG 失败")
     b64 = base64.b64encode(buf.tobytes()).decode()
     prompt = payload.get("prompt") or (
-        "你是一个视觉分类器，分析画面后以 JSON 输出：{\"result\": \"动作名或 none\", "
-        "\"description\": \"简要中文描述\"}。无异常时 result=\"none\"。"
+        "你是画面内容分析器。分析这张图像（可能画有目标框），只输出一个 JSON，"
+        "不要任何多余文字或代码块：\n"
+        "{\"result\": \"画面主要内容/动作，无异常填 none\", "
+        "\"description\": \"一句话中文描述\", \"confidence\": 0.0}"
     )
     body = {
         "model": model, "temperature": 0.1, "max_tokens": 256,
@@ -279,7 +282,24 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
     resp = requests.post(url, json=body, headers=headers, timeout=(5, read_timeout))
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
-    return _parse_vlm_result(content)
+    action, description = _parse_vlm_result(content)
+    return action, description, content
+
+
+def _vlm_content(raw: str):
+    """VLM 原始回复 → 内容字段（尽量解析为 JSON；失败退回原文；空则 None）。"""
+    if not raw:
+        return None
+    t = raw.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.endswith("```"):
+            t = t[:-3]
+        t = t.strip()
+    try:
+        return json.loads(t)
+    except ValueError:
+        return raw
 
 
 def _db_path(p: dict) -> Path:
@@ -373,19 +393,75 @@ def h_yolo(p: dict) -> dict:
 
 
 def _det_filter_of(p: dict):
-    """det_filter 参数（filter 条件 DSL + group_limits 成组判定）→ DetFilter 实例。
+    """det_filter 参数（filter/group_limits/events）→ DetFilter 实例。
 
-    group_limits 空 = 不判定（None）；非空 = 成组数量判定（越界/未登记类别剔除）。
+    group_limits 空 = 不判定（None）；events 为 JSON 列表（事件规格，可作链路尾）。
     """
     from pipe.det_filter import DetFilter
     gl_text = str(p.get("group_limits", "") or "").strip()
+    ev_text = str(p.get("events", "") or "").strip()
+    events = None
+    if ev_text:
+        try:
+            events = json.loads(ev_text)
+            if not isinstance(events, list):
+                raise ValueError("应为 JSON 列表")
+        except ValueError as e:
+            raise ValueError(f"events 需为 JSON 列表: {e}")
     return DetFilter(filter=_str_param(p, "filter"),
-                     group_limits=(_class_limits(gl_text) if gl_text else None))
+                     group_limits=(_class_limits(gl_text) if gl_text else None),
+                     events=events)
+
+
+def _seq_filter_of(p: dict, what: str = "all"):
+    """seq_filter 参数 → SeqFilter 实例（无配置则 None）。
+
+    throttle 形如 'key:秒'（如 'cls_id:3.0'）=整类节流；change 形如 'key:watch'=track 集合
+    变化门控；rules 为 JSON 列表（SeqRule 规格）。what 选择用途：
+      "gates" → 只用 throttle/change（检测流门控，Pipeline.seq_filter）
+      "rules" → 只用 rules（事件尾，Pipeline.event_filter）
+      "all"   → 全部（模块测试页）
+    """
+    from pipe.seq_filter import SeqFilter, SeqRule
+    throttle = change = None
+    t = str(p.get("throttle", "") or "").strip()
+    if t and ":" in t:
+        k, v = t.split(":", 1)
+        try:
+            iv = float(v)
+        except ValueError:
+            iv = 0.0
+        if k.strip() and iv > 0:
+            throttle = {"key": k.strip(), "interval": iv}
+    c = str(p.get("change", "") or "").strip()
+    if c and ":" in c:
+        k, w = c.split(":", 1)
+        if k.strip():
+            change = {"key": k.strip(), "watch": (w.strip() or "track_id")}
+    rules = None
+    rj = str(p.get("rules", "") or "").strip()
+    if rj:
+        try:
+            specs = json.loads(rj)
+            if not isinstance(specs, list):
+                raise ValueError("应为 JSON 列表")
+            rules = [SeqRule(**s) if isinstance(s, dict) else SeqRule(match=str(s), event="事件")
+                     for s in specs]
+        except ValueError as e:
+            raise ValueError(f"rules 需为 JSON 列表: {e}")
+    if what == "gates":
+        rules = None
+    elif what == "rules":
+        throttle = change = None
+    if rules is None and throttle is None and change is None:
+        return None
+    return SeqFilter(rules=rules, throttle=throttle, change=change)
 
 
 def h_det_filter(p: dict) -> dict:
-    """检测筛选模块测试页：模拟检测列表 → 逐条筛选 + 成组判定 → 放行/筛掉明细。"""
+    """检测筛选模块测试页：模拟检测列表 → 逐条筛选 + 成组判定 → 放行/筛掉明细（含事件）。"""
     from pipe.composer import Detection
+    from pipe.records import collect_events
     try:
         df = _det_filter_of(p)
     except ValueError as e:
@@ -421,6 +497,10 @@ def h_det_filter(p: dict) -> dict:
                if df.group_limits else "（空=不判定）"),
             "按类: " + "、".join(f"cls{c} {by_cls_out.get(c, 0)}/{by_cls_in[c]}"
                                  for c in sorted(by_cls_in))]
+    if df.events:
+        evs = collect_events(keep)
+        text.append(f"事件: {len(evs)} 条"
+                    + (" — " + "、".join(e.get("name", "") for e in evs) if evs else ""))
     rows = [[i, d.cls_id, d.track_id, f"{d.score:.3f}",
              f"{d.bbox[2] - d.bbox[0]}x{d.bbox[3] - d.bbox[1]}",
              min(d.bbox[2] - d.bbox[0], d.bbox[3] - d.bbox[1]),
@@ -429,6 +509,50 @@ def h_det_filter(p: dict) -> dict:
     tables = [{"title": "逐条判定", "headers": ["#", "类别", "track", "置信度", "尺寸",
                                                 "短边", "结果"],
                "rows": rows}]
+    return res(text="\n".join(text), tables=tables)
+
+
+def _parse_sim_dets(p: dict):
+    """测试页模拟检测文本 → (Detection 列表, 错误信息)。每行 7 个数字。"""
+    from pipe.composer import Detection
+    lines = [l.strip() for l in str(p.get("detections", "") or "").splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    if not lines:
+        return None, "请输入模拟检测（每行: 类别,track,置信度,x1,y1,x2,y2）"
+    dets = []
+    for i, line in enumerate(lines, 1):
+        parts = [x.strip() for x in line.replace("，", ",").split(",") if x]
+        try:
+            if len(parts) != 7:
+                raise ValueError("应为 7 个数字：类别,track,置信度,x1,y1,x2,y2")
+            v = [float(x) for x in parts]
+            dets.append(Detection(track_id=int(v[1]), cls_id=int(v[0]),
+                                  bbox=tuple(int(x) for x in v[3:7]), score=v[2]))
+        except ValueError as e:
+            return None, f"第 {i} 行无法解析: {line!r}（{e}）"
+    return dets, None
+
+
+def h_seq_filter(p: dict) -> dict:
+    """时序判定模块测试页：模拟检测 → 节流/变化门控 → 放行/扣留明细。"""
+    try:
+        sf = _seq_filter_of(p)
+    except ValueError as e:
+        return res(ok=False, error=f"门控参数无法解析：{e}")
+    if sf is None:
+        return res(ok=False, error="请配置整类节流（如 cls_id:3.0）或变化门控（如 cls_id:track_id）")
+    dets, err = _parse_sim_dets(p)
+    if err:
+        return res(ok=False, error=err)
+    ts = _float(p, "ts", 0.0)
+    keep = sf.run(dets, ts=ts, frame_idx=0)
+    keep_ids = {id(d) for d in keep}
+    text = [f"输入 {len(dets)} 条 | 放行 {len(keep)} 条 | 扣留 {len(dets) - len(keep)} 条（ts={ts}）",
+            f"门控: 整类节流={sf.throttle or '关'} | 变化门控={sf.change or '关'}"]
+    rows = [[i, d.cls_id, d.track_id, f"{d.score:.3f}",
+             "✓ 放行" if id(d) in keep_ids else "✗ 扣留"]
+            for i, d in enumerate(dets)]
+    tables = [{"title": "逐条判定", "headers": ["#", "类别", "track", "置信度", "结果"], "rows": rows}]
     return res(text="\n".join(text), tables=tables)
 
 
@@ -451,60 +575,12 @@ def h_vlm(p: dict) -> dict:
     text = ["素材包（prepare 输出）:", json.dumps(payload, ensure_ascii=False, indent=2)]
     if _bool(p, "use_real_vlm"):
         img_path, frame = _load_frame(p)
-        action = _vlm_real(p, payload, frame)
-        text.append(f"\n真实 VLM 返回 action: {action}")
+        action, description, _raw = _vlm_real(p, payload, frame)
+        text.append(f"\n真实 VLM 返回 action: {action}"
+                    + (f" — {description}" if description else ""))
     else:
         text.append("\n（未勾选真实 VLM，演示 action=fire）")
     return res(text="\n".join(text))
-
-
-def h_alarm(p: dict) -> dict:
-    from pipe.composer import AlarmPolicy
-    kind = p.get("kind", "window")
-    try:
-        ap = AlarmPolicy(task_id=_int(p, "task_id", 1), kind=kind,
-                         target_actions=_str_list(p, "target_actions"),
-                         smooth_frames=(_int(p, "window_frames", 2) if kind == "window" else 1),
-                         hit_ratio=_float(p, "hit_ratio", 1.0),
-                         min_conf=_float(p, "min_conf", 0.0),
-                         min_dwell=(_float(p, "dwell_sec", 2.0) if kind == "dwell" else 0.0),
-                         key_cooldown=_float(p, "key_cooldown", -1.0),
-                         rules=_str_param(p, "rules"),
-                         alarm_cooldown=_float(p, "alarm_cooldown", 60.0),
-                         cooldown_by_action=_bool(p, "cooldown_by_action"))
-    except ValueError as e:  # 规则 DSL 非法：保存/测试时快速失败
-        return res(ok=False, error=f"规则配置错误: {e}")
-    script = str(p.get("timeline", ""))
-    lines = [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
-    events, log = [], []
-    if kind == "dwell":
-        for l in lines:
-            parts = [x.strip() for x in re.split(r"[,，\s]+", l) if x.strip()]
-            if len(parts) < 3:
-                continue
-            ts, tid, cls = float(parts[0]), int(parts[1]), int(parts[2])
-            ev = ap.on_dwell(tid, cls, ts)
-            log.append(f"  {'⚠ 告警 ' + ev[0].action if ev else '○ 无'}")
-            events += ev
-    else:
-        for l in lines:
-            parts = [x.strip() for x in re.split(r"[,，\s]+", l) if x.strip()]
-            if len(parts) < 3:
-                continue
-            ts, tk = float(parts[0]), int(parts[1])
-            action = " ".join(parts[2:])
-            ev = ap.on_vlm_result(tk, action, ts)
-            log.append(f"  {'⚠ 告警 ' + ev[0].action if ev else '○ 无'}")
-            events += ev
-    text = (f"判定: {kind} | 目标动作: {ap.target_actions or '(无)'} | "
-            f"窗口/驻留: {ap.smooth_frames} | 命中比例: {ap.hit_ratio} | "
-            f"冷却: {ap.alarm_cooldown}s | 置信度门槛: {ap.min_conf} | "
-            f"驻留门槛: {ap.min_dwell}s | 规则: {p.get('rules') or '(无)'}\n"
-            f"告警 {len(events)} 次\n" + "\n".join(log))
-    table = {"title": "告警事件", "headers": ["ts", "gran", "track_key", "action", "conf"],
-             "rows": [[f"{e.ts:.2f}", e.gran, e.track_key, e.action, f"{e.conf:.3f}"]
-                      for e in events]}
-    return res(text=text, tables=[table] if events else [])
 
 
 def h_face_detect(p: dict) -> dict:
@@ -1077,11 +1153,10 @@ def h_pipeline_run(p: dict) -> dict:
 
     def _step_out(frame_no, ts, tag, dets, subs, al, frame=None):
         """逐模块展示本帧各自处理的内容（不管是否向下传递），每条带帧序数。"""
-        nonlocal detection_count, alarm_count, vlm_fail, plate_count, vlm_unreachable
+        nonlocal detection_count, vlm_fail, plate_count, vlm_unreachable, event_count
         plates = getattr(pipe, "last_plates", [])
         plate_in = getattr(pipe, "last_plate_input", [])
         detection_count += len(dets or [])
-        alarm_count += len(al)
         plate_count += len(plates)
 
         # 帧管理：帧决策（放行本帧）
@@ -1146,7 +1221,7 @@ def h_pipeline_run(p: dict) -> dict:
                             base = getattr(pipe, "last_annotated", None)
                             if base is None:
                                 base = frame
-                            action, description = _vlm_real(
+                            action, description, raw = _vlm_real(
                                 vlm_cfg, payload, _vlm_material(base, payload, s))
                             _emit("vlm", f"研判 {action}"
                                   + (f" — {description}" if description else "") + "（真实调用）",
@@ -1161,16 +1236,19 @@ def h_pipeline_run(p: dict) -> dict:
                                       stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
                             continue
                     else:
-                        action, description = vlm_action, ""
+                        action, description, raw = vlm_action, "", ""
                         _emit("vlm", f"研判 {action}（模拟回填）", ts, stage="vlm",
                               frame_no=frame_no, log_line=True, prefix="    ")
-                    for e in pipe.on_vlm_result(s.track_key, action, ts, description):
-                        hit = f"命中 → {e.action}"
-                        if e.description:
-                            hit += f" — {e.description}"
-                        alarm_count += 1
-                        _emit("alarm", hit, ts, stage="vlm",
-                              frame_no=frame_no, log_line=True, prefix="    ")
+                    # VLM 结果作为记录经事件尾（event_filter）出事件；content 落 VLM 原始 JSON
+                    content = _vlm_content(raw) if raw else {"result": action, "description": description}
+                    rec = {"kind": "vlm", "label": action, "text": description,
+                           "content": content}
+                    for ev in pipe.publish([rec], ts, frame_no):
+                        event_count += 1
+                        nm = ev.get("name", "事件")
+                        det = ev.get("detail") or {}
+                        _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), ts,
+                              stage="seq_filter", frame_no=frame_no, log_line=True, prefix="    ")
 
         # 车牌识别：本帧识别结果 + 原分辨率车牌小图落盘
         if "plate_recog" in _stage_order:
@@ -1190,24 +1268,19 @@ def h_pipeline_run(p: dict) -> dict:
                 _emit("info", f"识别 0 张（传入车图 {len(plate_in)} 张）", ts,
                       stage="plate_recog", frame_no=frame_no, log_line=True, prefix="    ")
 
-        # 输出处理（告警）：本帧判定结果（触发/无）
-        if "alarm" in _stage_order:
-            if al:
-                for e in al:
-                    desc = f" — {e.description}" if getattr(e, "description", "") else ""
-                    conf = getattr(e, "conf", 1.0)
-                    ctext = f"（conf {conf:.2f}）" if conf and conf < 1.0 else ""
-                    _emit("alarm", f"触发 {e.action}{ctext}{desc}", ts, stage="alarm",
-                          frame_no=frame_no, log_line=True, prefix="    ")
-            else:
-                _emit("info", "无告警", ts, stage="alarm",
-                      frame_no=frame_no, log_line=True, prefix="    ")
+        # 链路尾通用输出：末段记录携带的事件（det_filter/seq_filter 追加；不绑定模块）
+        for ev in (getattr(pipe, "last_events", None) or []):
+            event_count += 1
+            nm = ev.get("name", "事件")
+            det = ev.get("detail") or {}
+            _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), ts,
+                  stage="seq_filter", frame_no=frame_no, log_line=True, prefix="    ")
         log.append("")  # 帧块之间空行，多换行更易读
     
     # 初始化计数器
     processed_count = 0
     detection_count = 0
-    alarm_count = 0
+    event_count = 0
     plate_count = 0
     plate_saved = [0]  # 已落盘原分辨率车牌小图数（文件名编号用）
     
@@ -1258,7 +1331,7 @@ def h_pipeline_run(p: dict) -> dict:
         images.append({"title": f"原始帧 {image_name}", "data": _img_data_url(canvas, 70)})
         
         head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
-        head += f" | 检出 {detection_count} 个 | 告警 {alarm_count} 个"
+        head += f" | 检出 {detection_count} 个 | 事件 {event_count} 个"
         head += " | 输出到: " + str(output_dir) + _save_summary()
         
         return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
@@ -1361,7 +1434,7 @@ def h_pipeline_run(p: dict) -> dict:
 
     head = f"链路: {spec.get('name') or '未命名'} | 视频: {vid.name}"
     head += f" | 范围: {start_time}s-{end_time}s ({start_frame}-{end_frame}帧)"
-    head += f" | 处理 {processed_count} 帧 | 检出 {detection_count} 个 | 车牌 {plate_count} 次 | 告警 {alarm_count} 个"
+    head += f" | 处理 {processed_count} 帧 | 检出 {detection_count} 个 | 车牌 {plate_count} 次 | 事件 {event_count} 个"
     if vlm_unreachable:
         vlm_state = "端点不可达，已跳过"
     elif use_real_vlm:
@@ -1385,7 +1458,7 @@ def h_pipeline_run(p: dict) -> dict:
 def _chain_from_spec(spec: dict):
     """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。不加载模型。"""
     from pipe.composer import (
-        FrameManager, YOLODetector, VLMAnalyzer, AlarmPolicy, Pipeline,
+        FrameManager, YOLODetector, VLMAnalyzer, Pipeline,
         SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
         backpressure_params,
     )
@@ -1401,8 +1474,10 @@ def _chain_from_spec(spec: dict):
 
     if "frame_manager" not in by_mod:
         raise ValueError("链路缺少必需阶段: frame_manager")
-    if not any(k in by_mod for k in ("alarm", "face_embed", "face_detect", "plate_recog")):
-        raise ValueError("链路缺少必需阶段: alarm（或 face_embed / face_detect / plate_recog 作为终段）")
+    if not any(k in by_mod for k in ("face_embed", "face_detect", "plate_recog",
+                                      "det_filter", "seq_filter")):
+        raise ValueError("链路缺少必需阶段: 终段需为 det_filter / seq_filter / "
+                         "face_embed / face_detect / plate_recog 之一")
 
     # 字符串参数统一走模块级 _str_param（None/空白 → 默认值）
 
@@ -1413,25 +1488,6 @@ def _chain_from_spec(spec: dict):
         interval_sec=_float(fp, "interval_sec", 3.0),
         interval_frames=_int(fp, "interval_frames", 30),
         **backpressure_params(_str_param(fp, "backpressure", "standard")))
-    ap = _one("alarm")
-    if "alarm" in by_mod:
-        a_kind = _str_param(ap, "kind", "window")
-        # 按判定方式取用：window 用「滑窗长度」；dwell 用「驻留秒数」；两者互不干扰
-        alarm = AlarmPolicy(
-            task_id=_int(ap, "task_id", 1),
-            kind=a_kind,
-            target_actions=_str_list(ap, "target_actions"),
-            smooth_frames=(_int(ap, "window_frames", 2) if a_kind == "window" else 1),
-            hit_ratio=_float(ap, "hit_ratio", 1.0),
-            min_conf=_float(ap, "min_conf", 0.0),
-            min_dwell=(_float(ap, "dwell_sec", 2.0) if a_kind == "dwell" else 0.0),
-            key_cooldown=_float(ap, "key_cooldown", -1.0),
-            rules=_str_param(ap, "rules"),
-            alarm_cooldown=_float(ap, "alarm_cooldown", 60.0),
-            cooldown_by_action=_bool(ap, "cooldown_by_action"))
-    else:
-        # 人脸链等无告警阶段：占位策略（不产生告警，Pipeline.step 需要）
-        alarm = AlarmPolicy(task_id=1, kind="inspection")
     yolo = None
     det_filter = None
     if "det_filter" in by_mod:
@@ -1482,13 +1538,18 @@ def _chain_from_spec(spec: dict):
             dedup_iou=_float(pp, "dedup_iou", 0.6),
             track_dedup=(True if td in (None, "") else _bool(pp, "track_dedup")),
             track_cooldown=_float(pp, "track_cooldown", 5.0))
-    return Pipeline(frame=fm, alarm=alarm, yolo=yolo, vlm=vlm,
+    # 时序判定阶段（一个 module_id）：参数按用途拆两个实例——
+    # gates（throttle/change）→ 检测流门控 Pipeline.seq_filter；
+    # rules（SeqRule 规格）→ 事件尾 Pipeline.event_filter（VLM/车牌记录经 publish 走它出事件）。
+    seq_filter = None
+    event_filter = None
+    if "seq_filter" in by_mod:
+        sp = _one("seq_filter")
+        seq_filter = _seq_filter_of(sp, what="gates")
+        event_filter = _seq_filter_of(sp, what="rules")
+    return Pipeline(frame=fm, yolo=yolo, vlm=vlm,
                     crop=crop, annotate=annotate, plate=plate,
-                    det_filter=det_filter,
-                    check_interval=(_float(_one("yolo"), "check_interval", 3.0)
-                                    if "yolo" in by_mod else 3.0),
-                    track_change_only=(_bool(_one("yolo"), "track_change_only")
-                                       if "yolo" in by_mod else False))
+                    det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter)
 
 
 # ---------------- 实时播放叠加：SSE 流式链路运行（方案 B） ----------------
@@ -1556,7 +1617,7 @@ def h_pipeline_stream(write, params: dict) -> None:
                    "stages": [s.get("module_id") for s in spec.get("stages") or []]})
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    processed = detection_count = plate_count = alarm_count = 0
+    processed = detection_count = plate_count = event_total = 0
     t0 = time.time()
     n = start_frame
     try:
@@ -1573,15 +1634,15 @@ def h_pipeline_stream(write, params: dict) -> None:
                 n += 1
                 continue
             dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo is not None else []
-            subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
+            subs, evs = pipe.step(n, ts, dets, frame=frame, force=True)
             if vlm_feedback and pipe.vlm is not None:
                 for s in subs:  # 模拟回填（真实 VLM 见函数说明）
-                    al += pipe.on_vlm_result(s.track_key, vlm_action, ts)
+                    evs += pipe.publish([{"kind": "vlm", "label": vlm_action, "text": ""}], ts, n)
             plates = list(getattr(pipe, "last_plates", []))
             processed += 1
             detection_count += len(dets or [])
             plate_count += len(plates)
-            alarm_count += len(al)
+            event_total += len(evs)
             write("frame", {
                 "n": n, "ts": round(ts, 3),
                 "dets": [{"cls": d.cls_id, "bbox": list(d.bbox),
@@ -1591,15 +1652,15 @@ def h_pipeline_stream(write, params: dict) -> None:
                             "score": round(float(p.score), 3), "bbox": list(p.bbox),
                             "car_bbox": list(p.car_bbox) if p.car_bbox else None}
                            for p in plates],
-                "alarms": [{"action": e.action, "desc": getattr(e, "description", ""),
-                            "conf": round(float(getattr(e, "conf", 1.0)), 3)} for e in al],
+                "alarms": [{"action": e.get("name", "事件"), "desc": str(e.get("detail") or ""),
+                            "conf": 1.0} for e in evs],
             })
             n += 1
     finally:
         cap.release()
         _STREAMS.pop(run_id, None)
     write("done", {"run_id": run_id, "processed": processed, "detections": detection_count,
-                   "plates": plate_count, "alarms": alarm_count,
+                   "plates": plate_count, "alarms": event_total,
                    "elapsed": round(time.time() - t0, 2), "stopped": stop_evt.is_set()})
 
 
@@ -1652,8 +1713,10 @@ def h_chain(p: dict) -> dict:
                 for s in subs:
                     if feedback:
                         log.append("    " + _tag("vlm") + f"帧#{frame_no} 研判 {vlm_action}（模拟回填）")
-                        for e in pipe.on_vlm_result(s.track_key, vlm_action, ts):
-                            log.append("    " + _tag("vlm") + f"帧#{frame_no} 命中 → {e.action}")
+                        for ev in pipe.publish([{"kind": "vlm", "label": vlm_action, "text": ""}],
+                                               ts, frame_no):
+                            log.append("    " + _tag("seq_filter")
+                                       + f"帧#{frame_no} 事件 {ev.get('name')}")
                     else:
                         log.append("    " + _tag("vlm") + f"帧#{frame_no} 素材包 {s.ref}（未开启研判回填）")
         if "plate_recog" in _so:
@@ -1664,13 +1727,6 @@ def h_chain(p: dict) -> dict:
                                + f"帧#{frame_no} 识别 {p.plate_no} {p.type_name}/{p.color} {p.score:.2f}")
             else:
                 log.append("    " + _tag("plate_recog") + f"帧#{frame_no} 识别 0 张")
-        if "alarm" in _so:
-            if al:
-                for e in al:
-                    desc = f" — {e.description}" if getattr(e, "description", "") else ""
-                    log.append("    " + _tag("alarm") + f"帧#{frame_no} 触发 {e.action}{desc}")
-            else:
-                log.append("    " + _tag("alarm") + f"帧#{frame_no} 无告警")
 
     if p.get("feed") == "video":
         # 真实视频驱动：按帧管理节奏抽帧 → YOLO 推理（dwell 模式 track=True 保
@@ -1802,13 +1858,6 @@ PARAMS = {
                     "help": "COCO: 0=人, 2=车"},
         "device": {"label": "推理设备（空=自动）", "type": "str", "default": "",
                    "help": "如 cpu 或 0"},
-        "check_interval": {"label": "传递/报送节拍（秒/类）", "type": "float", "default": 3.0,
-                           "help": "Pipeline 编排：同一类别每隔几秒才向下游传/报送一次，避免刷屏"},
-        "track_change_only": {"label": "只在 track_id 变化时报送", "type": "bool", "default": False,
-                              "help": "开启后，只有 track_id 发生变化时才报送 VLM（需要启用跟踪）"},
-        "ts": {"label": "报送时间戳（秒）", "type": "float", "default": 0.0,
-               "test_only": True,
-               "help": "本帧的时间戳，随报送结果一起带出"},
     },
     "det_filter": {
         "filter": {"label": "筛选条件（条件 DSL）", "type": "text", "default": "",
@@ -1819,13 +1868,34 @@ PARAMS = {
         "group_limits": {"label": "每类数量上下限（如 0:1,300; 2:1,10）", "type": "str",
                          "default": "",
                          "help": "成组数量判定：类别:下限,上限，分号分隔；数量越界/未登记的类别整类视为未识别；"
-                                 "空=不判定（等价 count 聚合谓词，见检测筛选.md）"},
+                                 "空=不判定（等价 count 聚合谓词，见 doc/modules/det_filter.md）"},
+        "events": {"label": "事件标注（JSON 列表）", "type": "text", "default": "",
+                   "help": "如 [{\"name\":\"警情\",\"when\":\"label in 治安类|交警类\",\"detail\":[\"label\",\"content\"]}]；"
+                           "放行记录命中即追加事件（可多事件）；空=不标注。可作链路尾输出"},
         "detections": {"label": "模拟检测（每行一条）", "type": "text", "default": "",
                        "test_only": True,
                        "help": "每行: 类别,track,置信度,x1,y1,x2,y2（如 '0,1,0.9,100,100,200,200'）"},
         "ts": {"label": "帧时间戳（秒）", "type": "float", "default": 0.0,
                "test_only": True,
                "help": "条件里可用 ts（如 'ts >= 10' 表示 10 秒后才开始放行）"},
+    },
+    "seq_filter": {
+        "throttle": {"label": "整类节流（key:秒，如 cls_id:3.0）", "type": "str", "default": "",
+                     "help": "同一 key（一般 cls_id）每隔 N 秒才放行整类记录一次；空=不节流。"
+                             "等价原 YOLO/Pipeline 的 check_interval"},
+        "change": {"label": "变化门控（key:watch，如 cls_id:track_id）", "type": "str", "default": "",
+                   "help": "同类 watch 值集合（默认 track_id）相比上次有变化才放行；空=不门控。"
+                           "等价原 track_change_only"},
+        "rules": {"label": "确认/事件规则（JSON 列表）", "type": "text", "default": "",
+                  "help": "SeqRule 规格，如 [{\"match\":\"label in 治安类|交警类\",\"event\":\"{label}\","
+                          "\"key\":\"label\",\"cooldown\":30}]；event 支持 {字段} 动态占位，"
+                          "cooldown<0=同对象一次，window_n/min_n/hit_ratio 为窗口；空=无规则"},
+        "detections": {"label": "模拟检测（每行一条）", "type": "text", "default": "",
+                       "test_only": True,
+                       "help": "每行: 类别,track,置信度,x1,y1,x2,y2（如 '0,1,0.9,100,100,200,200'）"},
+        "ts": {"label": "帧时间戳（秒）", "type": "float", "default": 0.0,
+               "test_only": True,
+               "help": "门控/规则计时用（同一帧多次调用可改 ts 观察节流）"},
     },
     "vlm": {
         "max_resolution": {"label": "送审缩放上限（宽,高）", "type": "str", "default": "1280,720",
@@ -1859,49 +1929,6 @@ PARAMS = {
                       "help": "调用的模型名称"},
         "vlm_key": {"label": "API Key（无 key 留空）", "type": "str", "default": "",
                     "help": "接口密钥，免鉴权可留空"},
-    },
-    "alarm": {
-        "kind": {"label": "判定方式", "type": "select", "default": "window",
-                 "options": ["window", "dwell", "inspection"],
-                 "help": "预设档位：window=VLM滑动窗口; dwell=驻留秒数; inspection=巡检/车牌（同对象只输出一次）"},
-        "task_id": {"label": "任务编号", "type": "int", "default": 1,
-                    "help": "告警会带上这个任务编号"},
-        "target_actions": {"label": "目标动作（逗号分隔，空=巡检）", "type": "str",
-                           "default": "fire,fight",
-                           "show_if": {"key": "kind", "in": ["window"]},
-                           "help": "哪些动作算告警，多个用逗号分隔（仅 window）"},
-        "window_frames": {"label": "滑窗长度（帧）", "type": "int", "default": 2,
-                          "show_if": {"key": "kind", "in": ["window"]},
-                          "help": "连续几帧命中才告警（仅 window 判定）"},
-        "hit_ratio": {"label": "命中比例", "type": "float", "default": 1.0,
-                      "show_if": {"key": "kind", "in": ["window"]},
-                      "help": "窗口内命中比例到多少才告警（1.0=全部命中，仅 window）"},
-        "min_conf": {"label": "置信度门槛（0=关）", "type": "float", "default": 0.0,
-                     "help": "事件置信度低于它不输出（车牌=识别分；VLM 默认 1.0 不受限）"},
-        "dwell_sec": {"label": "驻留秒数", "type": "float", "default": 2.0,
-                      "show_if": {"key": "kind", "in": ["dwell"]},
-                      "help": "对象持续出现达到该秒数才输出（仅 dwell 判定）"},
-        "rules": {"label": "规则条件（空=关）", "type": "text", "default": "",
-                  "help": "对事件字段自定义条件：字段 操作符 值（>= > <= < == != contains in，"
-                          "操作符两侧留空格）；组内逗号=并且，组间分号=或者。"
-                          "字段：conf/dwell/label/key/features.名，"
-                          "如 features.reading >= 80, features.unit == ℃;conf >= 0.9"},
-        "alarm_cooldown": {"label": "冷却时间（秒）", "type": "float", "default": 60.0,
-                           "show_if": {"key": "kind", "in": ["window", "dwell"]},
-                           "help": "同一目标告警后多久内不再重复报（window/dwell；inspection 见 下一条）"},
-        "key_cooldown": {"label": "巡检同对象去重（-1=只一次）", "type": "float", "default": -1.0,
-                         "show_if": {"key": "kind", "in": ["inspection"]},
-                         "help": "仅 inspection：-1=同对象只输出一次（车牌默认）；"
-                                 "0=不去重逐条落盘; >0=同对象 N 秒后可再报"},
-        "cooldown_by_action": {"label": "按警情类型独立冷却", "type": "bool", "default": False,
-                               "show_if": {"key": "kind", "in": ["window"]},
-                               "help": "开启后，不同警情类型独立冷却时间（仅 window）"},
-        "timeline": {"label": "事件时间线（每行一条）", "type": "text",
-                     "test_only": True,
-                     "default": "# window/inspection: ts, track_key, action\n"
-                                "1.0, 0, fire\n2.0, 0, fire\n3.0, 0, fire\n"
-                                "# dwell: ts, track_id, cls_id\n10.0, 1, 0\n11.0, 1, 0\n12.0, 1, 0",
-                     "help": "window/inspection 用「ts, track_key, action」；dwell 用「ts, track_id, cls_id」"},
     },
     "chain": {
         # 模块链路的通用运行器（runner=chain）：运行表单=「视频输入 + 各阶段参数」，
@@ -2117,6 +2144,12 @@ MODULES = {
                 "+ 聚合 count(字段)/count(子条件)/count()；+ 成组数量判定）。"
                 "链路里插在 YOLO 之后；有效性过滤的唯一来源（空条件+空上下限=不筛选）。",
         "params": PARAMS["det_filter"], "handler": h_det_filter},
+    "seq_filter": {
+        "name": "时序判定 SeqFilter", "group": "管道四模块",
+        "desc": "复用 pipe.seq_filter.SeqFilter：时序门控（整类节流 throttle / track 集合变化 change）"
+                "+ 窗口/单条规则确认与事件标注。链路里插在检测筛选之后；"
+                "承载原 Pipeline 的 check_interval/track_change_only 语义。",
+        "params": PARAMS["seq_filter"], "handler": h_seq_filter},
     "target_crop": {
         "name": "目标裁剪 TargetCrop", "group": "管道四模块",
         "desc": "按上游检测框裁子图（输出分辨率可配，默认原分辨率）；"
@@ -2130,11 +2163,6 @@ MODULES = {
         "name": "大模型研判 VLMAnalyzer", "group": "管道四模块",
         "desc": "复用 pipe.composer.VLMAnalyzer：素材包准备，可接真实 VLM。",
         "params": PARAMS["vlm"], "handler": h_vlm},
-    "alarm": {
-        "name": "输出处理（告警）OutputPolicy", "group": "管道四模块",
-        "desc": "复用 pipe.composer.OutputPolicy（原告警策略）：Finding 统一进，"
-                "驻留/词表/置信/规则DSL/滑窗/去重冷却七道闸出（AlarmPolicy 为兼容别名）。",
-        "params": PARAMS["alarm"], "handler": h_alarm},
     "face_detect": {
         "name": "人脸检测 FaceDetector", "group": "人脸识别链路",
         "desc": "复用 face_detect.face_detector：SCRFD 检测 + 5 点对齐。",
@@ -2471,7 +2499,7 @@ def _pipelines_list() -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# ---------------- 数据库数据浏览（只读快照，见 doc/存储设计.md 第一部分） ----------------
+# ---------------- 数据库数据浏览（只读快照，见 doc/design/storage_design.md 第一部分） ----------------
 
 def _db_tables() -> dict:
     if not _DB_ENABLED:
@@ -2547,6 +2575,50 @@ def _pipeline_delete(handler) -> dict:
         return {"ok": True, "deleted": pid}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ---------------- 挂载 agent（智能助手：答疑 / 组装 / 修改链路） ----------------
+
+def _agent_chat(handler) -> dict:
+    """POST /api/pipeline/agent —— 挂载 agent 对话。
+
+    请求体：{"role":"architect|assembler", "message": "...", "history": [...]}
+    返回：  {ok, role, text, tool_calls:[{name,arguments}], steps, error?}
+
+    LLM 端点/密钥经环境变量提供（LLM_BASE_URL / LLM_API_KEY 或 SILICONFLOW_API_KEY /
+    LLM_MODEL）；未配置时返回 configured=False 提示。模型经 function calling 调用平台工具
+    （读知识库 / 列模块 / 校验 spec / 资源估算 / 读已存链路）。
+    """
+    try:
+        body = _read_json_body(handler)
+        if not isinstance(body, dict):
+            raise TypeError("请求体必须是对象")
+        role = str(body.get("role") or "architect").strip() or "architect"
+        message = str(body.get("message") or "").strip()
+        history = body.get("history") or []
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {"ok": False, "error": "请求体必须是合法 JSON 对象"}
+    if role not in ("architect", "assembler"):
+        return {"ok": False, "error": f"未知角色: {role}（可用 architect / assembler）"}
+    if not message:
+        return {"ok": False, "error": "message 不能为空"}
+    if not isinstance(history, list):
+        return {"ok": False, "error": "history 必须是消息数组"}
+
+    try:
+        import agent_llm  # 惰性：运行时依赖仅在调用时引入
+    except Exception as e:
+        return {"ok": False, "error": f"agent 运行时不可用: {type(e).__name__}: {e}"}
+    if not agent_llm._api_key():
+        return {"ok": False, "configured": False,
+                "error": "未配置 LLM：请设置环境变量 LLM_API_KEY（或 SILICONFLOW_API_KEY）后重启服务"}
+    try:
+        res = agent_llm.run(role, message, history=history)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": res.get("ok", False), "role": res.get("role"),
+            "text": res.get("text", ""), "tool_calls": res.get("tool_calls", []),
+            "steps": res.get("steps", 0), "error": res.get("error", "")}
 
 
 # ---------------- HTTP 服务 ----------------
@@ -2740,14 +2812,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_pipeline_delete(self))
             return
 
-        # ---- 链路生成 / 智能助手（占位壳子，功能在 P2/P4 落地）----
+        # ---- 链路生成 / 智能助手 ----
         if self.path == "/api/pipeline/build":
             self._json({"ok": True, "stub": True,
                         "note": "链路生成（P2 占位）尚未实现"})
             return
         if self.path == "/api/pipeline/agent":
-            self._json({"ok": True, "stub": True,
-                        "note": "智能助手（P4 占位）尚未实现"})
+            t0 = time.time()
+            result = _agent_chat(self)
+            result.setdefault("elapsed_sec", round(time.time() - t0, 2))
+            print(f"[agent] ok={result.get('ok')} {time.time() - t0:.1f}s")
+            self._json(result)
             return
 
         if not self.path.startswith("/api/test/"):
@@ -2803,12 +2878,12 @@ class Handler(BaseHTTPRequestHandler):
 # （pipelines + pipeline_steps 引用上述 preset）。幂等：同名已存在则跳过
 # （尊重用户在 web 端的编辑），每模块恰一份、链路恰一条。
 
-# 警情类型提示词（VLM 研判阶段用；返回 JSON：alert_type + description）
-ALARM_PROMPT = """你是一个警情分析专家。请分析画面中的情况，并以 JSON 格式返回分析结果：
-
+# 警情类型提示词（VLM 研判阶段用；返回 JSON：alert_type + description + confidence）
+ALARM_PROMPT = """你是一个警情分析专家。分析画面中的情况，只输出一个 JSON（不要多余文字或代码块）：
 {
   "alert_type": "治安类/交警类/群体性事件类/救援救助类/无异常",
-  "description": "简要描述观察到的异常情况（无异常时描述正常场景）"
+  "description": "简要描述观察到的异常情况（无异常时描述正常场景）",
+  "confidence": 0.0
 }
 
 警情类型说明：
@@ -2818,7 +2893,7 @@ ALARM_PROMPT = """你是一个警情分析专家。请分析画面中的情况�
 - 救援救助类：有人溺水、倒地并挥手呼救等情况
 - 无异常：画面中未发现上述异常情况
 
-请根据实际情况准确判断，输出标准的 JSON 格式（不要添加额外说明）。"""
+请根据实际情况准确判断，严格输出上述字段的 JSON（confidence 为 0~1 的置信度）。"""
 
 _SEED_PIPELINE_NAME = "警用无人机链路"
 _SEED_STAGES = [
@@ -2829,8 +2904,7 @@ _SEED_STAGES = [
     # YOLO：imgsz=1280 为远角小目标决定性参数（2026-08-24 实调，见知识库决策表）
     ("yolo", "警用无人机·YOLO识别", {
         "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
-        "imgsz": 1280, "max_det": 300, "classes": "0,2", "device": "",
-        "check_interval": 3.0, "track_change_only": False}),
+        "imgsz": 1280, "max_det": 300, "classes": "0,2", "device": ""}),
     # 检测筛选：人≥2 才报、车≥1 才报（有效性对全下游生效）
     ("det_filter", "警用无人机·检测筛选", {
         "filter": "", "group_limits": "0:2,300;2:1,300"}),
@@ -2843,12 +2917,16 @@ _SEED_STAGES = [
         "use_real_vlm": True,
         "vlm_endpoint": "http://117.42.21.253:8000/v1/chat/completions",
         "vlm_model": "qwen3-vl-32b", "vlm_key": ""}),
-    # 告警：window 滑窗 + 按警情类型独立冷却
-    ("alarm", "警用无人机·告警策略", {
-        "kind": "window", "task_id": 1,
-        "target_actions": "治安类,交警类,群体性事件类,救援救助类",
-        "window_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 30.0,
-        "cooldown_by_action": True}),
+    # 时序判定（链路尾，一个阶段两种用途）——
+    #   throttle=整类节流 3 秒/类（原 check_interval）→ 检测流门控；
+    #   rules=事件尾（原「告警策略」window 等价）：VLM 结果经 publish 走此规则，
+    #   词表命中 + 按警情类型独立冷却 30s，事件名取 VLM 的 action（{label}）。
+    ("seq_filter", "警用无人机·时序判定", {
+        "throttle": "cls_id:3.0", "change": "",
+        "rules": json.dumps([{
+            "match": "label in 治安类|交警类|群体性事件类|救援救助类",
+            "event": "{label}", "key": "label", "cooldown": 30.0,
+        }], ensure_ascii=False)}),
 ]
 
 # 第二条链路：车牌识别（帧管理 → YOLO 识车 → 车牌识别(裁车牌+识别) → 告警）
@@ -2861,8 +2939,7 @@ _SEED_PLATE_STAGES = [
     # YOLO：只识车（classes=2），为车牌识别提供车辆框（复用原有 yolo 模块）
     ("yolo", "车牌识别·YOLO识车", {
         "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
-        "imgsz": 1280, "max_det": 300, "classes": "2", "device": "",
-        "check_interval": 0.0, "track_change_only": False}),
+        "imgsz": 1280, "max_det": 300, "classes": "2", "device": ""}),
     # 检测筛选：车长边≥40 才有效（小目标视为未识别）
     ("det_filter", "车牌识别·检测筛选", {
         "filter": "long >= 40", "group_limits": "2:1,300"}),
@@ -2875,11 +2952,12 @@ _SEED_PLATE_STAGES = [
     ("plate_recog", "车牌识别·车牌识别", {
         "detect_level": "high", "mode": "crop", "margin": 0.1,
         "dedup_iou": 0.6, "track_dedup": True, "track_cooldown": 5.0}),
-    # 告警：巡检（识别到的车牌逐条记录，同车牌跨帧去重）
-    ("alarm", "车牌识别·告警策略", {
-        "kind": "inspection", "task_id": 2, "target_actions": "",
-        "window_frames": 1, "hit_ratio": 1.0, "alarm_cooldown": 30.0,
-        "cooldown_by_action": False}),
+    # 事件尾（原「告警策略」inspection 的等价）：车牌记录经 publish 出事件，同车牌号只一次
+    ("seq_filter", "车牌识别·时序判定", {
+        "throttle": "", "change": "",
+        "rules": json.dumps([{
+            "match": "kind == plate", "event": "{label}", "key": "label", "cooldown": -1.0,
+        }], ensure_ascii=False)}),
 ]
 
 
@@ -2893,8 +2971,7 @@ _SEED_FACE_STAGES = [
     # YOLO：只识人（classes=0），imgsz=1280 兼容远角小目标（分辨率近乎免费的召回）
     ("yolo", "人脸截取·YOLO识人", {
         "model_path": "models/yolov8n.pt", "conf": 0.3, "iou": 0.6,
-        "imgsz": 1280, "max_det": 300, "classes": "0", "device": "",
-        "check_interval": 0.0, "track_change_only": False}),
+        "imgsz": 1280, "max_det": 300, "classes": "0", "device": ""}),
     # 检测筛选：人长边≥30 才有效（小目标视为未识别）
     ("det_filter", "人脸截取·检测筛选", {
         "filter": "long >= 30", "group_limits": "0:1,300"}),
@@ -2932,9 +3009,9 @@ _SEED_STANDALONE = [
 def _seed_chain(name: str, stages: list, description: str, have: dict) -> None:
     """幂等播种一条链路：先保各阶段模块 preset，再建链路引用。
 
-    已存在同名链路时：阶段结构一致则原样保留（不动用户改动）；结构变化（如插入
-    「目标裁剪」）则按模块复用旧 preset（保留其参数）、补建缺失阶段、丢弃下线阶段，
-    重建步骤（save_pipeline 同名覆盖）。这样既迁移结构，又不产生重复 preset。
+    已存在同名链路时：阶段结构一致则原样保留（不动用户改动）；结构变化则按模块复用
+    旧 preset（保留其参数）、补建缺失阶段、丢弃下线阶段，重建步骤（save_pipeline 同名
+    覆盖）。这样既迁移结构，又不产生重复 preset。
     """
     expected = [mid for mid, _s, _p in stages]
     existing = next((p for p in db.list_pipelines() if p["name"] == name), None)

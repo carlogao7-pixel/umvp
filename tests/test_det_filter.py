@@ -161,6 +161,30 @@ def main() -> None:
         except ValueError:
             check(f"count 非法报错: {bad!r}", True)
 
+    # ---- 7. 事件标注（可作链路尾；多事件） ----
+    def _rk(cls, tid, alert):
+        return {"cls_id": cls, "track_id": tid, "bbox": (0, 0, 50, 50), "content": {"alert": alert}}
+    out = DetFilter("cls_id in 0|2", events=["命中"]).run([_rk(0, 1, "治安类"), _rk(2, 2, "无异常")], ts=3.0)
+    check("事件：放行记录追加事件（多事件列表）",
+          all(r["events"][0]["name"] == "命中" for r in out))
+    check("事件：ts 落入事件", out[0]["events"][0]["ts"] == 3.0)
+    out = DetFilter("", events=[{"name": "警情", "when": "cls_id == 0",
+                                 "detail": ["content"]}]).run([_rk(0, 1, "治安类"), _rk(2, 2, "无异常")], ts=1.0)
+    check("事件 when 过滤（未命中不加）", len(out[0]["events"]) == 1 and "events" not in out[1])
+    check("事件 detail 取字段（VLM 内容字段）",
+          out[0]["events"][0]["detail"]["content"] == {"alert": "治安类"})
+    out = DetFilter("", events=[{"name": "A"}, {"name": "B"}]).run([_rk(0, 1, "x")], ts=0.0)
+    check("多规格 → 一条记录多事件", [e["name"] for e in out[0]["events"]] == ["A", "B"])
+    d_ev = det((0, 0, 50, 50), cls=0, tid=1)
+    oo = DetFilter("", events=["E"]).run([d_ev], ts=2.0)
+    check("对象输入：事件挂 events 属性",
+          getattr(oo[0], "events", [{}])[0].get("name") == "E")
+    try:
+        DetFilter(events=[{"when": "cls_id == 0"}])
+        check("事件规格缺 name 报错", False)
+    except ValueError:
+        check("事件规格缺 name 报错", True)
+
     print(f"\n全部通过: {PASS} 项断言")
 
 
