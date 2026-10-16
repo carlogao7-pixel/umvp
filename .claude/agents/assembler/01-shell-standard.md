@@ -79,11 +79,21 @@
 | `seq_filter` | 时序门控（检测流）+ 事件尾 | throttle、change、rules |
 | `target_crop` | 按上游检测框裁子图 | out_size、margin、classes、filter |
 | `annotate` | 帧上画检测框（供 VLM） | thickness、show_label、classes、filter |
-| `vlm` | 大模型研判（素材 + 推理） | max_resolution、prompt、use_real_vlm、vlm_endpoint/model/key |
+| `vlm` | 大模型研判（素材 + 推理） | max_resolution、image_source、prompt、use_real_vlm、vlm_endpoint/model/key |
 | `plate_recog` | 车牌识别（消费车图） | detect_level、mode、margin、dedup_iou、track_dedup、track_cooldown |
 | `face_detect` | 人脸检测（消费人图） | device、det_thresh、det_size、max_num、use_crop、margin、dedup_iou |
 | `face_embed` | 人脸嵌入 | device |
 | `face_store` | 向量底库检索 | db_path、thresh、topk、device |
+
+**VLM 送审素材（`vlm.image_source`，连线相关）**：声明送审用哪张图——`annotated`（默认，＝带框图，
+无上游 `annotate` 时回退原帧）/ `frame`（本帧原帧）/ `crops`（与本次报送目标匹配的裁剪子图，
+**须链路同时含 `target_crop` 阶段**，按 bbox / IoU≥0.5 命中）。**缺省＝现状（零回归）；缺源一律回退、
+不报错**（`crops` 未命中 → `annotated` → 原帧）；参数细节见 `doc/modules/vlm.md`。
+
+> **连线校验**：`validate_spec` 对非法取值报错，对「声明 `annotated` 但上游无 `annotate`」「声明
+> `crops` 但上游无 `target_crop`」给**警告**（非致命，缺源自会回退）。历史注脚：`target_crop + vlm`
+> 组合曾因 composer 补漏而**不产生送审**（静默失效），已修复——该组合现按检测按类正常报送 VLM，
+> 同时产出 `last_crops` 供 `image_source=crops` 取用。
 
 **条件 DSL**（`det_filter.filter` / `target_crop.filter` / `annotate.filter`）：`字段 操作符 值`，
 组内逗号 = 并且、组间分号 = 或者、`not` = 非、`()` 分组；字段 `cls_id/类别`、`track_id/track`、
@@ -131,6 +141,8 @@
 - [ ] **输出事件** → 终段 `seq_filter.rules`（窗口 / 冷却 / 词表 / 动态事件名）或
       `det_filter.events`；VLM 结果由运行器 `publish()` 送入事件尾。**不要用 alarm/OutputPolicy**。
 - [ ] VLM 词表：`seq_filter.rules[].match`（如 `label in 治安类|交警类`）必须与 `vlm.prompt` 的输出词对齐。
+- [ ] VLM 送审素材：`vlm.image_source` 缺省 = `annotated`（零回归）；选 `crops` 须链路含 `target_crop`，
+      选 `annotated` 建议含 `annotate`（缺配套仅警告 / 回退，见 §2）。
 - [ ] 车牌链：`yolo.classes="2"` → `det_filter` → `target_crop(classes="2")` → `plate_recog`
       → 终段 `seq_filter(rules: kind==plate, cooldown<0)`。
 - [ ] 人脸链：`yolo.classes="0"` → `det_filter` → `target_crop(classes="0")` → `face_detect`（终段）。

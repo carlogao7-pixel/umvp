@@ -432,10 +432,11 @@ class Pipeline:
             self.last_annotated = self.annotate.run(frame, dets, ts)
 
         if self.yolo is not None:
-            if self.crop is not None:
-                pass  # 目标裁剪已产出，供下游阶段消费
-            elif dets is not None and self.vlm is not None:
-                # 报送请求的唯一消费者是 VLM 阶段（门控已在上游 det_filter/seq_filter 生效）
+            if dets is not None and self.vlm is not None:
+                # 报送请求的唯一消费者是 VLM 阶段（门控已在上游 det_filter/seq_filter 生效）。
+                # 目标裁剪阶段（crop）与 VLM 可共存：crops 供下游阶段/驱动层取裁剪子图
+                # （image_source=crops），同时仍按检测按类报送 VLM（_submits 语义与门控不变）；
+                # 仅有 crop、无 vlm 时不产生 submits（车牌/人脸链路既有行为不变）。
                 submits = self._submits(dets)
         elif self.vlm is not None:
             # large_only: 帧决策即送整帧

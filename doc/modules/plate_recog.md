@@ -68,7 +68,7 @@
 | bbox | (x1,y1,x2,y2) int | 车牌框，**原图坐标系**（`extract_plates` 已还原） |
 | car_bbox | (x1,y1,x2,y2)，可选 | 来源车框（原图坐标，仅 `extract_plates`） |
 | upscale | float | 车图的缩放倍数（来自目标裁剪 `out_size`；1.0=未放大） |
-| plate_img | ndarray，可选 | **原分辨率车牌图**（从原图直接裁出，margin 外扩，无缩放） |
+| plate_img | ndarray，可选 | **原分辨率车牌图**（从原图直接裁出，margin 外扩，无缩放）；记录化（`to_record`）后统一键名 `image`（旧名 `plate_img` 兼容，指向同一 ndarray） |
 | plate_crop_bbox | (x1,y1,x2,y2)，可选 | plate_img 对应的原图裁剪框（含 margin） |
 | index | int | 序号 |
 | width / height | int 属性 | 车牌框宽/高（像素） |

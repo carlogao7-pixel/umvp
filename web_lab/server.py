@@ -230,6 +230,72 @@ def _vlm_material(frame, payload: dict, req) -> "np.ndarray":
     return frame
 
 
+# VLM 送审图像源（spec 的 vlm 阶段参数 image_source；默认 annotated=现状语义）
+VLM_IMAGE_SOURCES = ("annotated", "frame", "crops")
+
+
+def _bbox_iou(a, b) -> float:
+    """两框 IoU（(x1,y1,x2,y2)，像素坐标）；退化框返回 0。"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _match_crop_for_req(req, crops):
+    """在目标裁剪产物 last_crops 里找与本次报送目标对应的子图。
+
+    匹配依据（下游可核对）：优先 req.det.bbox（单目标素材），否则取 req.dets 各框；
+    按 bbox 精确相等或 IoU≥0.5 命中（裁剪含 margin/缩放，用 IoU 而非全等）。
+    找不到返回 None（由调用方回退默认源，不抛错）。
+    """
+    if not crops:
+        return None
+    wanted = []
+    det = getattr(req, "det", None)
+    if det is not None:
+        wanted.append(tuple(int(v) for v in det.bbox))
+    for d in getattr(req, "dets", None) or []:
+        wanted.append(tuple(int(v) for v in d.bbox))
+    for c in crops:
+        cb = tuple(int(v) for v in c.bbox)
+        for w in wanted:
+            if cb == w or _bbox_iou(cb, w) >= 0.5:
+                return c
+    return None
+
+
+def _pick_vlm_image(source: str, req, frame, pipe) -> tuple:
+    """按 vlm 阶段声明的 image_source 取本帧送审图。
+
+    返回 (图像, 说明, 是否回退)。任一路径缺源都回退到现状（annotated→本帧原图），
+    不抛错——链路无 annotate / 无匹配裁剪时行为与改动前一致。
+    """
+    annotated = getattr(pipe, "last_annotated", None)
+    if source == "frame":
+        if frame is not None:
+            return frame, "原帧", False
+        return annotated, "无本帧原图，回退标注图", True
+    if source == "crops":
+        crop = _match_crop_for_req(req, getattr(pipe, "last_crops", None) or [])
+        if crop is not None:
+            return crop.img, "裁剪子图", False
+        if annotated is not None:
+            return annotated, "无匹配裁剪子图，回退标注图", True
+        return frame, "无匹配裁剪子图，回退原帧", True
+    # annotated（默认，现状语义）
+    if annotated is not None:
+        return annotated, "标注图", False
+    return frame, "无标注图，回退原帧", True
+
+
 def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
     """快速探测端点是否可连（TCP 连接），避免 requests 长超时把整轮测试拖住。"""
     import socket
@@ -986,6 +1052,11 @@ def h_pipeline_run(p: dict) -> dict:
             vlm_cfg = s.get("params") or {}
             break
     use_real_vlm = _bool(vlm_cfg, "use_real_vlm")
+    # 送审图像源：壳内声明（vlm 阶段 image_source），默认 annotated=现状；
+    # 非法值回落默认（validate_chain 会在建链路时拦，这里兜底防手工 spec 绕过）。
+    image_source = _str_param(vlm_cfg, "image_source", "annotated").lower()
+    if image_source not in VLM_IMAGE_SOURCES:
+        image_source = "annotated"
     vlm_fail = 0  # 真实调用失败次数（网络等），累计供结果提示
     # 真实 VLM 端点预探测：不可达则本轮直接跳过真实调用，避免每帧长超时把测试拖住
     _vlm_url = str(vlm_cfg.get("vlm_endpoint") or "").strip() \
@@ -1129,13 +1200,17 @@ def h_pipeline_run(p: dict) -> dict:
                             continue
                         try:
                             payload = pipe.vlm.prepare(s, None)
-                            base = getattr(pipe, "last_annotated", None)
-                            if base is None:
-                                base = frame
+                            # 送审图按壳内 image_source 选取（默认 annotated=现状；缺源回退）
+                            base, src_note, src_fallback = _pick_vlm_image(
+                                image_source, s, frame, pipe)
+                            # 回退（或非默认源）时在研判日志里给出可读来源说明
+                            src_tag = ("" if (image_source == "annotated" and not src_fallback)
+                                       else f"·素材:{src_note}")
                             action, description, raw = _vlm_real(
                                 vlm_cfg, payload, _vlm_material(base, payload, s))
                             _emit("vlm", f"研判 {action}"
-                                  + (f" — {description}" if description else "") + "（真实调用）",
+                                  + (f" — {description}" if description else "")
+                                  + f"（真实调用{src_tag}）",
                                   ts, stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
                         except Exception as e:
                             vlm_fail += 1
@@ -1905,6 +1980,12 @@ PARAMS = {
                            "help": "送审图片最大尺寸，超出会缩小"},
         "prompt": {"label": "提示词", "type": "text", "default": "",
                    "help": "留空用默认分类提示词"},
+        # 送审图像源（壳内声明"用哪张图"；默认 annotated=现状，低清图本阶段不做）
+        "image_source": {"label": "送审图像源", "type": "select", "default": "annotated",
+                         "options": ["annotated", "frame", "crops"],
+                         "help": "annotated=带框图（默认；无上游标注阶段时回退本帧原图）；"
+                                 "frame=本帧原图；crops=与本次报送目标匹配的裁剪子图"
+                                 "（匹配不到时回退 annotated/原帧，并记日志）"},
         "image": {"label": "测试图片（真实调用用）", "type": "file", "src": "img",
                   "test_only": True,
                   "help": "勾选真实大模型时，从这张图取素材发请求"},

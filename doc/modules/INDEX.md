@@ -11,7 +11,9 @@
 
 - **JSON 主干**：记录必备 `kind` / `ts` / `frame_idx`；通用字段 `bbox` / `score` / `cls_id` /
   `track_id` / `label` / `text`；事件字段 `events`（列表，一条记录可携带多个事件）。
-- **旁路字段**（约定不序列化）：`image`（ndarray 子图/帧）、`embedding`（向量）——像素与向量不进 JSON。
+- **旁路字段**（约定不序列化）：`image`（ndarray 子图/帧，**记录旁路图像统一键名**）、`embedding`（向量）——像素与向量不进 JSON。
+  历史模块自造键为**兼容别名**（`to_record` 转换时自动补 `image`，旧键保留）：
+  目标裁剪 `img` / 人脸检测 `face_img` / 车牌识别 `plate_img`。
 - **适配与事件 API**：老对象在边界经 `to_record` 统一（dataclass 自动转，特殊类型 `@register_adapter`）；
   `add_event` / `get_events` / `collect_events` 为通用事件接口；派生字段 `w/h/short/long/area`
   由 [`umvp/pipe/conditions.py`](../../umvp/pipe/conditions.py) 提供。
@@ -22,11 +24,11 @@
 |---|---|---|---|
 | [帧管理](frame_manager.md) | 接·产（帧元信息 frame_idx/ts；只决策不建检测记录） | 产（原图进入链路） | — |
 | [YOLO 识别](yolo.md) | 接·产（Detection 记录） | 接（原帧，推理输入） | — |
-| [目标裁剪](target_crop.md) | 接·产（CropResult 记录，带 bbox/cls_id/score/track_id） | 接·产（crop 子图 `img`） | — |
+| [目标裁剪](target_crop.md) | 接·产（CropResult 记录，带 bbox/cls_id/score/track_id） | 接·产（crop 子图 `image`，旧名 `img`） | — |
 | [标注](annotate.md) | 接（读框） | 接·产（帧副本带框图） | — |
 | [VLM 研判](vlm.md) | 产（研判内容回写：`label`/`content`） | 接（画框帧/素材） | — |
-| [人脸检测](face_detect.md) | 接·产（人脸记录 face_bbox/score/kps） | 接·产（人脸图 `face_img`） | — |
-| [车牌识别](plate_recog.md) | 接·产（车牌文本记录 plate_no/type/color） | 接·产（原分辨率车牌小图 `plate_img`） | — |
+| [人脸检测](face_detect.md) | 接·产（人脸记录 face_bbox/score/kps） | 接·产（人脸图 `image`，旧名 `face_img`） | — |
+| [车牌识别](plate_recog.md) | 接·产（车牌文本记录 plate_no/type/color） | 接·产（原分辨率车牌小图 `image`，旧名 `plate_img`） | — |
 | [检测筛选](det_filter.md) | 接·产·改（放行子集 + 追加 `events`） | 透传 | 透传 |
 | [时序判定](seq_filter.md) | 接·产·改（放行子集 + 追加 `events`） | 透传 | 透传 |
 | [人脸嵌入](face_embed.md) | — | 接（对齐人脸图 face_crop） | 产（512d 向量） |
@@ -47,7 +49,7 @@
 
 | 文档 | 模块 | 代码 | 主要 preset |
 |---|---|---|---|
-| [目标裁剪](target_crop.md) | 按上游检测框裁子图（产 CropResult + 图像旁路 `img`） | `TargetCrop` / `crop_targets` | CROP0001+ |
+| [目标裁剪](target_crop.md) | 按上游检测框裁子图（产 CropResult + 图像旁路 `image`，旧名 `img`） | `TargetCrop` / `crop_targets` | CROP0001+ |
 | [标注](annotate.md) | 帧副本画框（图像旁路，供 VLM 看"原图+画框"） | `Annotator` / `annotate_frame` | ANNO0001+ |
 | [VLM 研判](vlm.md) | 大模型研判 + 素材准备（研判内容回写主干） | `VLMAnalyzer` | VLM0001 |
 | [人脸检测](face_detect.md) | SCRFD 检测 + 5 点对齐；`FaceStage` 子图检脸 + 原图出脸 | `FaceDetector` / `FaceStage` | FDET0001~0002 |

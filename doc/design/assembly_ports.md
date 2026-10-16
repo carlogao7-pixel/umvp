@@ -119,12 +119,15 @@ class Annotator:
   （含「声明但未装配 → 报错」用例）、`test_composer` 36、`test_plate_recog_pipeline` 28、
   `test_police_uav_pipeline`、`test_agent_runtime` 39 全绿。
 
-### 第 1 步：旁路命名统一 + 图像源选择（WO-0002.2）
+### 第 1 步：旁路命名统一 + 图像源选择（WO-0002.2）— ✅ 已实施 2026-10-16
 
-- 旁路产物统一命名（`img`/`face_img`/`plate_img` → `image` 语义 + 保留兼容别名）；
-- spec 阶段支持 `image_source`（`frame / annotated / crops`），默认 = 现状（低清图暂不管，见 §8）；
-- VLM 素材在壳里可选（满足"原帧/带框图/裁剪图任选"的诉求）；
-- 回归：三条保留链路 + 全模块自检。
+- ✅ **旁路命名统一**（`records.py`）：记录旁路图像统一键 **`image`**（`to_record` 自动补；`img`/`face_img`/`plate_img` 保留兼容别名），新增读取器 `image_of(rec)`；各模块对象属性不变；
+- ✅ **`vlm.image_source`**（`annotated`（默认＝现状）/ `frame` / `crops`）：驱动层按值取图，缺源一律回退并在 timeline 标注素材来源；`validate_chain` 非法取值报错、上游缺 `annotate`/`target_crop` 给非致命警告；
+- ✅ **补漏**：`composer.step()` 原先「存在 `target_crop` 即不产生送审」，改为按「是否有 `vlm`」判定——`target_crop + vlm` 组合由此前**静默失效**变为可用（`crops` 源端到端成立）；
+- **验证**：新增 `tests/test_image_source.py` **59** 项（三取值/回退/records 键统一/crop+vlm 端到端/驱动层）；`test_validate_chain` **20/20**；
+  `test_face_capture_pipeline` 63、`test_composer` 36、`test_plate_recog_pipeline` 28、`test_police_uav_pipeline`、
+  `test_agent_runtime` 39、`test_cropper` 26、`test_target_crop` 35、`test_annotate` 16、
+  `test_det_filter` 66、`test_seq_filter` 43 全绿。
 
 ### 第 2 步：完整端口协议（WO-0002.3）
 

@@ -144,6 +144,82 @@ def test_test_only_key_rejected():
     assert any("test_only" in e for e in errs), errs
 
 
+# ---------------- image_source（vlm 送审图像源，WO-0002.2） ----------------
+
+def _uav_vlm(vlm_params: dict, annotate: bool = True, target_crop: bool = False):
+    """警用形态（含 vlm），可开关 annotate / target_crop 阶段；seq_filter 收尾。
+    vlm_params 直接透传（如 {"image_source": "crops"}）。"""
+    stages = [
+        ("frame_manager", {"sampling": "analysis", "frame_skip": 15}),
+        ("yolo", {"model_path": "yolov8n.pt", "classes": "0,2"}),
+        ("det_filter", {"group_limits": "0:2,300;2:1,300"}),
+    ]
+    if target_crop:
+        stages.append(("target_crop", {"classes": "0,2"}))
+    if annotate:
+        stages.append(("annotate", {"thickness": 2, "show_label": True}))
+    stages.append(("vlm", vlm_params))
+    stages.append(("seq_filter", {"throttle": "", "change": "", "rules": ""}))
+    return _stages(*stages)
+
+
+def _warns(spec):
+    w: list = []
+    errs = validate(spec, warnings=w)
+    return errs, w
+
+
+def test_image_source_valid_no_warn():
+    # annotated 上游有 annotate / crops 上游有 target_crop → 无 error 无 warning
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "annotated"}))
+    assert errs == [] and w == [], (errs, w)
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "crops"},
+                              target_crop=True))
+    assert errs == [] and w == [], (errs, w)
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "frame"}))
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_image_source_invalid_value_rejected():
+    # 非法取值（如 lowres，尚未实现）必须报错，不能静默回退
+    errs, _ = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "lowres"}))
+    assert any("不在允许值" in e and "image_source" in e for e in errs), errs
+
+
+def test_image_source_annotated_without_annotate_warns_not_fatal():
+    # 显式 annotated 但上游无 annotate → 非致命：error 空、warnings 有提示
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "annotated"},
+                              annotate=False))
+    assert errs == [], errs
+    assert any("annotate" in x for x in w), w
+
+
+def test_image_source_crops_without_target_crop_warns_not_fatal():
+    # 显式 crops 但上游无 target_crop → 非致命警告（运行时会回退）
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": "crops"},
+                              target_crop=False))
+    assert errs == [], errs
+    assert any("target_crop" in x for x in w), w
+
+
+def test_image_source_absent_old_spec_no_warn():
+    # 旧 spec（未声明 image_source）：缺省=现状，不报错不警告（零回归）
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False}, annotate=False))
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_image_source_none_value_no_error():
+    # DB 空列还原/未填 = None → 回落模块默认，不算非法取值，也不触发一致性警告
+    errs, w = _warns(_uav_vlm({"use_real_vlm": False, "image_source": None}, annotate=False))
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_validate_legacy_signature_unchanged():
+    # 旧调用方（validate(spec) 不传 warnings）签名兼容：仍有 error、不因 warning 抛错
+    spec = _uav_vlm({"use_real_vlm": False, "image_source": "crops"}, target_crop=False)
+    assert validate(spec) == [], validate(spec)
+
+
 def _with(idx, mid, patch):
     stages = list(BASE_PLATE)
     params = dict(stages[idx][1])

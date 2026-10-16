@@ -46,6 +46,9 @@
 | cls_id / score / track_id | int/float/int | 来源检测元数据（无检测时 cls=-1） |
 | index | int | 序号 |
 
+> `img` 为对象字段名；记录化（`to_record`）后旁路图像统一键名 `image`（旧名 `img` 兼容，
+> 指向同一 ndarray），见 [records 通用语](INDEX.md#〇通用语先读)。
+
 方法：`to_original(bbox)` / `kps_to_original(kps)` —— 子图坐标 → 原图坐标
 （除以 scale 加 offset）；下游识别模块据此还原车牌/人脸框并出原分辨率小图。
 

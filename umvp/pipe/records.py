@@ -6,8 +6,13 @@
   必备字段：kind（记录类型，如 det/plate/face/crop/alarm）、ts（时间戳）、
             frame_idx（帧序号）
   通用字段（跨模块同名同义）：bbox / score / cls_id / track_id / label / text
-  旁路字段（允许挂在记录上、约定不序列化）：image（ndarray 子图/帧）、
-            embedding（向量）——像素与向量不进 JSON
+  旁路字段（允许挂在记录上、约定不序列化）：**image**（ndarray 子图/帧）、
+             embedding（向量）——像素与向量不进 JSON
+             · 记录旁路图像统一键名 = image；历史模块自造键为**兼容别名**，
+               经 to_record 转换时自动补 image（旧键保留，新旧并存）：
+               target_crop → img、face_detect → face_img、plate_recog → plate_img
+               （见 IMAGE_KEY / IMAGE_ALIASES；对象属性 c.img / f.face_img / pl.plate_img
+               不受影响）
   派生字段（条件 DSL 可直接引用，从 bbox 计算）：w/h/short/long/area
   （见 pipe.conditions）
   事件字段：events —— **列表**，元素为事件 dict {"name": 事件名, "ts": 时间戳,
@@ -31,6 +36,40 @@ from typing import Any, Callable, Dict, List, Optional, Type
 _ADAPTERS: Dict[Type, Callable[[Any], dict]] = {}
 EVENTS_KEY = "events"  # 记录携带的事件列表字段名（通用约定）
 
+# 旁路图像字段：统一键名 IMAGE_KEY，历史模块自造键为兼容别名（记录 dict 层新旧并存）
+IMAGE_KEY = "image"
+IMAGE_ALIASES = ("img", "face_img", "plate_img")  # target_crop / face_detect / plate_recog
+
+
+def image_of(rec) -> Any:
+    """从记录/dict 取旁路图：优先 image，回退兼容别名；都没有返回 None。"""
+    if isinstance(rec, Mapping):
+        for k in (IMAGE_KEY, *IMAGE_ALIASES):
+            v = rec.get(k)
+            if v is not None:
+                return v
+        return None
+    for k in (IMAGE_KEY, *IMAGE_ALIASES):
+        v = getattr(rec, k, None)
+        if v is not None:
+            return v
+    return None
+
+
+def _unify_image_key(rec: dict) -> dict:
+    """把旧旁路图像键（img/face_img/plate_img）的值补到 image（旧键保留，原地补键）。
+
+    统一记录旁路图像命名（records 约定 image）；缺 image 时按别名顺序补第一个非空值。
+    已有 image（含显式 None）则不覆盖；无任何旁路图键（如 Detection）原样返回。
+    """
+    if IMAGE_KEY not in rec:
+        for k in IMAGE_ALIASES:
+            v = rec.get(k)
+            if v is not None:
+                rec[IMAGE_KEY] = v
+                break
+    return rec
+
 
 def register_adapter(cls: Type) -> Callable[[Callable[[Any], dict]], Callable[[Any], dict]]:
     """装饰器：注册类型的自定义转记录函数（覆盖 dataclass 默认转换）。"""
@@ -45,17 +84,18 @@ def to_record(obj) -> dict:
 
     Mapping 直接拷贝；注册适配器优先；dataclass 按字段名转；
     其余尽力取 __dict__，取不到给空 dict（字段缺失由消费方兜底）。
+    末尾统一旁路图像键：旧键（img/face_img/plate_img）自动补 image（见 _unify_image_key）。
     """
     if isinstance(obj, Mapping):
-        return dict(obj)
+        return _unify_image_key(dict(obj))
     for cls in type(obj).__mro__:
         fn = _ADAPTERS.get(cls)
         if fn is not None:
-            return dict(fn(obj))
+            return _unify_image_key(dict(fn(obj)))
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: getattr(obj, f.name) for f in _dc_fields(obj)}
+        return _unify_image_key({f.name: getattr(obj, f.name) for f in _dc_fields(obj)})
     d = getattr(obj, "__dict__", None)
-    return dict(d) if d else {}
+    return _unify_image_key(dict(d)) if d else {}
 
 
 def records(items, kind: Optional[str] = None, ts: Optional[float] = None,

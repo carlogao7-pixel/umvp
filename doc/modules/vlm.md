@@ -22,10 +22,15 @@
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
+| image_source | select | annotated | **送审图像源**（连线相关，2026-10-16 新增）：`annotated`＝带框图（缺则回退原帧，＝旧行为）/ `frame`＝本帧原帧 / `crops`＝与送审目标匹配的裁剪子图（按 bbox 精确或 IoU≥0.5 命中，**链路须含 `target_crop` 阶段**；未命中回退并在 timeline 标注素材来源）。缺省＝现状（零回归），缺源一律回退不报错 |
 | use_real_vlm | bool | false | true=真发 HTTP 请求到端点；false=只演示素材包不推理 |
 | vlm_endpoint | str | （见库内值） | OpenAI 兼容接口地址（/v1/chat/completions） |
 | vlm_model | str | qwen3-vl-32b | 调用的模型名 |
 | vlm_key | str | 空 | API Key，免鉴权端点留空 |
+
+> `validate_chain` 对 `image_source` 非法取值报错；`annotated` 但上游无 `annotate`、`crops` 但上游无
+> `target_crop` 时给**非致命警告**（运行时回退）。详见
+> [拼接层端口协议设计稿](../design/assembly_ports.md)（P5，第 1 步已实施）。
 
 ### 2.3 单模块测试参数（仅模块测试页运行用，不落库、不进链路）
 

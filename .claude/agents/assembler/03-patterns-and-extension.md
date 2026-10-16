@@ -35,7 +35,7 @@
 | ③ 新增槽位 | 产出要给**多个 / 未知**下游，或它须成为链路**阶段**（spec 可见 / 可参数化 / 被校验） | `crop` / `annotate` / `plate` / `face` 四槽位 |
 
 **判据**：驱动层能私下解决就②；需要成为链路结构的一部分才③。既有槽位先查重：
-`last_annotated`（画框图→VLM）/ `last_crops`（子图→车牌 / 人脸）/ frame（原帧→裁剪 / 标注）。
+`last_annotated`（画框图→VLM）/ `last_crops`（子图→车牌 / 人脸，或 VLM `image_source=crops`）/ frame（原帧→裁剪 / 标注）。
 
 **真到③，新增槽位四件套**（参照 annotate 的接法）：
 

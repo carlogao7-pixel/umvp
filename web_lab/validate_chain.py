@@ -11,6 +11,7 @@
   2) 无重复 module_id
   3) 终段 ∈ {det_filter, seq_filter, plate_recog, face_detect, face_embed}
   4) 每个 module_id 是已注册产品模块；params 键在其参数白名单内；select 取值合法
+     （含 vlm.image_source：annotated/frame/crops，非法取值即报错）
   5) 声明即执行：spec 声明的每个已注册阶段必须被装配器装配进执行路径
      （server.CHAIN_ASSEMBLED_MODULES）；声明了但装配器无处理（如 face_store）会报错。
      这条正是「人脸链声明 det_filter 却静默不执行」事故（WO-0001）的回归测试。
@@ -20,7 +21,9 @@
      - target_crop/annotate 的 filter → pipe.conditions.parse_condition 干跑
      - yolo 的 model_path → models/ 权重池文件存在性
      - yolo 的 conf/iou ∈ (0,1]、frame_manager.frame_skip 为正整数
-退出码：0=通过；1=有 error（逐条打印）。
+  7) vlm.image_source 一致性（非致命警告，经 warnings 列表返回）：显式声明 annotated 但
+     上游无 annotate / 声明 crops 但上游无 target_crop → 运行时静默回退，提示但不算错。
+  退出码：0=通过（含仅有警告）；1=有 error（逐条打印）。
 """
 from __future__ import annotations
 
@@ -101,8 +104,14 @@ def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
     return errs
 
 
-def validate(spec: dict) -> list[str]:
+def validate(spec: dict, warnings: list | None = None) -> list[str]:
+    """校验链路 spec。返回 error 列表（非空=不通过）。
+
+    warnings（可选）：传入列表时，追加非致命提示（如 vlm 声明的 image_source 其上游
+    无对应产物阶段，运行时会静默回退）。不传则忽略——保持旧调用方（agent/tests）签名兼容。
+    """
     errs: list[str] = []
+    warns: list = warnings if warnings is not None else []
     stages = (spec or {}).get("stages")
     if not isinstance(stages, list) or not stages:
         return ["stages 缺失或为空（应为非空数组，首段 frame_manager）"]
@@ -146,7 +155,9 @@ def validate(spec: dict) -> list[str]:
                 errs.append(f"stages[{i}] {mid}: 参数 {k!r} 为模块测试页专用（test_only），"
                             f"不能进链路 spec")
             opts = spec_k.get("options")
-            if opts and str(v) not in [str(o) for o in opts]:
+            # v 为 None=该列未设置（DB 空列还原/未填），回落模块默认，不算非法取值；
+            # 显式填了非允许字符串才报错（如 image_source='lowres'）。
+            if opts and v is not None and str(v) not in [str(o) for o in opts]:
                 errs.append(f"stages[{i}] {mid}.{k}={v!r} 不在允许值 {opts}")
         errs.extend(_semantic_dry_run(i, mid, params))
     # 5) 声明即执行：已注册产品模块若未被装配器装配，声明了也不会执行（静默失效）。
@@ -157,6 +168,24 @@ def validate(spec: dict) -> list[str]:
         if m not in CHAIN_ASSEMBLED_MODULES:
             errs.append(f"声明即执行: 阶段 {m!r} 未被 _chain_from_spec 装配进执行路径"
                         f"（可装配阶段: {sorted(CHAIN_ASSEMBLED_MODULES)}）")
+    # 6) vlm.image_source 与上游产物一致性（非致命警告）：
+    #    显式声明 annotated 但链路上游无 annotate / 声明 crops 但上游无 target_crop 时，
+    #    驱动层会静默回退到默认源（annotated→原帧），行为正确但非用户本意，故提示。
+    #    未声明 image_source 的旧 spec 不提示（缺省=现状，零回归）。
+    for i, st in enumerate(stages):
+        if st.get("module_id") != "vlm":
+            continue
+        params = st.get("params") or {}
+        if not isinstance(params, dict) or "image_source" not in params:
+            continue
+        src = str(params.get("image_source") or "").strip().lower()
+        upstream = ids[:i]
+        if src == "annotated" and "annotate" not in upstream:
+            warns.append(f"stages[{i}] vlm.image_source='annotated' 但其上游无 annotate "
+                         f"阶段，运行时将回退本帧原图（如需带框图请加 annotate 阶段）")
+        elif src == "crops" and "target_crop" not in upstream:
+            warns.append(f"stages[{i}] vlm.image_source='crops' 但其上游无 target_crop "
+                         f"阶段，运行时将回退（annotated→原帧）")
     return errs
 
 
@@ -174,7 +203,10 @@ def main() -> int:
     except Exception as e:
         print(f"[ERR] 无法读取/解析 spec: {e}")
         return 1
-    errs = validate(spec)
+    warns: list = []
+    errs = validate(spec, warnings=warns)
+    for w in warns:
+        print(f"  [WARN] {w}")
     if errs:
         print("链路 spec 校验失败：")
         for e in errs:

@@ -73,6 +73,7 @@ SCRFD 人脸检测（InsightFace buffalo_l 包 det_10g.onnx）：定位人脸 +
   （目标裁剪/人脸检测链路把子图坐标系的 kps/bbox 还原回原图）。
 - `FaceStage`：消费上游「目标裁剪」的 `CropResult` 子图，产出原分辨率人脸
   （`FaceResult`：person_bbox / face_bbox / face_img / score / kps）；链路编排见 [人脸截取链路 PIPE0003](../chains/pipe0003_face_capture.md)。
+  记录化（`to_record`）后旁路图像统一键名 `image`（旧名 `face_img` 兼容，指向同一 ndarray）。
 
 ## 6. 验证
 

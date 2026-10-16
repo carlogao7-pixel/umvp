@@ -18,6 +18,10 @@
 
 > 模块与参数白名单以 `list_modules` 现取为准；本表只给组合骨架与方向。
 
+**VLM 送审素材（`vlm.image_source`）**：默认 `annotated`（带框图，＝现状）；要 VLM 看原帧用 `frame`；
+要它只看目标子图用 `crops`（该组合须同时含 `target_crop`，即上表"行为研判"行可加一段 `target_crop`）。
+缺省不变、缺源回退，细节见 `doc/modules/vlm.md` 与 `01-shell-standard.md §2`。
+
 ## 2. YOLO 检测 / 跟踪参数初值（实测，2026-08-12）
 
 > 环境：RTX 3060 Laptop GPU、模型固定 `yolov8n.pt`、4K 源素材；数据 `out/yolo_bench{2,3,4,5}/`。
