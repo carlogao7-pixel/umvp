@@ -22,6 +22,19 @@
 要它只看目标子图用 `crops`（该组合须同时含 `target_crop`，即上表"行为研判"行可加一段 `target_crop`）。
 缺省不变、缺源回退，细节见 `doc/modules/vlm.md` 与 `01-shell-standard.md §2`。
 
+**产物连线（`inputs`）用法**（端口协议，见 `01-shell-standard.md §3`）：默认各阶段已按**固定流水**接好
+（`det_filter` / `seq_filter` ← `dets`，`target_crop` / `annotate` ← `frame` + `dets`），
+**不写 `inputs` = 现状**；只在想让某阶段**取上游另一环**时才显式连线（每端口一个上游产物，值须字符串）：
+
+- `annotate.dets = det_filter.dets` → 标注画"**同帧筛选后**"的框、**忽略时序门控**（`seq_filter` 的
+  节流 / 变化）；不写则 annotate 吃检测流末端（det_filter → seq_filter 之后）。
+- `annotate.dets = yolo.dets` → 画**筛选前**的原始检出（调试图省 / 看漏检）。
+- `target_crop.dets = yolo.dets` → 按**原始检出**裁剪（跳过 `det_filter` 有效性筛选）。
+
+> **多数场景无需连线**（默认即现状）；端口与类型以模块 `INPUTS/OUTPUTS` 声明为准。本期仅
+> `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效，`vlm/plate_recog/face_detect` 写
+> `inputs` 只会**警告**、运行时按默认取数。
+
 ## 2. YOLO 检测 / 跟踪参数初值（实测，2026-08-12）
 
 > 环境：RTX 3060 Laptop GPU、模型固定 `yolov8n.pt`、4K 源素材；数据 `out/yolo_bench{2,3,4,5}/`。

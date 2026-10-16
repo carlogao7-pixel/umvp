@@ -93,6 +93,12 @@
   .stage-form .field{margin-bottom:8px;max-width:640px}
   .stage-form label{font-size:12px}
   .stage-form input,.stage-form select,.stage-form textarea{max-width:420px;padding:5px 8px;font-size:12px}
+  .stage-wiring{margin-top:6px;padding-top:8px;border-top:1px dashed var(--line)}
+  .stage-wiring .wiring-title{font-size:12px;color:var(--dim);margin-bottom:5px}
+  .stage-wiring .wiring-row{display:flex;gap:8px;align-items:center;margin-bottom:5px;max-width:640px}
+  .stage-wiring .wiring-row label{font-size:12px;min-width:110px;color:var(--text)}
+  .stage-wiring .wiring-row select{flex:1;max-width:360px;padding:4px 8px;font-size:12px}
+  .stage-wiring .wiring-note{font-size:11.5px;color:var(--dim);line-height:1.6}
   .stage-preset{display:flex;gap:6px;align-items:center;margin-bottom:8px}
   .stage-preset input[type=text]{width:150px;max-width:150px;padding:4px 8px;font-size:12px}
   .stage-preset select{width:auto;max-width:260px;padding:4px 8px;font-size:12px}
@@ -811,7 +817,7 @@ function renderStagePresetSel(q, sel, mid){
   }
 }
 
-function addStage(mid, params, presetId){
+function addStage(mid, params, presetId, inputs){
   const m = SCHEMA.modules[mid];
   // 每个模块在一条链路中最多一个阶段：重复点击调色板不会新增重复阶段（防止误加）
   if (STAGES.some(s => s.module === mid)){
@@ -854,22 +860,107 @@ function addStage(mid, params, presetId){
     form.oninput = () => applyShowIf(form);
     form.onchange = () => applyShowIf(form);
   }
+  // 输入连线（P5 第 2 步）：对本期已纳入解析的端口各渲染一个上游产物下拉（默认=现状）
+  const wiring = document.createElement("div");
+  wiring.className = "stage-wiring";
+  el.appendChild(wiring);
   document.getElementById("dg-stages").appendChild(el);
-  STAGES.push({module: mid, el, presetId: presetId || null});
+  STAGES.push({module: mid, el, presetId: presetId || null, inputs: inputs || {}});
   if (params) fillForm(el, params);
   applyShowIf(el);
+  renderWiring(el);
   return el;
+}
+
+// ---- 输入连线（产物端口协议，P5 第 2 步）----
+// 本阶段上游已登记产物清单（{name, type}）：取各上游阶段 OUTPUTS ∩ SCHEMA.artifacts
+// （artifacts = Pipe 实际登记的产物表，是唯一权威）。
+function upstreamArtifacts(stageIndex){
+  const arts = SCHEMA.artifacts || {};
+  const out = [];
+  for (let i = 0; i < stageIndex; i++){
+    const mid = STAGES[i].module;
+    const mod = SCHEMA.modules[mid];
+    for (const [oname, otype] of Object.entries((mod && mod.outputs) || {})){
+      const name = mid + "." + oname;
+      if (name in arts) out.push({name, type: arts[name] || otype});
+    }
+  }
+  return out;
+}
+
+// 渲染某阶段的「输入连线」区：只对 resolved_ports（本期已纳入解析的端口）开放连线；
+// 未开放端口（vlm/plate_recog/face_detect）给出说明，不渲染下拉。
+function renderWiring(stageEl){
+  const box = stageEl.querySelector(".stage-wiring");
+  if (!box) return;
+  const idx = STAGES.findIndex(s => s.el === stageEl);
+  if (idx < 0) return;
+  const stage = STAGES[idx];
+  const mod = SCHEMA.modules[stage.module] || {};
+  const declared = mod.inputs || {};
+  const resolved = mod.resolved_ports || [];
+  const inputs = stage.inputs || {};
+  box.innerHTML = "";
+  if (!resolved.length){
+    const keys = Object.keys(declared);
+    if (keys.length){
+      const note = document.createElement("div");
+      note.className = "wiring-note";
+      note.textContent = "输入端口（" + keys.join(" / ") +
+        "）本期未开放连线，按默认取数——连线不影响运行。";
+      box.appendChild(note);
+    }
+    return;
+  }
+  const ups = upstreamArtifacts(idx);
+  const title = document.createElement("div");
+  title.className = "wiring-title";
+  title.textContent = "输入连线（缺省=现状规则）";
+  box.appendChild(title);
+  for (const port of resolved){
+    const wantType = declared[port];
+    const row = document.createElement("div");
+    row.className = "wiring-row";
+    const lab = document.createElement("label");
+    lab.textContent = port + (wantType ? "（" + wantType + "）" : "");
+    const sel = document.createElement("select");
+    sel.dataset.port = port;
+    const opDef = document.createElement("option");
+    opDef.value = ""; opDef.textContent = "默认（现状）";
+    sel.appendChild(opDef);
+    for (const a of ups){
+      if (wantType && a.type !== wantType) continue;  // 只列类型匹配的上游产物
+      const op = document.createElement("option");
+      op.value = a.name;
+      op.textContent = a.name + "（" + a.type + "）";
+      sel.appendChild(op);
+    }
+    sel.value = inputs[port] || "";
+    // 选择回写 stage.inputs（随保存/运行流程走；空=删除该连线，回落默认）
+    sel.addEventListener("change", () => {
+      const i = STAGES.findIndex(s => s.el === stageEl);
+      if (i < 0) return;
+      const ins = STAGES[i].inputs || (STAGES[i].inputs = {});
+      if (sel.value) ins[port] = sel.value;
+      else delete ins[port];
+      dgEstimate();
+    });
+    row.appendChild(lab); row.appendChild(sel);
+    box.appendChild(row);
+  }
 }
 
 function renderStages(list){
   const box = document.getElementById("dg-stages");
   box.innerHTML = "";
   STAGES = [];
-  for (const s of list || []) addStage(s.module, s.params, s.preset_id);
+  for (const s of list || []) addStage(s.module, s.params, s.preset_id, s.inputs);
 }
 
 function snapshot(){
-  return STAGES.map(s => ({module: s.module, params: collect(s.el), preset_id: s.presetId}));
+  return STAGES.map(s => ({module: s.module, params: collect(s.el),
+                           preset_id: s.presetId, inputs: s.inputs || {}}));
 }
 
 async function saveStagePreset(i){
@@ -1035,12 +1126,20 @@ async function savePipelinePreset(){
   }
 
   // 保存链路（steps 重建引用，不复制参数）
+  // 端口连线（inputs）随链路存于 meta.stage_inputs（{module_id: {端口: 上游产物名}}），
+  // 不改 pipeline_steps 表结构；载入时由后端回填到各阶段（见 db.load_pipeline）。
+  const stage_inputs = {};
+  for (const stage of stages){
+    const ins = stage.inputs || {};
+    if (Object.keys(ins).length) stage_inputs[stage.module] = ins;
+  }
   const data = await apiPost("/api/pipelines/save", {
     name: name,
     steps: steps,
     streams: parseInt(document.getElementById("dg-streams").value) || 1,
     budget: {},
-    meta: {description: document.getElementById("dg-scenario").value}
+    meta: {description: document.getElementById("dg-scenario").value,
+           stage_inputs: stage_inputs}
   });
 
   if (!data.ok){
@@ -1064,11 +1163,12 @@ async function loadPipelinePreset(){
   const d = document.getElementById("dg-scenario");
   if (d) d.value = (pipeline.meta && pipeline.meta.description) || "";
   
-  // 转换 stages 为前端需要的格式
+  // 转换 stages 为前端需要的格式（inputs=端口连线，由后端从 meta.stage_inputs 回填）
   const stages = (pipeline.stages || []).map(s => ({
     module: s.module_id,
     params: s.params || {},
-    preset_id: s.preset_id
+    preset_id: s.preset_id,
+    inputs: s.inputs || {}
   }));
 
   renderStages(stages);

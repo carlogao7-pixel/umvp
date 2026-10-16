@@ -8,7 +8,7 @@
 
 | 文件 | 内容 | 何时读 |
 |---|---|---|
-| `01-shell-standard.md` | **链路壳标准（唯一权威）**：spec schema + 硬规则 + 参数白名单来源 + 标准壳 + 装配自检清单 + 红线 | 写 / 改 spec 前必读 |
+| `01-shell-standard.md` | **链路壳标准（唯一权威）**：spec schema + 硬规则 + 参数白名单来源 + **产物端口协议（`inputs` 连线）** + 标准壳 + 装配自检清单 + 红线 | 写 / 改 spec 前必读 |
 | `02-assembly-workflow.md` | 组装工作流 + 交付包契约 + 汇报模板 | 接到任务时 |
 | `03-patterns-and-extension.md` | 拼装套路 / 胶水 / 槽位判定 + **新模块接入 / 新编排逻辑演进** | 遇新需求 / 扩展时 |
 | `04-pitfalls-and-checklist.md` | 常见坑 + 已验证 / 未验证清单 | 选参数 / 交付前 |
@@ -24,7 +24,7 @@
 ## 维护规则（迭代时更新哪个文件）
 
 - **新增模块**：本文档无需改——`list_modules` 自动纳入；若它引入新的**旁路槽位 / 阶段**，
-  更新 `03-patterns-and-extension.md` 的"新模块接入四件套"。
+  更新 `03-patterns-and-extension.md` 的"新模块接入清单（端口协议版）"。
 - **新增 / 改变编排逻辑、数据流**：更新 `01-shell-standard.md`（硬规则 / 数据流）与 `03`（扩展点）。
 - **参数实测 / 调优结论**：追加 `05-decision-table.md` 与 `04-pitfalls-and-checklist.md`。
 - **新坑**：追加 `04-pitfalls-and-checklist.md`。

@@ -72,6 +72,10 @@ class DetFilter:
     events       : 事件规格列表（可选，多事件）——见模块文档；放行记录上追加事件。
     """
 
+    # 产物端口声明：吃检测记录，放行子集仍是检测记录（只取舍不改内容）。
+    INPUTS = {"dets": "Records"}
+    OUTPUTS = {"dets": "Records"}
+
     def __init__(self, filter: str = "",
                  group_limits: Optional[Dict[int, Tuple[int, int]]] = None,
                  predicates: Optional[Sequence] = None,

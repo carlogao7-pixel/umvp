@@ -58,6 +58,10 @@ class FaceStage:
         dedup_iou: 人脸框去重 IoU（上游重叠目标框会让同一张脸进多个子图）
     """
 
+    # 产物端口声明：吃原帧（坐标基准/出图源）+ 上游目标裁剪记录，产人脸记录。
+    INPUTS = {"frame": "Image", "crops": "Records"}
+    OUTPUTS = {"faces": "Records"}
+
     def __init__(self, face_det: FaceDetector, tool=None, dedup_iou: float = 0.6) -> None:
         self.face_det = face_det
         self.tool = tool or Cropper(upscale=1.0, margin=0.15)

@@ -18,21 +18,31 @@
   `add_event` / `get_events` / `collect_events` 为通用事件接口；派生字段 `w/h/short/long/area`
   由 [`umvp/pipe/conditions.py`](../../umvp/pipe/conditions.py) 提供。
 
-### 两平面角色表（模块｜JSON 主干｜图像旁路｜向量旁路；接=接收 产=生产 改=修改/追加）
+### 产物端口表（模块｜端口与产物｜接产改；2026-10-16 端口协议）
 
-| 模块 | JSON 主干 | 图像旁路 | 向量旁路 |
+> 模块间连线的通用语（P5 端口协议，见 [拼接层端口协议设计稿](../design/assembly_ports.md)）：
+> **产物名 = `{阶段}.{产物}`**，类型三类 `Image / Records / Vector`；模块以类属性
+> `INPUTS` / `OUTPUTS` 自描述（如 `Annotator.INPUTS == {"image": "Image", "dets": "Records"}`）；
+> spec 阶段可用 `"inputs": {端口: 上游产物名}` 显式连线（**不写 = 现状默认**）。
+
+| 模块 | INPUTS（端口→类型） | OUTPUTS（产物→类型） | 备注（接/产/改） |
 |---|---|---|---|
-| [帧管理](frame_manager.md) | 接·产（帧元信息 frame_idx/ts；只决策不建检测记录） | 产（原图进入链路） | — |
-| [YOLO 识别](yolo.md) | 接·产（Detection 记录） | 接（原帧，推理输入） | — |
-| [目标裁剪](target_crop.md) | 接·产（CropResult 记录，带 bbox/cls_id/score/track_id） | 接·产（crop 子图 `image`，旧名 `img`） | — |
-| [标注](annotate.md) | 接（读框） | 接·产（帧副本带框图） | — |
-| [VLM 研判](vlm.md) | 产（研判内容回写：`label`/`content`） | 接（画框帧/素材） | — |
-| [人脸检测](face_detect.md) | 接·产（人脸记录 face_bbox/score/kps） | 接·产（人脸图 `image`，旧名 `face_img`） | — |
-| [车牌识别](plate_recog.md) | 接·产（车牌文本记录 plate_no/type/color） | 接·产（原分辨率车牌小图 `image`，旧名 `plate_img`） | — |
-| [检测筛选](det_filter.md) | 接·产·改（放行子集 + 追加 `events`） | 透传 | 透传 |
-| [时序判定](seq_filter.md) | 接·产·改（放行子集 + 追加 `events`） | 透传 | 透传 |
-| [人脸嵌入](face_embed.md) | — | 接（对齐人脸图 face_crop） | 产（512d 向量） |
-| [向量底库](face_store.md) | 产（MatchResult 记录） | — | 接（查询向量） |
+| [帧管理](frame_manager.md) | `{}` | `frame_manager.frame` → Image | 产原图（帧元信息进主干） |
+| [YOLO 识别](yolo.md) | `image` → Image | `yolo.dets` → Records | 纯推理产检测记录 |
+| [检测筛选](det_filter.md) | `dets` → Records | `det_filter.dets` → Records | 放行子集＋`events`（改） |
+| [时序判定](seq_filter.md) | `dets` → Records | `seq_filter.dets` → Records | 门控放行＋`events`（改） |
+| [目标裁剪](target_crop.md) | `frame` → Image；`dets` → Records | `target_crop.crops` → Records（元素含 `image`） | 接检测产子图 |
+| [标注](annotate.md) | `image` → Image；`dets` → Records | `annotate.annotated` → Image | 产带框图 |
+| [VLM 研判](vlm.md) | `image` → Image；`dets` → Records | —（研判内容回写主干 `label`/`content`） | 送审在驱动层消费 |
+| [人脸检测](face_detect.md) | `frame` → Image；`crops` → Records | `face_detect.faces` → Records（元素含 `image`） | 接裁剪产人脸记录＋人脸图 |
+| [车牌识别](plate_recog.md) | `frame` → Image；`crops` → Records | `plate_recog.plates` → Records（元素含 `image`） | 接裁剪产车牌记录＋原分辨率车牌图 |
+| [人脸嵌入](face_embed.md) | 人脸图 | 512d 向量 → Vector | 向量旁路 |
+| [向量底库](face_store.md) | 查询向量 | MatchResult 记录 | 检索产出 |
+
+**本期连线范围**：`inputs` 解析已覆盖 `yolo.image`、`det_filter.dets`、`seq_filter.dets`、
+`target_crop.frame/dets`、`annotate.image/dets`；`vlm` / `plate_recog` / `face_detect` 暂按默认取数
+（写了 `inputs` 会由 `validate_chain` 给出**非致命警告**）。校验：未知产物 / 非法端口 / 非上游引用 /
+类型不符 / 值非字符串 → 报错；同一产物被多个下游引用 → 允许（分支留路）。
 
 ## 一、主干生产者（向数据流放入新记录）
 

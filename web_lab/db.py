@@ -674,6 +674,21 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
             cur.close()
 
 
+def _attach_stage_inputs(stages: list[dict], stage_inputs) -> list[dict]:
+    """把 meta.stage_inputs（{module_id: {端口: 上游产物名}}）回填到各 stage 的 inputs。
+
+    纯函数（无 DB 依赖，便于单测）：只对已有 stage 且连线非空的模块注入；旧链路
+    （meta 无 stage_inputs）保持原样 → 零回归。返回同一 stages 列表（就地更新）。
+    """
+    if not isinstance(stage_inputs, dict):
+        return stages
+    for st in stages:
+        ins = stage_inputs.get(st.get("module_id"))
+        if isinstance(ins, dict) and ins:
+            st["inputs"] = ins
+    return stages
+
+
 def load_pipeline(pipeline_id: str) -> dict:
     """按 id 取回完整链路：{id, name, streams, budget, meta, stages}。
 
@@ -712,8 +727,13 @@ def load_pipeline(pipeline_id: str) -> dict:
     stages = [{"position": position, "preset_id": preset_id, "module_id": module_id,
                "params": params_map.get(preset_id, {})}
               for position, preset_id, module_id in steps]
+    meta = _loads(meta_json)
+    # 端口连线（P5 第 2 步）随链路保存：设计器把各阶段 inputs 存于 meta.stage_inputs
+    # （{module_id: {端口: 上游产物名}}，免费 meta JSON，不改 pipeline_steps 表结构），
+    # 取回时回填到对应 stage 的 inputs 字段 → 直接生成带连线的 P2 spec。
+    _attach_stage_inputs(stages, meta.get("stage_inputs") if isinstance(meta, dict) else None)
     return {"id": pid, "name": name, "streams": streams,
-            "budget": _loads(budget_json), "meta": _loads(meta_json),
+            "budget": _loads(budget_json), "meta": meta,
             "stages": stages}
 
 

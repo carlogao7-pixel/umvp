@@ -1,6 +1,6 @@
 # 拼接层端口协议（设计稿）
 
-> 状态：📐 设计稿（**第 0 步已实施 2026-10-16**（WO-0002.1）；第 1/2 步待排）。需求来源：
+> 状态：✅ **三步全部实施（2026-10-16）**：第 0 步 WO-0002.1、第 1 步 WO-0002.2、第 2 步 WO-0002.3。需求来源：
 > `../requirements/development.md`「P5」；实施工单 **WO-0002**（分步）。用户已确认：
 > ①「逐帧阶段必须走通用插槽 + validate_chain 断言」写入链路壳标准；②**分步实施**。
 >
@@ -129,11 +129,25 @@ class Annotator:
   `test_agent_runtime` 39、`test_cropper` 26、`test_target_crop` 35、`test_annotate` 16、
   `test_det_filter` 66、`test_seq_filter` 43 全绿。
 
-### 第 2 步：完整端口协议（WO-0002.3）
+### 第 2 步：完整端口协议（WO-0002.3）— ✅ 已实施 2026-10-16
 
-- 产物表 + 模块 `INPUTS/OUTPUTS` 声明 + `inputs` 连线 + 校验器 + 设计器连线 UI（下拉选产物）；
-- `docs/modules/INDEX.md` 的「两平面角色表」升级为「产物端口表」；
-- 新增模块接入清单：登记声明 → 装配器自动可用（不再改 `Pipeline` 核心）。
+- ✅ **产物表**：`Pipeline.artifacts` 每帧登记 `frame_manager.frame` / `yolo.dets` / `det_filter.dets` /
+  `seq_filter.dets` / `target_crop.crops` / `annotate.annotated` / `face_detect.faces` / `plate_recog.plates`；
+- ✅ **模块自描述**：9 个模块声明 `INPUTS` / `OUTPUTS`（类型 `Image`/`Records`/`Vector`）；
+- ✅ **`inputs` 连线**：spec 阶段可选 `"inputs": {端口: 上游产物名}`，缺省＝现状（零回归）；非法连线
+  fail fast（`PortResolutionError`，含阶段/端口/产物/可用清单）；本期解析范围 §3 所列 5 条端口；
+  `vlm` / `plate_recog` / `face_detect` 暂未纳入（校验给非致命警告）；
+- ✅ **校验器 DAG**：未知产物 / 非法端口 / 非上游或自引用 / 类型不符 / 值非字符串 → 错；同一产物多下游 → 允许；
+- ✅ **设计器连线 UI**：每阶段按可连线端口渲染下拉（上游产物 + 类型标注 + 「默认（现状）」），
+  存 `meta.stage_inputs`（`pipeline_steps` 表结构未变，旧链路无键保持原样）；
+- ✅ **接入即用**：新模块「插槽 + 声明 INPUTS/OUTPUTS + 登记 `CHAIN_ASSEMBLED_MODULES`」后装配器/
+  设计器即可用（是否纳入 `inputs` 解析为可选第 4 件）；
+- **验证**：`test_composer` 36→**59**（产物表/连线/非法连线）、`test_validate_chain` 20→**30**、
+  新增 `tests/test_port_inputs.py` **39**（含端到端间谍证据：`annotate.dets=yolo.dets` 与
+  `=det_filter.dets` 实参确实不同）、`test_image_source` 59、`test_face_capture_pipeline` 63、
+  `test_plate_recog_pipeline` 28、`test_police_uav_pipeline`、其它模块自检全绿；CLI 非法 spec `exit=1`；
+- **本步未覆盖**（遗留，非阻塞）：真实 MySQL 往返、浏览器内设计器交互、`vlm`/`plate_recog`/`face_detect`
+  的 `inputs` 接线（依赖 crops 产物形态统一）、低清图。
 
 ## 5. 兼容与迁移
 

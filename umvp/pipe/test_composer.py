@@ -22,15 +22,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipe.composer import (
+    ARTIFACT_ANNOTATED,
+    ARTIFACT_CROPS,
+    ARTIFACT_DET_FILTER_DETS,
+    ARTIFACT_DETS,
+    ARTIFACT_FACES,
+    ARTIFACT_FRAME,
+    ARTIFACT_PLATES,
+    ARTIFACT_SEQ_FILTER_DETS,
+    ARTIFACT_TYPES,
     Detection,
     FrameManager,
     GRAN_CLASS,
     GRAN_SCENE,
     IntervalGate,
+    Pipeline,
+    PortResolutionError,
     SAMPLING_ANALYSIS,
     SAMPLING_FRAME_COUNT,
     SAMPLING_WALL_CLOCK,
-    Pipeline,
     YOLODetector,
     compose,
 )
@@ -234,5 +244,145 @@ pp = Pipeline(frame=FrameManager(frame_skip=1),
 evs = pp.publish([{"cls_id": 0, "content": {"r": 1}}, {"cls_id": 2, "content": {}}], ts=1.0)
 check("publish：外部记录经尾部出事件",
       len(evs) == 1 and evs[0]["name"] == "vlm" and evs[0]["detail"]["content"] == {"r": 1})
+
+# ============ 12. 产物表 artifacts（P5 第 2 步端口协议） ============
+print("== 12. 产物表 artifacts ==")
+def _mk_yolo() -> YOLODetector:
+    """带桩模型的 YOLODetector（复用 11 节的 _Model/_Res/_Boxes，纯逻辑不加载权重）。"""
+    y = YOLODetector(model_path="x.pt")
+    y._model = yd._model
+    return y
+
+class _Out:
+    """最小裁剪记录（非 dataclass → to_record 走 __dict__ + 补 image 别名）。"""
+    def __init__(self, img): self.img, self.bbox, self.track_id = img, (0, 0, 4, 4), 0
+
+class _CropStub:
+    INPUTS = {"frame": "Image", "dets": "Records"}
+    OUTPUTS = {"crops": "Records"}
+    def __init__(self): self.outs = []
+    def run(self, frame, dets, ts=0.0):
+        self.outs = [_Out("IMG%d" % d.track_id) for d in (dets or [])]
+        return self.outs
+
+class _AnnoStub:
+    INPUTS = {"image": "Image", "dets": "Records"}
+    OUTPUTS = {"annotated": "Image"}
+    def __init__(self): self.ret = object()
+    def run(self, image, dets, ts=0.0): return self.ret
+
+class _FaceStub:
+    INPUTS = {"frame": "Image", "crops": "Records"}
+    OUTPUTS = {"faces": "Records"}
+    def __init__(self): self.ret = [{"kind": "face"}]
+    def run(self, frame, crops, ts=0.0): return list(self.ret)
+
+class _PlateStub:
+    INPUTS = {"frame": "Image", "crops": "Records"}
+    OUTPUTS = {"plates": "Records"}
+    def __init__(self): self.ret = []
+    def run(self, frame, crops, ts=0.0): return list(self.ret)
+
+crop_st, anno_st, face_st, plate_st = _CropStub(), _AnnoStub(), _FaceStub(), _PlateStub()
+frame_obj = object()
+p3 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=crop_st, annotate=anno_st,
+              face=face_st, plate=plate_st,
+              det_filter=DetFilter(filter="score >= 0.5, long >= 50"),
+              seq_filter=SeqFilter(throttle={"key": "cls_id", "interval": 2.0}))
+p3.step(0, 0.0, frame=frame_obj, force=True)
+A = p3.artifacts
+check("frame_manager.frame 登记本帧原图", A.get(ARTIFACT_FRAME) is frame_obj)
+check("yolo.dets 登记纯推理原始检出（过滤前 3 框）",
+      [d.bbox for d in A.get(ARTIFACT_DETS, [])] == [(0, 0, 10, 10), (0, 0, 100, 60), (0, 0, 200, 80)])
+check("det_filter.dets 登记放行后的 dets（1 框）", len(A.get(ARTIFACT_DET_FILTER_DETS, [])) == 1)
+check("seq_filter.dets 登记门控后的 dets（1 框）", len(A.get(ARTIFACT_SEQ_FILTER_DETS, [])) == 1)
+check("target_crop.crops 登记裁剪记录列表", len(A.get(ARTIFACT_CROPS, [])) == 1)
+check("target_crop.crops 元素含 image 键（旁路图统一名；img 兼容别名保留）",
+      A[ARTIFACT_CROPS][0].get("image") == "IMG0" and A[ARTIFACT_CROPS][0].get("img") == "IMG0")
+check("annotate.annotated 登记带框图", A.get(ARTIFACT_ANNOTATED) is anno_st.ret)
+check("face_detect.faces 登记人脸记录", A.get(ARTIFACT_FACES) == [{"kind": "face"}])
+check("plate_recog.plates 登记车牌记录", A.get(ARTIFACT_PLATES) == [])
+check("零回归：last_crops 仍是对象列表（驱动层在用）",
+      p3.last_crops and p3.last_crops[0] is crop_st.outs[0])
+check("零回归：last_annotated 未变", p3.last_annotated is anno_st.ret)
+check("ARTIFACT_TYPES 覆盖全部登记产物",
+      set(A) <= set(ARTIFACT_TYPES) and ARTIFACT_TYPES[ARTIFACT_FRAME] == "Image"
+      and ARTIFACT_TYPES[ARTIFACT_CROPS] == "Records")
+# 阶段缺失 → 产物不登记；未取帧 → 产物表清空
+p_na = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo())
+p_na.step(0, 0.0, frame=object(), force=True)
+check("缺 annotate 阶段 → 无 annotate.annotated 产物", ARTIFACT_ANNOTATED not in p_na.artifacts)
+p_skip = Pipeline(frame=FrameManager(frame_skip=3), yolo=_mk_yolo())
+p_skip.step(1, 1.0, frame=object())   # 帧 1 非取帧点
+check("未取帧时产物表清空（每帧重建）", p_skip.artifacts == {})
+
+# ============ 13. inputs 连线解析 ============
+print("== 13. inputs 连线解析 ==")
+class _RecvCrop:
+    """桩目标裁剪：记录收到的实参，断言连线确实按产物名取上游值。"""
+    INPUTS = {"frame": "Image", "dets": "Records"}
+    OUTPUTS = {"crops": "Records"}
+    def __init__(self): self.got_frame = None; self.got_dets = None
+    def run(self, frame, dets, ts=0.0):
+        self.got_frame, self.got_dets = frame, dets
+        return []
+
+fdef = DetFilter(filter="score >= 0.5, long >= 50")
+# 默认（无 stage_inputs）→ 目标裁剪收到 det_filter 过滤后的 1 条
+recv_c = _RecvCrop()
+pc = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=recv_c, det_filter=fdef)
+pc.step(0, 0.0, frame=object(), force=True)
+check("默认（无 inputs）：目标裁剪收到过滤后 dets（1 条）", len(recv_c.got_dets) == 1)
+check("默认 stage_inputs 为空（零回归）", pc.stage_inputs == {})
+
+# 声明 inputs：target_crop.dets ← yolo.dets（过滤前原始 3 条）→ 模块收到指定产物
+recv_i = _RecvCrop()
+frame_i = object()
+pi = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=recv_i, det_filter=fdef,
+              stage_inputs={"target_crop": {"dets": ARTIFACT_DETS}})
+pi.step(0, 0.0, frame=frame_i, force=True)
+check("声明 inputs：目标裁剪收到 yolo.dets（原始 3 条，绕过过滤）", len(recv_i.got_dets) == 3)
+check("声明 inputs：frame 端口仍按现状默认（本帧原图）", recv_i.got_frame is frame_i)
+# 同一声明可同时指定多个端口
+recv_i2 = _RecvCrop()
+pi2 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=recv_i2, det_filter=fdef,
+               stage_inputs={"target_crop": {"frame": ARTIFACT_FRAME, "dets": ARTIFACT_DET_FILTER_DETS}})
+pi2.step(0, 0.0, frame=frame_i, force=True)
+check("声明 inputs：dets 端口指向 det_filter.dets（过滤后 1 条）", len(recv_i2.got_dets) == 1)
+
+# ============ 14. 非法连线 fail fast（可读异常） ============
+print("== 14. 非法连线 fail fast ==")
+def _run_err(pipe: Pipeline):
+    try:
+        pipe.step(0, 0.0, frame=object(), force=True)
+        return None
+    except PortResolutionError as e:
+        return str(e)
+
+# ① 未知产物名
+e1 = _run_err(Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_RecvCrop(),
+                       stage_inputs={"target_crop": {"dets": "nope.dets"}}))
+check("未知产物名 → 报错含阶段/端口/产物名/可用清单",
+      bool(e1) and "target_crop" in e1 and "'dets'" in e1 and "nope.dets" in e1
+      and ARTIFACT_FRAME in e1)
+# ② 类型不符：Image 端口喂 Records
+e2 = _run_err(Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), annotate=_AnnoStub(),
+                       det_filter=fdef, stage_inputs={"annotate": {"image": ARTIFACT_DET_FILTER_DETS}}))
+check("类型不符 → 报错含类型与产物名（Image 端口喂 Records）",
+      bool(e2) and "类型不符" in e2 and ARTIFACT_DET_FILTER_DETS in e2 and "Image" in e2)
+# ③ 产物本帧未登记：seq_filter.dets 存在类型（Records）但链路无 seq_filter 阶段
+e3 = _run_err(Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_RecvCrop(),
+                       stage_inputs={"target_crop": {"dets": ARTIFACT_SEQ_FILTER_DETS}}))
+check("产物本帧未登记 → 报错含产物名与可用清单",
+      bool(e3) and "不在本帧产物表" in e3 and ARTIFACT_SEQ_FILTER_DETS in e3)
+# ④ 端口未在模块 INPUTS 声明：crop 只声明 dets，却连 frame
+class _RecvDetsOnly:
+    INPUTS = {"dets": "Records"}
+    OUTPUTS = {}
+    def run(self, frame, dets, ts=0.0): return []
+e4 = _run_err(Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_RecvDetsOnly(),
+                       stage_inputs={"target_crop": {"frame": ARTIFACT_FRAME}}))
+check("端口未声明 → 报错含模块已声明端口", bool(e4) and "INPUTS" in e4 and "frame" in e4)
+# 零回归：非法声明只在被消费时触发；未声明 inputs 的旧链路完全不受影响（见 1-11 节全绿）
 
 print(f"\n全部通过: {PASS} 项断言")

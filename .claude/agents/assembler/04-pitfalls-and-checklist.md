@@ -17,7 +17,10 @@
 - 极端低阈值双阈值组合（conf 0.05 + 有效性下限）无实用价值：弱检测全被下限滤掉。
 - iou 0.9 弱 NMS 保留的是重复 / 噪点框，不等于多检目标；iou 维度只在重叠素材有区分度。
 - **旧概念禁用**：`alarm/OutputPolicy`、`on_vlm_result`、`filter_conf/min_short/min_long`、
-  `check_interval/track_change_only`、`compose` 四模式（见 `01-shell-standard.md §5`）。
+  `check_interval/track_change_only`、`compose` 四模式（见 `01-shell-standard.md §6`）。
+- **连线（`inputs`）别乱写**：不写=现状（零回归），非必要不连；本期仅 `yolo/det_filter/seq_filter/
+  target_crop/annotate` 的端口生效，`vlm/plate_recog/face_detect` 写了只**警告**、按默认取数
+  （见 `01-shell-standard.md §3`）。
 
 ## 已验证 / 未验证清单（持续维护）
 

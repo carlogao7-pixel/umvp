@@ -27,6 +27,7 @@ import base64
 import contextlib
 import datetime
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -1482,6 +1483,62 @@ CHAIN_ASSEMBLED_MODULES = {
 }
 
 
+# ---- 产物端口协议（P5 第 2 步，设计稿 doc/design/assembly_ports.md §3）----
+# 本期已在 Pipeline.step 纳入 inputs 解析的端口：设计器只对这些端口开放连线，
+# validate_chain 只对它们做 DAG 硬校验。其余端口（vlm / plate_recog / face_detect）
+# 本期不解析——写了 inputs 只给非致命警告（运行按默认取数）。与 composer.step 的
+# _port(...) 调用点一一对应，改核心时同步此处。
+CHAIN_RESOLVED_PORTS: dict = {
+    "yolo": ("image",),
+    "det_filter": ("dets",),
+    "seq_filter": ("dets",),
+    "target_crop": ("frame", "dets"),
+    "annotate": ("image", "dets"),
+}
+# 声明了 INPUTS 但本期未纳入解析的阶段（写了 inputs → 警告，不致命）。
+CHAIN_UNRESOLVED_INPUT_MODULES = ("vlm", "plate_recog", "face_detect", "extract_faces")
+
+# module_id → (模块路径, 类名)：读取自描述 INPUTS/OUTPUTS 声明（惰性导入，纯声明不加载模型）
+_PORT_DECL_SOURCES = {
+    "frame_manager": ("pipe.composer", "FrameManager"),
+    "yolo": ("pipe.composer", "YOLODetector"),
+    "vlm": ("pipe.composer", "VLMAnalyzer"),
+    "det_filter": ("pipe.det_filter", "DetFilter"),
+    "seq_filter": ("pipe.seq_filter", "SeqFilter"),
+    "target_crop": ("pipe.target_crop", "TargetCrop"),
+    "annotate": ("pipe.annotate", "Annotator"),
+    "face_detect": ("face_detect.face_pipeline", "FaceStage"),
+    "plate_recog": ("plate_recog.plate_pipeline", "PlateStage"),
+}
+_PORT_DECL_CACHE: dict = {}
+
+
+def module_port_decls() -> dict:
+    """{module_id: {"inputs": {端口: 类型}, "outputs": {产物: 类型}}}——模块自描述端口。
+
+    惰性导入各模块类读取类属性 INPUTS/OUTPUTS（纯声明，不加载模型），结果缓存。
+    供 /api/schema（设计器连线 UI）与 validate_chain（DAG 校验类型匹配）复用，单一来源。
+    """
+    if _PORT_DECL_CACHE:
+        return _PORT_DECL_CACHE
+    for mid, (modpath, clsname) in _PORT_DECL_SOURCES.items():
+        try:
+            cls = getattr(importlib.import_module(modpath), clsname)
+            _PORT_DECL_CACHE[mid] = {
+                "inputs": dict(getattr(cls, "INPUTS", {}) or {}),
+                "outputs": dict(getattr(cls, "OUTPUTS", {}) or {}),
+            }
+        except Exception:  # 导入失败不阻断 schema/校验
+            _PORT_DECL_CACHE[mid] = {"inputs": {}, "outputs": {}}
+    return _PORT_DECL_CACHE
+
+
+def artifact_types() -> dict:
+    """产物名 → 类型（唯一来源：pipe.composer.ARTIFACT_TYPES）。"""
+    from pipe.composer import ARTIFACT_TYPES
+    return dict(ARTIFACT_TYPES)
+
+
 def _chain_from_spec(spec: dict):
     """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。
 
@@ -1503,6 +1560,20 @@ def _chain_from_spec(spec: dict):
 
     def _one(mid: str) -> dict:
         return (by_mod.get(mid) or [{}])[0]
+
+    # 端口连线：解析各 stage 的可选字段 "inputs": {端口: 上游产物名} → Pipeline.stage_inputs。
+    # 缺失/空/非对象 → 不传（Pipeline 默认 {} = 现状规则，零回归）。值只收字符串
+    # （每端口单一上游；非字符串交给 validate_chain 报错，这里防御性跳过）。
+    stage_inputs: dict = {}
+    for s in stages:
+        mid = s.get("module_id")
+        ins = s.get("inputs")
+        if not mid or not isinstance(ins, dict) or not ins:
+            continue
+        clean = {str(port): art for port, art in ins.items()
+                 if isinstance(port, str) and isinstance(art, str) and art.strip()}
+        if clean:
+            stage_inputs[mid] = clean
 
     if "frame_manager" not in by_mod:
         raise ValueError("链路缺少必需阶段: frame_manager")
@@ -1623,7 +1694,8 @@ def _chain_from_spec(spec: dict):
         event_filter = _seq_filter_of(sp, what="rules")
     pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm,
                     crop=crop, annotate=annotate, plate=plate, face=face,
-                    det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter)
+                    det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter,
+                    stage_inputs=stage_inputs)
     # face_embed 身份去重所需（驱动层读 pipe.last_faces 后处理）：非 dataclass 字段，装配层附挂
     pipe.face_embedder = face_embedder
     pipe.face_dedup_thresh = face_dedup_thresh
@@ -2479,11 +2551,19 @@ def _module_estimate(mid: str) -> dict:
 
 
 def _schema() -> dict:
+    ports = module_port_decls()
     return {"modules": {mid: {"name": m["name"], "group": m["group"],
                               "desc": m["desc"], "params": m["params"],
                               "hidden": m.get("hidden", False),
+                              # 端口协议（P5 第 2 步）：自描述输入/输出 + 本期可连线端口，
+                              # 供设计器「输入连线」区渲染（只读附加字段，兼容旧前端）。
+                              "inputs": ports.get(mid, {}).get("inputs", {}),
+                              "outputs": ports.get(mid, {}).get("outputs", {}),
+                              "resolved_ports": list(CHAIN_RESOLVED_PORTS.get(mid, ())),
                               "estimate": _module_estimate(mid)}
                         for mid, m in MODULES.items()},
+            # 可用产物清单（产物名 → 类型）：连线下拉选项的唯一来源
+            "artifacts": artifact_types(),
             "files": _file_index(),
             "estimator": {"fingerprint_count": len(_get_estimator().fingerprints)}}
 

@@ -15,13 +15,17 @@
   5) 声明即执行：spec 声明的每个已注册阶段必须被装配器装配进执行路径
      （server.CHAIN_ASSEMBLED_MODULES）；声明了但装配器无处理（如 face_store）会报错。
      这条正是「人脸链声明 det_filter 却静默不执行」事故（WO-0001）的回归测试。
-  6) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
+  6) 端口连线（P5 第 2 步，设计稿 §3④）：各 stage 可选字段 inputs（{端口: 上游产物名}）
+     DAG 校验——产物名须在 ARTIFACT_TYPES、端口须在该模块 INPUTS 声明、引用须指向上游阶段、
+     端口类型匹配、每端口单一上游（值须字符串）。对本期未纳入解析的阶段（vlm/plate_recog/
+     face_detect…）写了 inputs 只给非致命警告。未声明 inputs 的旧 spec 不报错不警告。
+  7) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
      - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
        （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
      - target_crop/annotate 的 filter → pipe.conditions.parse_condition 干跑
      - yolo 的 model_path → models/ 权重池文件存在性
      - yolo 的 conf/iou ∈ (0,1]、frame_manager.frame_skip 为正整数
-  7) vlm.image_source 一致性（非致命警告，经 warnings 列表返回）：显式声明 annotated 但
+  8) vlm.image_source 一致性（非致命警告，经 warnings 列表返回）：显式声明 annotated 但
      上游无 annotate / 声明 crops 但上游无 target_crop → 运行时静默回退，提示但不算错。
   退出码：0=通过（含仅有警告）；1=有 error（逐条打印）。
 """
@@ -37,12 +41,16 @@ sys.path.insert(0, str(ROOT / "web_lab"))
 
 from server import (  # noqa: E402
     CHAIN_ASSEMBLED_MODULES,
+    CHAIN_RESOLVED_PORTS,
+    CHAIN_UNRESOLVED_INPUT_MODULES,
     MODULES,
     MODELS_DIR,
     _det_filter_of,
     _find_file,
     _seq_filter_of,
+    module_port_decls,
 )
+from pipe.composer import ARTIFACT_TYPES  # noqa: E402
 from pipe.conditions import parse_condition  # noqa: E402
 
 TERMINAL_OK = {"det_filter", "seq_filter", "plate_recog", "face_detect", "face_embed"}
@@ -101,6 +109,53 @@ def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
             errs.append(f"stages[{i}] {mid}.{k}={v} 越界（应在 [{lo}, {hi}]）")
         if mid == "frame_manager" and k == "frame_skip" and v != int(v):
             errs.append(f"stages[{i}] frame_manager.frame_skip 应为正整数")
+    return errs
+
+
+def _validate_stage_inputs(i: int, mid: str, st: dict, upstream: list,
+                           decl: dict, warns: list) -> list:
+    """校验阶段 inputs 连线（P5 第 2 步 DAG 规则）。返回 error 列表。
+
+    规则（设计稿 §3④，逐条可读报错）：
+      ① 每个端口只接一个上游 → 值须为字符串产物名（列表/多值 → 错）；
+      ② 产物名须在 ARTIFACT_TYPES 中（未知产物 → 错）；
+      ③ 端口须在该模块 INPUTS 声明中（非法端口 → 错）；
+      ④ 引用须指向上游阶段（同阶段/下游 → 错）；
+      ⑤ 类型匹配：ARTIFACT_TYPES[产物] vs 模块 INPUTS[端口]（不匹配 → 错）。
+    同一产物被多个下游引用**允许**（分支留路，不报警）。
+    对本期未纳入解析的阶段（vlm/plate_recog/face_detect…）：写了 inputs 只给非致命警告。
+    未声明 inputs（None/空）→ 不报错不警告（零回归）。
+    """
+    ins = st.get("inputs")
+    if not ins:
+        return []
+    if not isinstance(ins, dict):
+        return [f"stages[{i}] {mid}.inputs 应为对象（{{端口: 上游产物名}}）"]
+    errs: list = []
+    declared = (decl.get(mid) or {}).get("inputs") or {}
+    for port, art in ins.items():
+        if not isinstance(art, str):
+            errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 值须为字符串产物名"
+                        f"（每端口单一上游，不支持列表/多值）；得到 {type(art).__name__}")
+            continue
+        if art not in ARTIFACT_TYPES:
+            errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用未知产物 {art!r}"
+                        f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
+            continue
+        if port not in declared:
+            errs.append(f"stages[{i}] {mid}.inputs 端口 {port!r} 未在该模块 INPUTS 声明中"
+                        f"（已声明端口: {sorted(declared)}）")
+        want = declared.get(port)
+        if want and ARTIFACT_TYPES[art] != want:
+            errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 类型不符：产物 {art!r} 为 "
+                        f"{ARTIFACT_TYPES[art]}，端口声明为 {want}")
+        producer = art.split(".", 1)[0]
+        if producer not in upstream:
+            errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用 {art!r} 不是上游产物"
+                        f"（由阶段 {producer!r} 产生，须位于本阶段之前）")
+    if mid in CHAIN_UNRESOLVED_INPUT_MODULES:
+        warns.append(f"stages[{i}] {mid} 本期不解析 inputs 连线，将按默认取数"
+                     f"（可连线端口见设计器；已开放连线的模块: {sorted(CHAIN_RESOLVED_PORTS)}）")
     return errs
 
 
@@ -168,7 +223,16 @@ def validate(spec: dict, warnings: list | None = None) -> list[str]:
         if m not in CHAIN_ASSEMBLED_MODULES:
             errs.append(f"声明即执行: 阶段 {m!r} 未被 _chain_from_spec 装配进执行路径"
                         f"（可装配阶段: {sorted(CHAIN_ASSEMBLED_MODULES)}）")
-    # 6) vlm.image_source 与上游产物一致性（非致命警告）：
+    # 6) 端口连线 DAG 校验（P5 第 2 步）：inputs={端口: 上游产物名}。
+    #    未声明 inputs 的旧 spec 不报错不警告（零回归）；端口声明与类型取模块 INPUTS 声明。
+    #    仅对已注册产品模块校验（未知/隐藏模块已在第 4 步报错，避免重复噪声）。
+    decl = module_port_decls()
+    for i, st in enumerate(stages):
+        mid = st.get("module_id")
+        if not mid or mid not in MODULES or (MODULES.get(mid) or {}).get("hidden"):
+            continue
+        errs.extend(_validate_stage_inputs(i, mid, st, ids[:i], decl, warns))
+    # 7) vlm.image_source 与上游产物一致性（非致命警告）：
     #    显式声明 annotated 但链路上游无 annotate / 声明 crops 但上游无 target_crop 时，
     #    驱动层会静默回退到默认源（annotated→原帧），行为正确但非用户本意，故提示。
     #    未声明 image_source 的旧 spec 不提示（缺省=现状，零回归）。

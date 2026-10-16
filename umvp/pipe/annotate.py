@@ -72,6 +72,10 @@ def annotate_frame(
 class Annotator:
     """标注阶段：run(frame, dets, ts) -> 标注后的帧（鸭子类型对齐 Pipeline.annotate）。"""
 
+    # 产物端口声明：吃一张图 + 上游检测框，产带框图（Image）。
+    INPUTS = {"image": "Image", "dets": "Records"}
+    OUTPUTS = {"annotated": "Image"}
+
     def __init__(self, thickness: int = 2, show_label: bool = True,
                  classes: Optional[Sequence[int]] = None, filter: str = "") -> None:
         self.thickness = int(thickness)

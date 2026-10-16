@@ -35,6 +35,10 @@ class PlateStage:
         track_cooldown : 同一 track 重试间隔秒数；0=只识别一次（不再重试）
     """
 
+    # 产物端口声明：吃原帧（坐标基准/出图源）+ 上游目标裁剪记录，产车牌记录。
+    INPUTS = {"frame": "Image", "crops": "Records"}
+    OUTPUTS = {"plates": "Records"}
+
     def __init__(
         self,
         plate: PlateRecognizer,

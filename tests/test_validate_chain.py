@@ -220,6 +220,119 @@ def test_validate_legacy_signature_unchanged():
     assert validate(spec) == [], validate(spec)
 
 
+# ---------------- 端口连线 inputs（P5 第 2 步 DAG 校验） ----------------
+# 模块 INPUTS/OUTPUTS 声明 + 产物类型表见 pipe.composer.ARTIFACT_TYPES / web_lab.server。
+# 规则逐条：①未知产物 ②非法端口 ③非上游/自引用 ④类型不符 ⑤值非字符串（列表）
+# ⑥同一产物多下游→允许 ⑦vlm/plate_recog/face_detect 写 inputs→警告不致命
+# ⑧旧 spec（无 inputs）→ 无错无警告。
+
+_PORT_PARAMS = {
+    "frame_manager": {"sampling": "analysis", "frame_skip": 1},
+    "yolo": {"model_path": "models/yolov8n.pt", "classes": "0"},
+    "det_filter": {"filter": ""},
+    "target_crop": {"classes": "0"},
+    "annotate": {"thickness": 2},
+    "vlm": {"use_real_vlm": False},
+    "plate_recog": {"mode": "crop"},
+    "face_detect": {"det_thresh": 0.4},
+    "seq_filter": {"throttle": "", "change": "", "rules": ""},
+}
+
+
+def _port_chain(inputs_by_mid: dict, mods: list):
+    """按给定模块顺序构造链路；inputs_by_mid={module_id: {"端口": "上游产物"}} 注入 inputs。"""
+    stages = []
+    for m in mods:
+        st = {"module_id": m, "params": dict(_PORT_PARAMS.get(m, {}))}
+        if m in inputs_by_mid:
+            st["inputs"] = inputs_by_mid[m]
+        stages.append(st)
+    return {"name": "t", "stages": stages}
+
+
+_PLAIN_MODS = ["frame_manager", "yolo", "det_filter", "annotate", "seq_filter"]
+
+
+def test_inputs_valid_no_warn():
+    # 合法连线：annotate.dets ← yolo.dets（端口声明 Records、产物 Records、yolo 在上游）
+    errs, w = _warns(_port_chain({"annotate": {"dets": "yolo.dets"}}, _PLAIN_MODS))
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_inputs_unknown_artifact_rejected():
+    # ① 未知产物名 → error，文案含产物名与可用产物清单
+    errs, w = _warns(_port_chain({"annotate": {"dets": "nope.dets"}}, _PLAIN_MODS))
+    assert any("未知产物" in e and "nope.dets" in e for e in errs), errs
+    assert any("yolo.dets" in e for e in errs), errs  # 可用产物清单可读
+    assert w == [], w
+
+
+def test_inputs_unknown_port_rejected():
+    # ② 端口未在模块 INPUTS 声明 → error，文案含端口名与该模块已声明端口
+    errs, w = _warns(_port_chain({"annotate": {"foo": "yolo.dets"}}, _PLAIN_MODS))
+    assert any("端口 'foo'" in e and "INPUTS" in e for e in errs), errs
+    assert any("'dets'" in e and "'image'" in e for e in errs), errs  # 已声明端口清单
+    assert w == [], w
+
+
+def test_inputs_non_upstream_rejected():
+    # ③a 引用下游产物：det_filter 引用 seq_filter.dets（类型同名 Records，仅触发"非上游"）
+    errs, w = _warns(_port_chain({"det_filter": {"dets": "seq_filter.dets"}}, _PLAIN_MODS))
+    assert any("不是上游产物" in e and "seq_filter" in e for e in errs), errs
+    assert not any("类型不符" in e for e in errs), errs  # 不误报同类
+
+
+def test_inputs_self_reference_rejected():
+    # ③b 自引用：det_filter.dets ← det_filter.dets（producer 不在自身之前）
+    errs, w = _warns(_port_chain({"det_filter": {"dets": "det_filter.dets"}}, _PLAIN_MODS))
+    assert any("不是上游产物" in e for e in errs), errs
+
+
+def test_inputs_type_mismatch_rejected():
+    # ④ 类型不符：annotate.image（Image）喂 det_filter.dets（Records）
+    errs, w = _warns(_port_chain({"annotate": {"image": "det_filter.dets"}}, _PLAIN_MODS))
+    assert any("类型不符" in e and "Records" in e and "Image" in e for e in errs), errs
+
+
+def test_inputs_multivalue_rejected():
+    # ⑤ 值非字符串（列表）→ 每端口单一上游，报错并回显类型
+    errs, w = _warns(_port_chain({"annotate": {"dets": ["yolo.dets"]}}, _PLAIN_MODS))
+    assert any("值须为字符串" in e and "list" in e for e in errs), errs
+
+
+def test_inputs_same_artifact_multi_downstream_ok():
+    # ⑥ 同一产物被多个下游引用（分支留路）→ 允许，零 error 零 warning
+    mods = ["frame_manager", "yolo", "det_filter", "target_crop", "annotate", "seq_filter"]
+    errs, w = _warns(_port_chain(
+        {"target_crop": {"dets": "yolo.dets"}, "annotate": {"dets": "yolo.dets"}}, mods))
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_inputs_unresolved_modules_warn_not_fatal():
+    # ⑦ vlm/plate_recog/face_detect 本期不解析 inputs → 有警告无 error（按默认取数）
+    # vlm：fm→yolo→det_filter→vlm→seq_filter
+    mods_vlm = ["frame_manager", "yolo", "det_filter", "vlm", "seq_filter"]
+    errs, w = _warns(_port_chain({"vlm": {"image": "frame_manager.frame"}}, mods_vlm))
+    assert errs == [] and any("vlm" in x and "不解析" in x for x in w), (errs, w)
+    # plate_recog：fm→yolo→det_filter→target_crop→plate_recog
+    mods_plate = ["frame_manager", "yolo", "det_filter", "target_crop", "plate_recog"]
+    errs, w = _warns(_port_chain({"plate_recog": {"frame": "frame_manager.frame"}}, mods_plate))
+    assert errs == [] and any("plate_recog" in x and "不解析" in x for x in w), (errs, w)
+    # face_detect：fm→yolo→det_filter→target_crop→face_detect
+    mods_face = ["frame_manager", "yolo", "det_filter", "target_crop", "face_detect"]
+    errs, w = _warns(_port_chain({"face_detect": {"frame": "frame_manager.frame"}}, mods_face))
+    assert errs == [] and any("face_detect" in x and "不解析" in x for x in w), (errs, w)
+
+
+def test_inputs_old_spec_no_error_no_warn():
+    # ⑧ 旧 spec（未声明 inputs）→ 零 error 零 warning（缺省=现状，零回归）
+    for mods in (_PLAIN_MODS,
+                 ["frame_manager", "yolo", "det_filter", "target_crop", "plate_recog"],
+                 ["frame_manager", "yolo", "det_filter", "target_crop", "face_detect"]):
+        errs, w = _warns(_port_chain({}, mods))
+        assert errs == [] and w == [], (mods, errs, w)
+
+
 def _with(idx, mid, patch):
     stages = list(BASE_PLATE)
     params = dict(stages[idx][1])

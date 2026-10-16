@@ -7,7 +7,7 @@
   python3 .opencode/tool/ticket.py new "描述" --by orchestrator --to web \
       [--parent WO-0001] [--verify "命令"] [--note "..."] [--date YYYY-MM-DD]
   python3 .opencode/tool/ticket.py set WO-0001.2 [--status 待测试] \
-      [--note "..."] [--verify "..."] [--to "..."]
+      [--append-note "..."]/--note "..."（整字段覆盖） [--verify "..."] [--to "..."]
   python3 .opencode/tool/ticket.py list [--status 进行中] [--parent WO-0001]
   python3 .opencode/tool/ticket.py show WO-0001
   python3 .opencode/tool/ticket.py check
@@ -149,6 +149,8 @@ def cmd_set(a):
         v = getattr(a, f, None)
         if v is not None:
             t[f] = v
+    if getattr(a, "append_note", None):
+        t["note"] = f"{cur['note']}；{a.append_note}" if cur["note"] else a.append_note
     if "|" in t["note"] or "|" in t["verify"]:
         raise TicketError("字段内禁用竖线 |")
     # 主单收尾检查：仍有未关闭子单时警告（不阻断）
@@ -243,7 +245,8 @@ def main():
     p = sub.add_parser("set", help="更新工单（状态/备注/验证/承接）")
     p.add_argument("ticket", help="工单编号")
     p.add_argument("--status", help=f"{'/'.join(STATUSES)}")
-    p.add_argument("--note", help="备注（整字段覆盖）")
+    p.add_argument("--note", help="备注（整字段覆盖，慎用）")
+    p.add_argument("--append-note", dest="append_note", help="备注（追加到现有备注，推荐）")
     p.add_argument("--verify", help="验证（整字段覆盖）")
     p.add_argument("--to", help="承接（整字段覆盖）")
     p.set_defaults(func=cmd_set)

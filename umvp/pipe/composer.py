@@ -26,13 +26,44 @@ YOLO 输出粒度（2026-10 编排上移到 Pipeline）:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pipe.det_filter import DetFilter
-from pipe.records import collect_events
+from pipe.records import collect_events, to_record
 from pipe.seq_filter import SeqFilter
 
 _NEG_INF = -1e18  # 首见必送：模拟 spaz 以 unix 时间戳减 0 的语义
+
+
+# ---------------- 产物端口协议（P5 第 2 步，设计稿 doc/design/assembly_ports.md §3） ----------------
+# 产物命名 = {阶段标识}.{产物名}，逐帧登记在 Pipeline.artifacts；值类型三选一：
+#   Image（ndarray 原帧/带框图）/ Records（dict/对象记录列表）/ Vector（向量）。
+# 模块以类属性 INPUTS / OUTPUTS 自描述端口（类型字符串）；装配器按 stage_inputs 连线解析。
+# 这些常量对外导出，供 web 段（spec 解析/校验/设计器）引用，避免字符串散落。
+ARTIFACT_FRAME = "frame_manager.frame"            # 本帧原图（Image）
+ARTIFACT_DETS = "yolo.dets"                        # YOLO 检出记录列表（Records）
+ARTIFACT_DET_FILTER_DETS = "det_filter.dets"       # 检测筛选放行后的 dets（Records）
+ARTIFACT_SEQ_FILTER_DETS = "seq_filter.dets"       # 时序判定门控后的 dets（Records）
+ARTIFACT_CROPS = "target_crop.crops"               # 裁剪记录列表（元素含 image 键，Records）
+ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image）
+ARTIFACT_FACES = "face_detect.faces"               # 人脸检测结果（Records）
+ARTIFACT_PLATES = "plate_recog.plates"             # 车牌识别结果（Records）
+
+# 产物名 → 类型（校验连线类型匹配；也是"可用产物清单"的唯一来源）
+ARTIFACT_TYPES: Dict[str, str] = {
+    ARTIFACT_FRAME: "Image",
+    ARTIFACT_DETS: "Records",
+    ARTIFACT_DET_FILTER_DETS: "Records",
+    ARTIFACT_SEQ_FILTER_DETS: "Records",
+    ARTIFACT_CROPS: "Records",
+    ARTIFACT_ANNOTATED: "Image",
+    ARTIFACT_FACES: "Records",
+    ARTIFACT_PLATES: "Records",
+}
+
+
+class PortResolutionError(ValueError):
+    """端口连线解析失败（产物不存在 / 类型不符 / 端口未声明）——fail fast，含可读上下文。"""
 
 # ---------------- 通用数据 ----------------
 @dataclass
@@ -88,6 +119,11 @@ class FrameManager:
       wall_clock  —— 按墙钟秒：每隔 interval_sec 秒取一张
       frame_count —— 按帧数：每隔 interval_frames 帧取一张
     """
+
+    # 产物端口声明（自描述）：帧管理是链路源头，不消费上游产物，只产出本帧原图。
+    # 注：FrameManager 是 dataclass，端口声明用**无注解**类属性（不会成为 dataclass 字段）。
+    INPUTS = {}
+    OUTPUTS = {"frame": "Image"}
 
     sampling: str = SAMPLING_ANALYSIS
     frame_skip: int = 3  # analysis: 基础抽帧间隔（= extract_frame_rate）
@@ -255,6 +291,10 @@ class YOLODetector:
       仍可在 YOLO 参数面配置，由装配层译成 DetFilter/Pipeline 参数。
     """
 
+    # 产物端口声明：吃一张图（原帧），产检测记录列表。
+    INPUTS = {"image": "Image"}
+    OUTPUTS = {"dets": "Records"}
+
     def __init__(
         self,
         # ---- 推理参数 ----
@@ -312,6 +352,11 @@ class YOLODetector:
 # ---------------- 模块 3: VLM 研判 ----------------
 class VLMAnalyzer:
     """素材准备 + 推理。prepare 产出 payload；推理由外部回调注入（真实场景为 spaz consumer）。"""
+
+    # 产物端口声明：吃一张送审图（默认带框图）+ 检测记录；研判内容经 publish 走事件尾，
+    # 不在 Pipeline.step 内登记为产物（故 OUTPUTS 为空——见回报「本期未纳入」说明）。
+    INPUTS = {"image": "Image", "dets": "Records"}
+    OUTPUTS = {}
 
     def __init__(
         self,
@@ -371,6 +416,13 @@ class Pipeline:
     last_face_input: List = field(default_factory=list)  # 最近一帧传给人脸阶段的子图（门控后）
     last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
     last_events: List = field(default_factory=list)  # 最近一帧末段记录携带的事件（链路尾通用输出，见 records.events）
+    # ---- 产物端口协议（P5 第 2 步） ----
+    # artifacts: 逐帧产物表 {产物名: 值}，step() 每帧开始时重建、各阶段执行后登记；
+    #           命名 {阶段标识}.{产物名}，见模块级 ARTIFACT_* 常量。
+    # stage_inputs: 拼接层注入的连线映射 {module_id: {端口名: 上游产物名}}；
+    #           缺省空 = 完全按现状规则（零回归）；声明则按产物名解析该端口的值。
+    artifacts: Dict[str, Any] = field(default_factory=dict)
+    stage_inputs: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     def _submits(self, dets: List[Detection]) -> List[SubmitRequest]:
         """按识别类型（类别）构造报送请求（有效性/门控已由 det_filter/seq_filter 完成）。
@@ -396,40 +448,98 @@ class Pipeline:
             items = self.event_filter.run(items, ts=ts, frame_idx=frame_idx)
         return collect_events(items)
 
+    def _port(self, module_id: str, module, port: str, default):
+        """解析一个输入端口的值：stage_inputs 未声明该端口 → 返回 default（现状规则，零回归）。
+
+        声明了则取 artifacts[上游产物名]，并做三项 fail fast 校验（抛 PortResolutionError）：
+          ① 产物名不在 ARTIFACT_TYPES（未知产物）；② 端口不在模块 INPUTS 声明中（非法端口）；
+          ③ 产物类型与端口声明类型不符；④ 产物本帧未登记（不在 artifacts，如上游阶段缺失）。
+        端口单一上游（用户决策 2）；同一产物可被多个下游引用（分支留路）。
+        """
+        mapping = (self.stage_inputs or {}).get(module_id) or {}
+        if port not in mapping:
+            return default
+        art_name = mapping[port]
+        decl = getattr(module, "INPUTS", None) or {}
+        if art_name not in ARTIFACT_TYPES:
+            raise PortResolutionError(
+                f"阶段 {module_id!r} 端口 {port!r} 引用了未知产物 {art_name!r}"
+                f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
+        if decl and port not in decl:
+            raise PortResolutionError(
+                f"阶段 {module_id!r} 端口 {port!r} 未在其 INPUTS 声明中"
+                f"（该模块已声明端口: {sorted(decl)}）")
+        want = decl.get(port)
+        if want and ARTIFACT_TYPES[art_name] != want:
+            raise PortResolutionError(
+                f"阶段 {module_id!r} 端口 {port!r} 类型不符：上游产物 {art_name!r} 为 "
+                f"{ARTIFACT_TYPES[art_name]}，端口声明为 {want}")
+        if art_name not in self.artifacts:
+            raise PortResolutionError(
+                f"阶段 {module_id!r} 端口 {port!r} 请求的产物 {art_name!r} 不在本帧产物表中"
+                f"（可用产物: {sorted(self.artifacts)}）")
+        return self.artifacts[art_name]
+
     def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
              frame=None, force: bool = False):
         """处理一帧。返回 (submits, events)。
         dets 由拼接层在 wants_frame 为真时做 YOLO 推理提供（无 YOLO 的模式传 None）；
         不传 dets 但配置了 yolo 时，传 frame 由模块自推理（车牌按 track 去重时 track=True）。
-        force=True 时跳过帧决策检查——供调用方已先行 wants_frame() 门控避免重复采样。"""
+        force=True 时跳过帧决策检查——供调用方已先行 wants_frame() 门控避免重复采样。
+
+        每帧开头重建产物表 artifacts，各阶段执行后登记其产物；各阶段输入端口在
+        stage_inputs 有声明时按产物名解析（默认空 = 现状规则）。
+        """
         submits: List[SubmitRequest] = []
+        self.artifacts = {}
         if not force and not self.frame.wants_frame(frame_idx, ts):
             return submits, []
-        if dets is None and self.yolo is not None and frame is not None:
-            dets = self.yolo.infer(frame, track=self.track_needed())
+        if frame is not None:
+            self.artifacts[ARTIFACT_FRAME] = frame  # frame_manager.frame
+        if dets is None and self.yolo is not None:
+            yolo_img = self._port("yolo", self.yolo, "image", frame)
+            if yolo_img is not None:
+                dets = self.yolo.infer(yolo_img, track=self.track_needed())
+        if self.yolo is not None and dets is not None:
+            self.artifacts[ARTIFACT_DETS] = dets  # yolo.dets（纯推理原始检出，过滤前）
 
         # 检测筛选阶段：有效性判定（逐条条件 + 成组数量；原 YOLO 输出过滤链）——
         # 不达标的检测视为"未识别"，对**所有**下游（裁剪/标注/报送/事件）一致生效。
         self.last_filter = None
         if dets and self.det_filter is not None:
-            n_in = len(dets)
-            dets = self.det_filter.run(dets, ts=ts, frame_idx=frame_idx)
+            df_in = self._port("det_filter", self.det_filter, "dets", dets)
+            n_in = len(df_in)
+            dets = self.det_filter.run(df_in, ts=ts, frame_idx=frame_idx)
             self.last_filter = (n_in, len(dets))
+        if self.det_filter is not None:
+            self.artifacts[ARTIFACT_DET_FILTER_DETS] = dets if dets is not None else []
 
         # 时序判定阶段：节流/变化门控（原 Pipeline check_interval/track_change_only）——
         # 门控下游可见的检测集。
         if dets and self.seq_filter is not None:
-            dets = self.seq_filter.run(dets, ts=ts, frame_idx=frame_idx)
+            sf_in = self._port("seq_filter", self.seq_filter, "dets", dets)
+            dets = self.seq_filter.run(sf_in, ts=ts, frame_idx=frame_idx)
+        if self.seq_filter is not None:
+            self.artifacts[ARTIFACT_SEQ_FILTER_DETS] = dets if dets is not None else []
 
         # 目标裁剪阶段：按上游检测框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
         self.last_crops = []
         if self.crop is not None and frame is not None and dets is not None:
-            self.last_crops = list(self.crop.run(frame, dets, ts))
+            crop_frame = self._port("target_crop", self.crop, "frame", frame)
+            crop_dets = self._port("target_crop", self.crop, "dets", dets)
+            self.last_crops = list(self.crop.run(crop_frame, crop_dets, ts))
+        if self.crop is not None:
+            # 裁剪记录列表：转记录后元素含统一旁路键 image（旧名 img 保留为兼容别名）
+            self.artifacts[ARTIFACT_CROPS] = [to_record(c) for c in self.last_crops]
 
         # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）
         self.last_annotated = None
         if self.annotate is not None and frame is not None and dets is not None:
-            self.last_annotated = self.annotate.run(frame, dets, ts)
+            anno_img = self._port("annotate", self.annotate, "image", frame)
+            anno_dets = self._port("annotate", self.annotate, "dets", dets)
+            self.last_annotated = self.annotate.run(anno_img, anno_dets, ts)
+        if self.annotate is not None and self.last_annotated is not None:
+            self.artifacts[ARTIFACT_ANNOTATED] = self.last_annotated
 
         if self.yolo is not None:
             if dets is not None and self.vlm is not None:
@@ -456,12 +566,16 @@ class Pipeline:
                        "content": {"plate_no": p.plate_no, "type_name": p.type_name,
                                    "color": p.color, "bbox": list(p.bbox)}}
                 plate_events += self.publish([rec], ts, frame_idx)
+        if self.plate is not None and frame is not None:
+            self.artifacts[ARTIFACT_PLATES] = self.last_plates
         # 人脸识别阶段：检测 → 人脸产物（同源于 crop 产物）；落盘/计数/事件尾留驱动层。
         self.last_faces = []
         self.last_face_input = []
         if self.face is not None and frame is not None:
             self.last_face_input = list(self.last_crops)
             self.last_faces = list(self.face.run(frame, self.last_crops, ts))
+        if self.face is not None and frame is not None:
+            self.artifacts[ARTIFACT_FACES] = self.last_faces
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
         # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
         self.last_events = (collect_events(dets) if dets else []) + plate_events

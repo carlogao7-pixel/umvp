@@ -103,6 +103,10 @@ class SeqFilter:
     执行顺序 throttle → change → rules；无规则时门控存活者全部放行。
     """
 
+    # 产物端口声明：吃检测记录，放行子集仍是检测记录（门控/确认不改内容）。
+    INPUTS = {"dets": "Records"}
+    OUTPUTS = {"dets": "Records"}
+
     def __init__(self, rules: Optional[List[SeqRule]] = None,
                  throttle: Optional[dict] = None, change: Optional[dict] = None) -> None:
         self.rules = list(rules or [])

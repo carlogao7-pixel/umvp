@@ -46,6 +46,12 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 5. **逐帧分析阶段一律经 `Pipeline.step` 插槽执行**——禁止在驱动层（`web_lab/server.py` 等）为某类
    链路新增专用单帧路径；spec 声明的每个阶段都必须被装配执行（`validate_chain`「声明即执行」断言）。
 
+**阶段可选连线（`inputs`）**：阶段可加 `"inputs": {端口: 上游产物名}` 指定"从上游取哪一部分"
+（如 `"inputs": {"dets": "det_filter.dets"}`）；**不写 = 现状固定流水（零回归）**，非必要不连，
+每端口只接一个上游产物。本期仅 `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效；
+其余模块（`vlm` / `plate_recog` / `face_detect`）写 `inputs` 只给**警告**（按默认取数）。语法与校验见
+`01-shell-standard.md §3`。
+
 **三类固定数据流**（**运行顺序由壳固定**，不由 stages 数组顺序驱动）：
 
 ```
@@ -99,14 +105,14 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
   未验证只能写"未验证"。
 - **禁用旧概念**：`alarm`/`OutputPolicy`、`on_vlm_result`、yolo 的
   `filter_conf/min_short/min_long/class_limits`、`check_interval/track_change_only`、`compose` 四模式
-  （见 `01-shell-standard.md §5`）。
+  （见 `01-shell-standard.md §6`）。
 
 ## 7. 技术文档索引
 
 | 文件 | 内容 |
 |---|---|
 | `.claude/agents/assembler/README.md` | 文档总览 + **维护规则**（新模块 / 新编排时更新哪篇）+ 动态事实来源 |
-| `.claude/agents/assembler/01-shell-standard.md` | **链路壳标准（唯一权威）**：spec schema + 硬规则 + 参数/DSL/事件 + 标准壳 + 自检清单 + 红线 |
+| `.claude/agents/assembler/01-shell-standard.md` | **链路壳标准（唯一权威）**：spec schema + 硬规则 + 参数/DSL/事件 + **产物端口协议（`inputs` 连线）** + 标准壳 + 自检清单 + 红线 |
 | `.claude/agents/assembler/02-assembly-workflow.md` | 工作流 + 交付包契约 + 汇报模板 |
 | `.claude/agents/assembler/03-patterns-and-extension.md` | 拼装套路 / 胶水 / 槽位判定 + **新模块接入 / 新编排逻辑演进** |
 | `.claude/agents/assembler/04-pitfalls-and-checklist.md` | 常见坑 + 已验证 / 未验证清单 |
@@ -121,7 +127,7 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 | 工具 | 用途 |
 |---|---|
 | `list_modules()` | 列出平台当前注册的**全部模块**及参数（键 / 类型 / 默认 / 取值）——**写 spec 的唯一参数白名单来源**（新模块自动纳入） |
-| `validate_spec(spec)` | 校验 spec 是否满足硬性规则与参数白名单；返回 `{ok, errors}`——**写 / 改 spec 后自检** |
+| `validate_spec(spec)` | 校验 spec 是否满足硬性规则与参数白名单，并校验阶段 `inputs` 连线（未知产物 / 非法端口 / 类型不符 / 非上游引用 → 报错；未纳入端口 → 警告）；返回 `{ok, errors}`——**写 / 改 spec 后自检** |
 | `estimate(spec, streams, vram_budget_mb)` | 资源估算（单链路 + 多路 + 预算反推） |
 | `read_doc(path)` | 读本文档（`.claude/agents/assembler/…`）与项目文档（`doc/…`） |
 | `list_pipelines()` / `get_pipeline(pipeline_id)` | 读已存链路现状（调参 / 参考时用） |

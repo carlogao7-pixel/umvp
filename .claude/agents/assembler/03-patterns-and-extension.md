@@ -37,14 +37,25 @@
 **判据**：驱动层能私下解决就②；需要成为链路结构的一部分才③。既有槽位先查重：
 `last_annotated`（画框图→VLM）/ `last_crops`（子图→车牌 / 人脸，或 VLM `image_source=crops`）/ frame（原帧→裁剪 / 标注）。
 
-**真到③，新增槽位四件套**（参照 annotate 的接法）：
+**真到③，新模块接入清单（端口协议版）**——按此四步接入；**②③完成（"登记声明"）后，装配器 /
+设计器即可用**，不必再改 `Pipeline` 核心：
 
-1. `Pipeline` 加字段：槽位 `xxx: Optional[object] = None` + 产物 `last_xxx`；
-2. `step()` 固定位置调 `run(...)`（顺序参照既有流水）；
-3. 驱动层取图分支（如 `base = pipe.last_xxx or ...`）；
-4. 外围注册：装配器接线（`web_lab/server.py:_chain_from_spec`）+ 登记 `CHAIN_ASSEMBLED_MODULES`
-   （`server.py`，`validate_chain`「声明即执行」断言的唯一依据）+
-   模块参数表（`MODULES`/`PARAMS`）+ 项目文档 `doc/modules/` 分册。
+1. **`Pipeline` 插槽（逐帧阶段）**：核心加字段 `xxx: Optional[object] = None` + 产物 `last_xxx`，
+   并在 `step()` 固定位置调 `run(...)`（顺序参照既有流水）；
+2. **模块声明 `INPUTS` / `OUTPUTS`**：类属性写清消费 / 产出的**端口名 → 类型**
+   （`Image` / `Records` / `Vector`），如
+   `INPUTS = {"image": "Image", "dets": "Records"}`、`OUTPUTS = {"annotated": "Image"}`
+   （端口协议见 `01-shell-standard.md §3`）；
+3. **`CHAIN_ASSEMBLED_MODULES` 登记**（`web_lab/server.py`）：登记 `module_id`，装配器
+   `_chain_from_spec` 才会把它装进执行路径——这也是 `validate_chain`「声明即执行」断言的唯一依据；
+4. **（可选）把端口纳入 `inputs` 解析**：让该端口的 `spec.inputs` 连线真正生效
+   （核心 `_port(...)` 调用点 + `CHAIN_RESOLVED_PORTS` 登记）。**不纳入**则阶段仍可声明、仍参与
+   其余校验，但 spec 写它的 `inputs` 只给**警告**、运行时按默认取数。
+
+> **"登记声明后装配器 / 设计器即可用"**：完成 **②③**，新模块即自动出现在 `list_modules` 与设计器
+> 模块列表（端口 schema 现取模块 `INPUTS/OUTPUTS`）；**④** 决定它的端口能否被 spec **显式连线**
+> （未纳入的端口设计器不开放连线）。另有配套：模块参数表（`MODULES/PARAMS`）+ `doc/modules/` 分册；
+> **产出要给驱动层落盘 / 展示**时，才需加驱动层取图分支（如 `base = pipe.last_xxx or ...`）。
 
 > 组装工**不做**上述 1–4 的代码改动（那是升级通道）——但要知道它们的存在，才能判断"现有模块
 > 拼不出来"并向总装 / 用户如实上报，而不是硬拼。
@@ -54,7 +65,8 @@
 - **无需改本文档**：`list_modules` 会自动包含新注册模块；`validate_spec` 会按新模块参数表校验。
 - 若新模块是一个**新阶段**（spec 可见）：照 `01-shell-standard.md §2` 用它的 `module_id` 与参数；
   终段白名单若有变化，以 `validate_spec` 的实际报错为准（规则由代码持有）。
-- 若新模块引入**新旁路槽位**：参照 §3 四件套理解数据流变化。
+- 若新模块引入**新旁路槽位**：参照 §3 的「新模块接入清单（端口协议版）」理解数据流变化；
+  它声明 `INPUTS/OUTPUTS` 并被登记后，装配器 / 设计器即自动可用。
 
 ## 5. 资源估算速用
 

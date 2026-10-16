@@ -1,7 +1,7 @@
 # 链路壳标准（唯一权威）
 
 > 读者：组装工 ｜ **本文件是链路构建的唯一权威规范**。组装工的产出 = 符合本规范的 `stages spec`；
-> 装配与运行由平台完成，**不手写"拼接代码"**。照抄 §3 模板、过 §4 清单即算合格。
+> 装配与运行由平台完成，**不手写"拼接代码"**。照抄 §4 模板、过 §5 清单即算合格。
 
 ## 0. 一条链路长什么样（唯一真相）
 
@@ -59,12 +59,15 @@
 >
 > **反例警示（本条规矩的由来）**：人脸链（PIPE0003）历史上曾走驱动层**专用单帧路径**，导致 spec 声明的
 > `det_filter` **声明了却不执行**（静默失效，WO-0001）；现已并入 `Pipeline.step` 插槽修复。
+>
+> **产物端口（阶段间连线）**：模块以 `INPUTS` / `OUTPUTS` 自描述端口，spec 阶段可选 `inputs` 显式连线；
+> **不写 = 现状固定流水**。详见 §3（完整接入清单见 `03-patterns-and-extension.md`）。
 
 ## 1. 标准产物
 
 - **必产**：`stages spec`（§0 的结构）。
 - **可选**（仅独立脚本 / 离线验证时）：驱动壳、断言式测试壳。
-- **禁止**：新建"拼接 / 胶水模块"、改核心模块（走升级通道）；用已删除 / 改名前的旧概念（见 §5）。
+- **禁止**：新建"拼接 / 胶水模块"、改核心模块（走升级通道）；用已删除 / 改名前的旧概念（见 §6）。
 
 ## 2. 模块与参数（来源：`list_modules`）
 
@@ -105,7 +108,59 @@
 - `seq_filter.rules` = `[{"match": 条件DSL, "event": 事件名(支持 `{字段}` 动态), "key": 分组键,
   "span"/"window_n"/"min_n"/"hit_ratio"/"cooldown"}]`；`cooldown<0` = 同对象一次。
 
-## 3. 标准壳（照抄填充）
+## 3. 产物端口协议（inputs 连线）
+
+> 目的：让阶段可声明「从上游取哪一部分」——模块自描述端口，壳（spec）按需连线；**缺省 = 现状固定流水**，
+> 零回归。连线是**增量**，不改 §0 的固定运行顺序。
+
+**产物与命名（`{阶段标识}.{产物名}`）**：每帧登记在 `Pipeline.artifacts`，值分三类——类型三选一，
+连线前先认类型：
+
+| 类型 | 含义 | 本期已登记产物 |
+|---|---|---|
+| `Image` | 图像（ndarray，旁路，不进 JSON） | `frame_manager.frame`、`annotate.annotated` |
+| `Records` | 记录列表（dict / 对象，JSON 主干） | `yolo.dets`、`det_filter.dets`、`seq_filter.dets`、`target_crop.crops`、`face_detect.faces`、`plate_recog.plates` |
+| `Vector` | 向量（ndarray，旁路） | （本期无生产者登记，类型保留） |
+
+> 可用产物清单与类型以 `ARTIFACT_TYPES`（`pipe.composer`）为**唯一来源**，`validate_spec` / 设计器现取。
+
+**模块自描述（`INPUTS` / `OUTPUTS`）**：每个模块用类属性声明自己消费 / 产出的端口及类型
+（端口名 → 类型），供装配器、校验器、设计器读取：
+
+```python
+class Annotator:
+    INPUTS  = {"image": "Image", "dets": "Records"}   # 消费：一张图 + 一批记录
+    OUTPUTS = {"annotated": "Image"}                  # 产出一张带框图
+```
+
+**spec 声明连线（阶段可选字段 `inputs`）**：`{"端口名": "上游产物名"}`，**每个端口只接一个**上游产物：
+
+```json
+{"module_id": "annotate", "params": {...}, "inputs": {"dets": "det_filter.dets"}}
+```
+
+- **不写 `inputs` = 现状**（按壳固定流水取数），**零回归**；只在"取上游另一部分 / 绕过固定流水的一环"时才写。
+- 同一产物**可被多个下游引用**（为分支留路）；但**一个端口不接多源**（`inputs` 不做列表 / 多值）。
+
+**校验（`validate_spec`，非法连线 fail fast 报错）**：
+
+- 引用的产物名必须存在（在 `ARTIFACT_TYPES`）→ 否则**报错**；
+- 端口必须在该模块 `INPUTS` 声明中 → 非法端口**报错**；
+- 端口类型须匹配（`Image` 端口不得喂 `Records`）→ 不符**报错**；
+- 引用必须是**上游**阶段产物（不能引用下游 / 自身）；值须为字符串（每端口单一上游）→ 违反**报错**。
+
+**本期未纳入 `inputs` 解析的端口**（写了 `inputs` 只会**警告**，运行时按**默认取数**，连线不生效）：
+
+- `vlm`——送审素材在**驱动层**消费，不在 `Pipeline.step` 内解析；
+- `plate_recog` / `face_detect` 等——消费上游裁剪**对象**，其形态本期待定。
+
+> 这些阶段仍可声明 `INPUTS/OUTPUTS`、仍参与其余断言，只是暂不响应 `inputs`（设计器仅对**已纳入解析**的
+> 端口开放连线）。后续纳入时再放开。
+
+> **与参数的关系**：连线只决定"从上游取哪部分"，**不改变模块自身参数**；参数大全以 `list_modules` 现取为准，
+> 模块 I/O 字段级细节见 `doc/modules/INDEX.md`。新增模块如何被纳入见 `03-patterns-and-extension.md`。
+
+## 4. 标准壳（照抄填充）
 
 以「警用无人机」等价形态为例（片段）：
 
@@ -128,7 +183,7 @@
 }
 ```
 
-## 4. 装配核对清单（逐条自检，全 ✔ 才算完成）
+## 5. 装配核对清单（逐条自检，全 ✔ 才算完成）
 
 - [ ] `stages` 非空，`frame_manager` 在首位且仅一段。
 - [ ] 无重复 `module_id`（一条链路每模块最多一次）。
@@ -146,9 +201,12 @@
 - [ ] 车牌链：`yolo.classes="2"` → `det_filter` → `target_crop(classes="2")` → `plate_recog`
       → 终段 `seq_filter(rules: kind==plate, cooldown<0)`。
 - [ ] 人脸链：`yolo.classes="0"` → `det_filter` → `target_crop(classes="0")` → `face_detect`（终段）。
+- [ ] 写了 `inputs` 连线时（§3）：产物在上游、类型匹配、端口已在模块 `INPUTS` 声明；**不写=现状**，
+      非必要不连；本期仅 `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效，
+      `vlm/plate_recog/face_detect` 写了只警告（按默认取数）。
 - [ ] 用 `validate_spec` 工具自检，`0 error` 才算过。
 
-## 5. 红线（旧概念，出现即错）
+## 6. 红线（旧概念，出现即错）
 
 | 旧概念（禁用） | 现状 |
 |---|---|

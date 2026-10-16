@@ -162,7 +162,7 @@ agent 用自包含提示词（`.claude/agents/*.md`）+ 项目内文档（`doc/`
 | P2 链路定制 | pipeline spec 校验 + estimate/run 接口 + 前端链路设计器 + chain 运行器 | 网页拼出链路 → 估算 → 生成/运行可跑通 | ✅ 已落地 |
 | P3 文档完善 | 组装 agent 技术文档（`.claude/agents/`） | agent 读后能独立规划 | ✅ 已落地 |
 | P4 agent | `.claude/agents/pipeline-architect.md` + `pipeline-assembler.md` | 自然语言需求 → 方案（含资源估算）→ 自动生成测试跑通 → 回归集全绿 | ✅ 已落地 |
-| P5 拼接层端口协议 | 模块端口声明 + 壳内连线 + 校验器断言（分三步） | 声明的阶段必被装配执行；图像源（原帧/带框图/裁剪图…）可在壳内选择 | 📐 设计稿（[`../design/assembly_ports.md`](../design/assembly_ports.md)，WO-0002） |
+| P5 拼接层端口协议 | 产物表 + 模块 INPUTS/OUTPUTS 声明 + 壳内 inputs 连线 + DAG 校验 + 设计器连线 UI（分三步实施） | 声明的阶段必被装配执行；图像源与模块间产物连线均可在壳内声明 | ✅ 已落地（[`../design/assembly_ports.md`](../design/assembly_ports.md)，WO-0002） |
 
 ## 八、验证与回归策略
 
@@ -196,7 +196,7 @@ agent 用自包含提示词（`.claude/agents/*.md`）+ 项目内文档（`doc/`
 
 ## 十一、下一阶段需求：拼接层端口协议（P5）
 
-> 状态：📐 需求已确认（2026-10-16），分步实施；详细设计见
+> 状态：✅ 已落地（2026-10-16，三步全部实施完成）；详细设计见
 > [`../design/assembly_ports.md`](../design/assembly_ports.md)，实施工单 **WO-0002**。
 
 **背景（触发问题）**：PIPE0003 在测试台走专用单帧路径（`_face_step`）绕开通用 `Pipeline.step`，

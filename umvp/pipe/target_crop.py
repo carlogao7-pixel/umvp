@@ -212,6 +212,10 @@ class TargetCrop:
     鸭子类型对齐 pipe.composer.Pipeline.crop：实现 run(frame, dets, ts) -> list[CropResult]。
     """
 
+    # 产物端口声明：吃原帧 + 上游检测记录，产裁剪记录列表（元素含旁路图键 image）。
+    INPUTS = {"frame": "Image", "dets": "Records"}
+    OUTPUTS = {"crops": "Records"}
+
     def __init__(self, scale: float = 1.0, margin: float = 0.0,
                  classes: Optional[Sequence[int]] = None, filter: str = "",
                  out_size=None) -> None:
