@@ -4,7 +4,7 @@
 >
 > ⚠️ **本文件由脚本自动生成，勿手改**；更新请重跑：`conda run -n ai python web_lab/dump_prompts.py`。
 >
-> - 生成方式：`conda run -n ai python web_lab/dump_prompts.py`（可重跑）｜生成时间：2026-10-16 09:56
+> - 生成方式：`conda run -n ai python web_lab/dump_prompts.py`（可重跑）｜生成时间：2026-10-16 14:33
 > - **动态部分**（工具返回的模块实参等）在运行时经 function calling 获得，不在本文。
 > - 口径以 `.claude/agents/` 与 `web_lab/agent.py` 为准；本文是静态快照。
 
@@ -350,6 +350,8 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 2. **每个 `module_id` 最多出现一次**（重复即拒绝）。
 3. **终段** ∈ {`det_filter`, `seq_filter`, `plate_recog`, `face_detect`, `face_embed`}。
 4. `params` 只用**该模块参数白名单**内的精确键名——白名单以 `list_modules` 现取为准。
+5. **逐帧分析阶段一律经 `Pipeline.step` 插槽执行**——禁止在驱动层（`web_lab/server.py` 等）为某类
+   链路新增专用单帧路径；spec 声明的每个阶段都必须被装配执行（`validate_chain`「声明即执行」断言）。
 
 **三类固定数据流**（**运行顺序由壳固定**，不由 stages 数组顺序驱动）：
 

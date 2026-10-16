@@ -29,9 +29,10 @@ model: deepseek/deepseek-flash
   | `tests/test_annotate.py` | 16 |
   | `tests/test_det_filter.py` | 66 |
   | `tests/test_seq_filter.py` | 43 |
-  | `tests/test_agent_runtime.py` | 33 |
+  | `tests/test_agent_runtime.py` | 39 |
   | `tests/test_face_extract_pipeline.py` | 28 |
-  | `tests/test_face_capture_pipeline.py` | 39 |
+  | `tests/test_face_capture_pipeline.py` | 63 |
+  | `tests/test_validate_chain.py` | 13 |
   | `tests/test_plate_recog_pipeline.py` | 28 |
 
 - **环境注意**：`onnxruntime` 会打印 `VerifyOutputSizes`/`Expected shape`/

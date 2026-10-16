@@ -11,7 +11,10 @@
   2) 无重复 module_id
   3) 终段 ∈ {det_filter, seq_filter, plate_recog, face_detect, face_embed}
   4) 每个 module_id 是已注册产品模块；params 键在其参数白名单内；select 取值合法
-  5) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
+  5) 声明即执行：spec 声明的每个已注册阶段必须被装配器装配进执行路径
+     （server.CHAIN_ASSEMBLED_MODULES）；声明了但装配器无处理（如 face_store）会报错。
+     这条正是「人脸链声明 det_filter 却静默不执行」事故（WO-0001）的回归测试。
+  6) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
      - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
        （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
      - target_crop/annotate 的 filter → pipe.conditions.parse_condition 干跑
@@ -29,7 +32,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "umvp"))
 sys.path.insert(0, str(ROOT / "web_lab"))
 
-from server import MODULES, MODELS_DIR, _det_filter_of, _find_file, _seq_filter_of  # noqa: E402
+from server import (  # noqa: E402
+    CHAIN_ASSEMBLED_MODULES,
+    MODULES,
+    MODELS_DIR,
+    _det_filter_of,
+    _find_file,
+    _seq_filter_of,
+)
 from pipe.conditions import parse_condition  # noqa: E402
 
 TERMINAL_OK = {"det_filter", "seq_filter", "plate_recog", "face_detect", "face_embed"}
@@ -139,6 +149,14 @@ def validate(spec: dict) -> list[str]:
             if opts and str(v) not in [str(o) for o in opts]:
                 errs.append(f"stages[{i}] {mid}.{k}={v!r} 不在允许值 {opts}")
         errs.extend(_semantic_dry_run(i, mid, params))
+    # 5) 声明即执行：已注册产品模块若未被装配器装配，声明了也不会执行（静默失效）。
+    # 未知/隐藏模块已在上一步报错，这里只查能通过注册检查的阶段。
+    for m in ids:
+        if not m or m not in MODULES or (MODULES.get(m) or {}).get("hidden"):
+            continue
+        if m not in CHAIN_ASSEMBLED_MODULES:
+            errs.append(f"声明即执行: 阶段 {m!r} 未被 _chain_from_spec 装配进执行路径"
+                        f"（可装配阶段: {sorted(CHAIN_ASSEMBLED_MODULES)}）")
     return errs
 
 

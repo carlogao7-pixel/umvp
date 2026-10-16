@@ -59,6 +59,35 @@ def test_seed_forms_ok():
     assert validate(face) == [], f"人脸截取形态应通过: {validate(face)}"
 
 
+def test_seed_face_forms_assembled_ok():
+    # 人脸链新形态（face_detect）/ 嵌入形态（face_embed）均在可装配集合 → 不触发「声明即执行」
+    face = _stages(
+        ("frame_manager", {"frame_skip": 5}),
+        ("yolo", {"model_path": "models/yolov8n.pt", "classes": "0"}),
+        ("det_filter", {"filter": "long >= 30"}),
+        ("target_crop", {"classes": "0"}),
+        ("face_detect", {"det_thresh": 0.4, "det_size": "640,640"}))
+    assert validate(face) == [], f"face_detect 形态应通过: {validate(face)}"
+    embed = _stages(
+        ("frame_manager", {"frame_skip": 5}),
+        ("yolo", {"model_path": "models/yolov8n.pt", "classes": "0"}),
+        ("det_filter", {"filter": ""}),
+        ("target_crop", {"classes": "0"}),
+        ("face_detect", {"det_thresh": 0.4}),
+        ("face_embed", {}))
+    assert validate(embed) == [], f"face_embed 形态应通过: {validate(embed)}"
+
+
+def test_declared_but_not_assembled_rejected():
+    # WO-0001 事故回归：face_store 已注册产品模块，但 _chain_from_spec 无对应装配——
+    # 「声明了也静默不执行」，校验器必须拦（旧版曾放过，正是人脸链 det_filter 失效同类）。
+    stages = list(BASE_PLATE[:-1]) + [("face_store", {})] + [BASE_PLATE[-1]]
+    errs = validate(_stages(*stages))
+    assert any("声明即执行" in e and "face_store" in e for e in errs), errs
+    # 未装配阶段被拦后，其余内容合法（其它校验项不误报同类错）
+    assert not any("未知/非产品模块" in e for e in errs), errs
+
+
 def test_experiment_round3_bad_dsl():
     # 实验③同型：det_filter.filter 硬语法错（缺值）必须被拦
     errs = validate(_stages(*_with(2, "det_filter", {"filter": "long >="})))

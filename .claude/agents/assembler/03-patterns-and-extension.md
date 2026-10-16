@@ -32,7 +32,7 @@
 |---|---|---|
 | ① 参数级差异 | 需求 = 既有产物的不同加工，加工点已存在 | VLM `max_resolution` |
 | ② 驱动层胶水 | 只有**一个**消费者，驱动层拿得到原料 | `_vlm_material`（取图 / 缩放 / 编码在运行器） |
-| ③ 新增槽位 | 产出要给**多个 / 未知**下游，或它须成为链路**阶段**（spec 可见 / 可参数化 / 被校验） | `crop` / `annotate` / `plate` 三槽位 |
+| ③ 新增槽位 | 产出要给**多个 / 未知**下游，或它须成为链路**阶段**（spec 可见 / 可参数化 / 被校验） | `crop` / `annotate` / `plate` / `face` 四槽位 |
 
 **判据**：驱动层能私下解决就②；需要成为链路结构的一部分才③。既有槽位先查重：
 `last_annotated`（画框图→VLM）/ `last_crops`（子图→车牌 / 人脸）/ frame（原帧→裁剪 / 标注）。
@@ -42,7 +42,8 @@
 1. `Pipeline` 加字段：槽位 `xxx: Optional[object] = None` + 产物 `last_xxx`；
 2. `step()` 固定位置调 `run(...)`（顺序参照既有流水）；
 3. 驱动层取图分支（如 `base = pipe.last_xxx or ...`）；
-4. 外围注册：装配器接线（`web_lab/server.py:_chain_from_spec`）+ `validate_chain.py` 白名单 +
+4. 外围注册：装配器接线（`web_lab/server.py:_chain_from_spec`）+ 登记 `CHAIN_ASSEMBLED_MODULES`
+   （`server.py`，`validate_chain`「声明即执行」断言的唯一依据）+
    模块参数表（`MODULES`/`PARAMS`）+ 项目文档 `doc/modules/` 分册。
 
 > 组装工**不做**上述 1–4 的代码改动（那是升级通道）——但要知道它们的存在，才能判断"现有模块

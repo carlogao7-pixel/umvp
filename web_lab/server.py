@@ -1049,111 +1049,21 @@ def h_pipeline_run(p: dict) -> dict:
             log.append(f"{prefix}{tag}帧#{frame_no} {text}")
         return item
 
-    # ---- 人脸链检测（两种形态，共用 _face_step）----
+    # ---- 人脸链（装配层已注入 Pipeline.face；落盘/计数/身份去留在驱动层）----
     # ① 含 face_embed 阶段 → 视频人脸去重提取模式（嵌入 + 身份去重）；
     # ② 仅 face_detect 阶段（无嵌入/检索）→ 人脸截取模式：逐帧提取原分辨率人脸并落盘。
-    # 链路段：帧管理 → YOLO识人 → 目标裁剪（裁人）→ 人脸检测（检脸 + 原图出脸）。
-    stage_params = {s.get("module_id"): (s.get("params") or {}) for s in spec.get("stages") or []}
-    is_face_chain = any(k in stage_params for k in ("face_embed", "face_detect", "extract_faces"))
-    fdet = femb = ftool = None
-    f_crop = fstage = None
+    # 链路段：帧管理 → YOLO识人 → 目标裁剪（裁人）→ 人脸检测（检脸 + 原图出脸），
+    # 逐帧与普通链一致走 pipe.step（_step_out 从 pipe.last_faces 做落盘/计数/去重）。
+    is_face_chain = getattr(pipe, "face", None) is not None
+    femb = getattr(pipe, "face_embedder", None)
+    face_dedup_thresh = getattr(pipe, "face_dedup_thresh", 0.55)
     face_vecs = []       # 已收集身份的归一化嵌入
     face_count = face_dup = 0
-    face_dedup_thresh = 0.55
-    if is_face_chain:
-        from face_detect.face_detector import FaceDetector
-        from face_detect.face_pipeline import FaceStage
-        from pipe.cropper import Cropper
-        from pipe.target_crop import TargetCrop
-        edp = stage_params.get("extract_faces") or {}  # 兼容旧形态
-        fdp = stage_params.get("face_detect") or {}
-        fep = stage_params.get("face_embed") or {}
-        tcp = stage_params.get("target_crop") or {}
-        # 检测器参数：有 face_detect 阶段用它的；否则用 extract_faces 阶段的 face_thresh
-        det_src = fdp if "face_detect" in stage_params else edp
-        fdet = FaceDetector(device=_str_param(det_src, "device", "auto"),
-                            det_thresh=(_float(det_src, "det_thresh", 0.0)
-                                        or _float(det_src, "face_thresh", 0.4)),
-                            det_size=tuple(_int_tuple(det_src, "det_size", 2) or (640, 640)),
-                            use_crop=_bool(det_src, "use_crop"))
-        if "face_embed" in stage_params:
-            from face_embed.face_embedder import FaceEmbedder
-            femb = FaceEmbedder(device=_str_param(fep, "device", "auto"))
-            face_dedup_thresh = _float(fep, "thresh", 0.55) or 0.55
-        # 目标裁剪（裁人）：新形态用 target_crop 阶段；兼容旧 extract_faces 的 upscale
-        # （旧形态的人框尺寸过滤已归 YOLO，此分支不再过滤）
-        if "target_crop" in stage_params:
-            f_crop = TargetCrop(margin=_float(tcp, "margin", 0.0),
-                                classes=_int_list(tcp, "classes", [0]) or [0],
-                                filter=_str_param(tcp, "filter"),
-                                out_size=_str_param(tcp, "out_size"))
-        else:
-            f_crop = TargetCrop(scale=_float(edp, "upscale", 1.0) or 1.0, margin=0.0,
-                                classes=_int_list(edp, "yolo_classes", [0]) or [0])
-        # 人脸检测阶段：出脸 margin / 去重 IoU（新形态在 face_detect；兼容旧 extract_faces）
-        f_margin = _float(fdp, "margin", 0.0) or _float(edp, "margin", 0.15)
-        f_dedup_iou = _float(fdp, "dedup_iou", 0.0) or _float(edp, "dedup_iou", 0.6) or 0.6
-        ftool = Cropper(upscale=1.0, margin=f_margin)
-        fstage = FaceStage(fdet, ftool, dedup_iou=f_dedup_iou)
-        # 链路未配 yolo 阶段时，用 extract_faces 阶段的 yolo_* 参数自建识人检测器
-        if pipe.yolo is None:
-            from pipe.composer import YOLODetector
-            model = _find_file(_str_param(edp, "yolo_model"), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
-            pipe.yolo = YOLODetector(
-                model_path=str(model), conf=_float(edp, "yolo_conf", 0.35),
-                iou=_float(edp, "yolo_iou", 0.7), imgsz=_int(edp, "yolo_imgsz", 640),
-                max_det=_int(edp, "yolo_max_det", 300),
-                classes=_int_list(edp, "yolo_classes", [0]))
-
-    def _face_step(frame_no, frame, ts, tag):
-        """人脸链单帧处理：YOLO识人→目标裁剪(裁人)→检脸→（嵌入+身份去重）→记事件+出图。"""
-        nonlocal face_count, face_dup
-        dets = pipe.yolo.infer(frame, track=False) if pipe.yolo is not None else []
-        crops = f_crop.run(frame, dets, ts)
-        faces = fstage.run(frame, crops, ts)
-        if "frame_manager" in _stage_order:
-            _emit("frame", tag, ts, stage="frame_manager", frame_no=frame_no, log_line=True)
-        if "target_crop" in _stage_order:
-            _emit("info", f"裁出 {len(crops)} 张人子图", ts, stage="target_crop",
-                  frame_no=frame_no, log_line=True, prefix="    ")
-        face_stage = ("face_embed" if "face_embed" in _stage_order else
-                      "face_detect" if "face_detect" in _stage_order else
-                      "extract_faces" if "extract_faces" in _stage_order else
-                      (_stage_order[-1] if _stage_order else None))
-        new_faces = 0
-        for f in faces:
-            data = f.to_dict()
-            if femb is not None:
-                vec = femb.embed_face(f.face_img)
-                vec = vec / (np.linalg.norm(vec) or 1.0)
-                best = max((float(v @ vec) for v in face_vecs), default=0.0)
-                data["best_sim"] = round(best, 3)
-                if best >= face_dedup_thresh:
-                    face_dup += 1
-                    _emit("info", f"重复人脸（相似 {best:.2f}）", ts, stage=face_stage,
-                          frame_no=frame_no, data=data, log_line=True, prefix="    ")
-                    continue
-                face_vecs.append(vec)
-            face_count += 1
-            new_faces += 1
-            fname = output_dir / f"face_{face_count:03d}_{ts:.1f}s.{image_format}"
-            _save_image(fname, f.face_img)
-            _emit("face", f"{'新人脸' if femb is not None else '人脸'} #{face_count}"
-                        f"（{f.face_img.shape[1]}x{f.face_img.shape[0]}）",
-                  ts, stage=face_stage, frame_no=frame_no, data=data,
-                  log_line=True, prefix="    ")
-            if len(images) < 36:
-                images.append({"title": f"{'新人脸' if femb is not None else '人脸'} #{face_count} t={ts:.1f}s",
-                               "data": _img_data_url(f.face_img, 90)})
-        unit = "新身份" if femb is not None else "人脸"
-        _emit("info", f"检出人脸 {len(faces)} 张，{unit} {new_faces} 个",
-              ts, stage=face_stage, frame_no=frame_no, log_line=True, prefix="    ")
-        log.append("")
-        return len(faces)
 
     def _step_out(frame_no, ts, tag, dets, subs, al, frame=None):
         """逐模块展示本帧各自处理的内容（不管是否向下传递），每条带帧序数。"""
         nonlocal detection_count, vlm_fail, plate_count, vlm_unreachable, event_count
+        nonlocal face_count, face_dup
         plates = getattr(pipe, "last_plates", [])
         plate_in = getattr(pipe, "last_plate_input", [])
         detection_count += len(dets or [])
@@ -1185,11 +1095,12 @@ def h_pipeline_run(p: dict) -> dict:
             _emit("submit", "；".join(parts), ts, stage="yolo",
                   frame_no=frame_no, log_line=True, prefix="    ")
 
-        # 目标裁剪：本帧按上游 YOLO 框裁出的子图
+        # 目标裁剪：本帧按上游 YOLO 框裁出的子图（人脸链裁的是"人子图"，沿用旧文案）
         if "target_crop" in _stage_order:
             crops = getattr(pipe, "last_crops", [])
             tids = [c.track_id for c in crops if getattr(c, "track_id", 0)]
-            _emit("info", f"裁出 {len(crops)} 张子图" + (f"（track {tids}）" if tids else ""),
+            crop_unit = "人子图" if is_face_chain else "子图"
+            _emit("info", f"裁出 {len(crops)} 张{crop_unit}" + (f"（track {tids}）" if tids else ""),
                   ts, stage="target_crop", frame_no=frame_no, log_line=True, prefix="    ")
 
         # 标注：本帧生成带框图（供 VLM 素材）
@@ -1268,6 +1179,44 @@ def h_pipeline_run(p: dict) -> dict:
                 _emit("info", f"识别 0 张（传入车图 {len(plate_in)} 张）", ts,
                       stage="plate_recog", frame_no=frame_no, log_line=True, prefix="    ")
 
+        # 人脸检测：从 pipe.last_faces（Pipeline 人脸插槽产出）做落盘/计数/身份去重
+        # （检测本身已在 pipe.step 里跑；此处只做展示层。无 face_embed 时=人脸截取模式）
+        if is_face_chain:
+            faces = list(getattr(pipe, "last_faces", []) or [])
+            face_stage = ("face_embed" if "face_embed" in _stage_order else
+                          "face_detect" if "face_detect" in _stage_order else
+                          "extract_faces" if "extract_faces" in _stage_order else
+                          (_stage_order[-1] if _stage_order else None))
+            new_faces = 0
+            for f in faces:
+                data = f.to_dict()
+                if femb is not None:
+                    vec = femb.embed_face(f.face_img)
+                    vec = vec / (np.linalg.norm(vec) or 1.0)
+                    best = max((float(v @ vec) for v in face_vecs), default=0.0)
+                    data["best_sim"] = round(best, 3)
+                    if best >= face_dedup_thresh:
+                        face_dup += 1
+                        _emit("info", f"重复人脸（相似 {best:.2f}）", ts, stage=face_stage,
+                              frame_no=frame_no, data=data, log_line=True, prefix="    ")
+                        continue
+                    face_vecs.append(vec)
+                face_count += 1
+                new_faces += 1
+                fname = output_dir / f"face_{face_count:03d}_{ts:.1f}s.{image_format}"
+                _save_image(fname, f.face_img)
+                _emit("face", f"{'新人脸' if femb is not None else '人脸'} #{face_count}"
+                            f"（{f.face_img.shape[1]}x{f.face_img.shape[0]}）",
+                      ts, stage=face_stage, frame_no=frame_no, data=data,
+                      log_line=True, prefix="    ")
+                if len(images) < 36:
+                    images.append({"title": f"{'新人脸' if femb is not None else '人脸'} "
+                                            f"#{face_count} t={ts:.1f}s",
+                                   "data": _img_data_url(f.face_img, 90)})
+            unit = "新身份" if femb is not None else "人脸"
+            _emit("info", f"检出人脸 {len(faces)} 张，{unit} {new_faces} 个",
+                  ts, stage=face_stage, frame_no=frame_no, log_line=True, prefix="    ")
+
         # 链路尾通用输出：末段记录携带的事件（det_filter/seq_filter 追加；不绑定模块）
         for ev in (getattr(pipe, "last_events", None) or []):
             event_count += 1
@@ -1301,21 +1250,22 @@ def h_pipeline_run(p: dict) -> dict:
         orig_name = output_dir / f"frame_000_{timestamp}_orig.{image_format}"
         _save_image(orig_name, frame)
 
+        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else []
+
+        subs, al = pipe.step(0, 0.0, dets, frame=frame)
+        _step_out(0, 0.0, f"图片测试: {img_path.name}", dets, subs, al, frame=frame)
+
         if is_face_chain:
+            # 人脸链图片测试：与普通链同走 pipe.step；结果头沿用「新身份/人脸」文案
             processed_count += 1
-            n_faces = _face_step(0, frame, 0.0, f"图片测试: {img_path.name}")
-            head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
+            n_faces = len(getattr(pipe, "last_faces", []) or [])
             unit = "新身份" if femb is not None else "人脸"
+            head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
             head += f" | 检出人脸 {n_faces} 张 | {unit} {face_count} 个"
             if femb is not None:
                 head += f"（阈值 {face_dedup_thresh}）"
             head += f" | 输出到: {output_dir}" + _save_summary()
             return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
-
-        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else []
-
-        subs, al = pipe.step(0, 0.0, dets, frame=frame)
-        _step_out(0, 0.0, f"图片测试: {img_path.name}", dets, subs, al, frame=frame)
 
         # 保存标注图（检出框 + 车牌框）
         canvas = frame.copy()
@@ -1382,40 +1332,34 @@ def h_pipeline_run(p: dict) -> dict:
         time_str = f"{ts:.2f}s"
         tag = f"时间{time_str} (处理第{frame_num+1}帧)"
 
-        if is_face_chain:
-            # 人脸链：extract_faces 内部自跑 YOLO 识人，不走 pipe.step
-            n_faces = _face_step(n, frame, ts, tag)
-            detection_count += n_faces
-            n += 1
-            continue
-
         dets = None
         if pipe.yolo is not None:
             dets = pipe.yolo.infer(frame, track=pipe.track_needed())
 
         subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
-        plates = getattr(pipe, "last_plates", [])
         _step_out(n, ts, tag, dets, subs, al, frame=frame)
 
-        # 保存关键帧图片（检出框 + 车牌框）
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if (dets and len(dets) > 0) or plates:
-            canvas = frame.copy()
-            _draw_tracks(canvas, dets or [])
-            for p in plates:
-                px1, py1, px2, py2 = p.bbox
-                cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
-                cv2.putText(canvas, p.plate_no, (px1, max(py1 - 6, 14)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            anno_name = output_dir / f"frame_{frame_num:04d}_{timestamp.replace(':', '')}_{time_str.replace('.', '_')}_det.{image_format}"
-            if not _save_image(anno_name, canvas) and dropped_saves[0] == 1:
-                timeline.append({"kind": "info",
-                                 "text": f"◌ 落盘达上限（{max_saved_images} 张），后续图片不再保存",
-                                 "ts": ts, "frame": processed_count})
+        # 保存关键帧图片（检出框 + 车牌框）；人脸链只落人脸图（在 _step_out 里），不回灌关键帧
+        if not is_face_chain:
+            plates = getattr(pipe, "last_plates", [])
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if (dets and len(dets) > 0) or plates:
+                canvas = frame.copy()
+                _draw_tracks(canvas, dets or [])
+                for p in plates:
+                    px1, py1, px2, py2 = p.bbox
+                    cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
+                    cv2.putText(canvas, p.plate_no, (px1, max(py1 - 6, 14)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                anno_name = output_dir / f"frame_{frame_num:04d}_{timestamp.replace(':', '')}_{time_str.replace('.', '_')}_det.{image_format}"
+                if not _save_image(anno_name, canvas) and dropped_saves[0] == 1:
+                    timeline.append({"kind": "info",
+                                     "text": f"◌ 落盘达上限（{max_saved_images} 张），后续图片不再保存",
+                                     "ts": ts, "frame": processed_count})
 
-            if len(images) < 6:  # 限制显示的图片数量
-                images.append({"title": f"帧#{frame_num} 时间{time_str} 检出{len(dets or [])}个/车牌{len(plates)}",
-                               "data": _img_data_url(canvas, 65)})
+                if len(images) < 6:  # 限制显示的图片数量
+                    images.append({"title": f"帧#{frame_num} 时间{time_str} 检出{len(dets or [])}个/车牌{len(plates)}",
+                                   "data": _img_data_url(canvas, 65)})
 
         n += 1
 
@@ -1455,8 +1399,21 @@ def h_pipeline_run(p: dict) -> dict:
 # _chain_from_spec 据此组装四模块实例（帧管理→YOLO→VLM→告警，可选阶段）。
 
 
+# _chain_from_spec 能装配进执行路径的阶段（validate_chain「声明即执行」断言的唯一依据）：
+# 新增可装配阶段务必同步登记，否则 spec 声明了它却静默不执行（WO-0001 事故即此类）。
+CHAIN_ASSEMBLED_MODULES = {
+    "frame_manager", "yolo", "det_filter", "seq_filter", "target_crop",
+    "annotate", "vlm", "plate_recog", "face_detect", "extract_faces", "face_embed",
+}
+
+
 def _chain_from_spec(spec: dict):
-    """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。不加载模型。"""
+    """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。
+
+    YOLO 惰性不加载；含 face_detect / face_embed 阶段时会构造人脸阶段
+    （FaceDetector/FaceEmbedder 构造即加载模型）。spec 声明的每个阶段都必须在此被
+    装配进执行路径（validate_chain 的「声明即执行」断言依据 CHAIN_ASSEMBLED_MODULES）。
+    """
     from pipe.composer import (
         FrameManager, YOLODetector, VLMAnalyzer, Pipeline,
         SAMPLING_ANALYSIS, SAMPLING_WALL_CLOCK, SAMPLING_FRAME_COUNT,
@@ -1524,6 +1481,48 @@ def _chain_from_spec(spec: dict):
                              show_label=_bool(anp, "show_label"),
                              classes=_int_list(anp, "classes", None),
                              filter=_str_param(anp, "filter"))
+    # 人脸阶段（face_detect / 兼容旧 extract_faces）：构造 FaceStage 注入 Pipeline.face
+    # （run(frame, crops, ts) -> list[FaceResult]，与 plate 对称）；face_embed 阶段构造
+    # FaceEmbedder（身份去重在驱动层读 last_faces 后处理，落盘/计数同样留驱动层）。
+    face = None
+    face_embedder = None
+    face_dedup_thresh = 0.55
+    if "face_detect" in by_mod or "extract_faces" in by_mod:
+        from face_detect.face_detector import FaceDetector
+        from face_detect.face_pipeline import FaceStage
+        from pipe.cropper import Cropper
+        edp = _one("extract_faces") if "extract_faces" in by_mod else {}  # 兼容旧形态
+        fdp = _one("face_detect") if "face_detect" in by_mod else {}
+        # 检测器参数：有 face_detect 阶段用它的；否则用 extract_faces 的 face_thresh
+        det_src = fdp if "face_detect" in by_mod else edp
+        fdet = FaceDetector(
+            device=_str_param(det_src, "device", "auto"),
+            det_thresh=(_float(det_src, "det_thresh", 0.0)
+                        or _float(det_src, "face_thresh", 0.4)),
+            det_size=tuple(_int_tuple(det_src, "det_size", 2) or (640, 640)),
+            use_crop=_bool(det_src, "use_crop"))
+        # 人脸检测阶段：出脸 margin / 去重 IoU（新形态在 face_detect；兼容旧 extract_faces）
+        f_margin = _float(fdp, "margin", 0.0) or _float(edp, "margin", 0.15)
+        f_dedup_iou = _float(fdp, "dedup_iou", 0.0) or _float(edp, "dedup_iou", 0.6) or 0.6
+        face = FaceStage(fdet, Cropper(upscale=1.0, margin=f_margin), dedup_iou=f_dedup_iou)
+        if "face_embed" in by_mod:
+            from face_embed.face_embedder import FaceEmbedder
+            fep = _one("face_embed")
+            face_embedder = FaceEmbedder(device=_str_param(fep, "device", "auto"))
+            face_dedup_thresh = _float(fep, "thresh", 0.55) or 0.55
+        # 兼容旧 extract_faces 形态：链路未配「目标裁剪」/「YOLO」阶段时按 extract_faces 参数补齐
+        if crop is None:
+            from pipe.target_crop import TargetCrop
+            crop = TargetCrop(scale=_float(edp, "upscale", 1.0) or 1.0, margin=0.0,
+                              classes=_int_list(edp, "yolo_classes", [0]) or [0])
+        if yolo is None:
+            model = (_find_file(_str_param(edp, "yolo_model"), [MODELS_DIR])
+                     or MODELS_DIR / "yolov8n.pt")
+            yolo = YOLODetector(
+                model_path=str(model), conf=_float(edp, "yolo_conf", 0.35),
+                iou=_float(edp, "yolo_iou", 0.7), imgsz=_int(edp, "yolo_imgsz", 640),
+                max_det=_int(edp, "yolo_max_det", 300),
+                classes=_int_list(edp, "yolo_classes", [0]))
     plate = None
     if "plate_recog" in by_mod:
         from plate_recog.plate_recognizer import PlateRecognizer
@@ -1547,9 +1546,13 @@ def _chain_from_spec(spec: dict):
         sp = _one("seq_filter")
         seq_filter = _seq_filter_of(sp, what="gates")
         event_filter = _seq_filter_of(sp, what="rules")
-    return Pipeline(frame=fm, yolo=yolo, vlm=vlm,
-                    crop=crop, annotate=annotate, plate=plate,
+    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm,
+                    crop=crop, annotate=annotate, plate=plate, face=face,
                     det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter)
+    # face_embed 身份去重所需（驱动层读 pipe.last_faces 后处理）：非 dataclass 字段，装配层附挂
+    pipe.face_embedder = face_embedder
+    pipe.face_dedup_thresh = face_dedup_thresh
+    return pipe
 
 
 # ---------------- 实时播放叠加：SSE 流式链路运行（方案 B） ----------------

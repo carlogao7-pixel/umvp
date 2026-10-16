@@ -43,6 +43,8 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 2. **每个 `module_id` 最多出现一次**（重复即拒绝）。
 3. **终段** ∈ {`det_filter`, `seq_filter`, `plate_recog`, `face_detect`, `face_embed`}。
 4. `params` 只用**该模块参数白名单**内的精确键名——白名单以 `list_modules` 现取为准。
+5. **逐帧分析阶段一律经 `Pipeline.step` 插槽执行**——禁止在驱动层（`web_lab/server.py` 等）为某类
+   链路新增专用单帧路径；spec 声明的每个阶段都必须被装配执行（`validate_chain`「声明即执行」断言）。
 
 **三类固定数据流**（**运行顺序由壳固定**，不由 stages 数组顺序驱动）：
 

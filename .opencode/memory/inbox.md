@@ -22,6 +22,20 @@
 
 <!-- 新条目追加在此行下方，最新在上 -->
 
+- [2026-10-16][INB-0019][qa][成果] WO-0002.1 验证通过：`tests/test_face_capture_pipeline.py` 新增服务级/驱动层用例（39→63 断言）——装配层注入 `Pipeline.face`（face_detect 新形态 + extract_faces 兼容形态 + face_embed 注入 FaceEmbedder）；det_filter 生效（同帧同整帧检测：放行 `long>=1` → `last_filter=(1,1)`/裁 1 人子图/检 3 脸；严格 `long>=100000` → `(1,0)`/0 裁剪/0 脸）；驱动层 `h_pipeline_run` 图片分支（仅 monkeypatch `db.load_pipeline` 返内存 spec，不连 MySQL/不起 HTTP）落盘命名 `face_001_0.0s.jpg`、上限 2（原图 1 + 脸 1，超限跳过 6）、时间线出现 det_filter `10 → 0` 条目。`tests/test_validate_chain.py` 11→13（新增「声明但未装配 face_store → 报错」+ face/face_embed 形态全绿）。回归全绿：test_composer 36 / face_capture 63 / validate 13/13 / police_uav 全通过 / plate_recog 28 / agent_runtime 39（脚本自报；qa 个人上下文旧表写 33，以脚本为准）。未覆盖边界：`h_chain`/SSE 与视频分支、face_embed 身份去重驱动层（需 DB 或视频素材）；另 `extract_faces` 在 `CHAIN_ASSEMBLED_MODULES` 但不在 `MODULES` 注册表 → 声明它会被 validate 判「未知模块」而跳过「声明即执行」（兼容形态，非回归）。`face_embed.thresh` 无参数表项（恒默认 0.55）已由 web 记 INB-0017，不重复。
+  → 去向：`tests/test_face_capture_pipeline.py`、`tests/test_validate_chain.py`；工单 WO-0002.1 置**已完成**。
+
+- [2026-10-16][INB-0018][agent-builder][成果] WO-0002.1 第 3 段（P5 第 0 步）：链路壳标准写入「逐帧阶段一律走 `Pipeline.step` 插槽、禁止驱动层专用单帧路径」硬规则（§0 新增硬规则 5 +「执行路径」说明：新模块接入三件套 ①插槽②`_chain_from_spec` 注入③`CHAIN_ASSEMBLED_MODULES` 登记；校验保障=`validate_chain`「声明即执行」断言；反例=PIPE0003 专用路径致 det_filter 声明不执行/WO-0001，已修复）。同步修正过时表述：`01-shell-standard.md` 槽位清单补 `face`、`pipeline-assembler.md §3` 硬规则补第 5 条、`03-patterns-and-extension.md` 槽位示例 `crop/annotate/plate`→`+face` 且「四件套」第 4 项点名 `CHAIN_ASSEMBLED_MODULES`。快照重生成 `doc/agent/static_prompts.md`（组装工块含新规矩）。验证 `tests/test_agent_runtime.py` 39/39。
+  → 去向：`.claude/agents/assembler/{01-shell-standard,03-patterns-and-extension}.md`、`.claude/agents/pipeline-assembler.md`、`doc/agent/static_prompts.md`；工单 WO-0002.1 保持待测试（整单由 qa 验证）。
+
+- [2026-10-16][INB-0017][web][坑] 驱动层人脸身份去重阈值读 `face_embed.thresh`，但 `face_embed` 参数表（server.py PARAMS）**无 thresh 项** → 实际恒取默认 0.55；要按链路配置阈值需给 face_embed 补 `thresh`（会新增 DB 参数表列）。另：`_chain_from_spec` 现对含 face_detect/face_embed 的 spec 在**装配期**即构造 FaceDetector/FaceEmbedder（构造即加载模型），h_chain/h_pipeline_stream 走人脸 spec 时同样会加载。
+  → 去向：供 pipe-chain（是否补 face_embed.thresh 参数表）/ qa（阈值用例）跟进；`doc/chains/pipe0003_face_capture.md` §4.1「两条执行路径的差异」与「已知差异」节可标记为**已修复**（WO-0002.1 第 2 段）。
+- [2026-10-16][INB-0016][web][成果] WO-0002.1 第 2 段：测试台人脸链并入通用 `Pipeline.step`（删 `_face_step` / `is_face_chain` 专用路径）+ validate_chain「声明即执行」断言。`_chain_from_spec` 新增 `CHAIN_ASSEMBLED_MODULES`、注入 `Pipeline.face`（FaceStage）并附挂 `pipe.face_embedder`/`pipe.face_dedup_thresh`；兼容 extract_faces 形态自动补 TargetCrop/YOLO。`h_pipeline_run` 图片/视频分支统一为 `pipe.step` + `_step_out`（从 `pipe.last_faces`/`last_crops` 落盘、计数、身份去重；沿用 `face_{n:03d}_{ts:.1f}s`、images≤36、落盘 200 上限、「人子图」文案）。验证：test_composer 36 / test_face_capture 39 / test_police_uav 全通过 / test_plate_recog 28 / test_validate_chain 11/11；进程内 18 项（含严格 det_filter 10→0 证明生效）。
+  → 去向：`web_lab/server.py`（:1052 人脸链状态、:1102「人子图」、:1182 人脸展示段、:1259 图片分支、:1342 视频分支、:1404 `CHAIN_ASSEMBLED_MODULES`、:1484 `_chain_from_spec` 人脸装配）、`web_lab/validate_chain.py`（:158 声明即执行断言）。**行为差异**：PIPE0003 的 det_filter(DF0003) 在测试台**真正生效**（过滤后检测数→裁剪→人脸），人脸数/落盘可能与旧日志不同（属修复目的，非回归）。
+
+- [2026-10-16][INB-0015][pipe-chain][成果] `Pipeline` 增 face 插槽（与 plate 对称，WO-0002.1 第 1 段）：新增字段 `face`/`last_faces`/`last_face_input`，`step()` 增「人脸识别阶段」段 `face.run(frame, last_crops, ts)`（落盘/计数/事件尾留驱动层），docstring 补插槽说明；不改行为。
+  → 去向：`umvp/pipe/composer.py`（:350 docstring、:361 face 字段、:365 last_faces、:368 last_face_input、:458 step 人脸段）；web 接线与 validate_chain 断言待 WO-0002.1 后续段落。
+
 ## 已同步
 
 <!-- /curate 处理后移到这里，注明去向，例如：INB-0001 → CLAUDE.md §三 设计契约 -->

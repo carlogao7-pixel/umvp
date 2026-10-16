@@ -347,7 +347,8 @@ class Pipeline:
 
     crop 为可选的"目标裁剪阶段"（鸭子类型：需实现 run(frame, dets, ts) -> list），
     plate 为可选的"车牌识别阶段"（需实现 run(frame, crops, ts) -> list），
-    均由拼接层注入（pipe.target_crop.TargetCrop / plate_recog.PlateStage），
+    face 为可选的"人脸识别阶段"（鸭子类型：需实现 run(frame, crops, ts) -> list），
+    均由拼接层注入（pipe.target_crop.TargetCrop / plate_recog.PlateStage / face_detect.FaceStage），
     本模块不引入 cv2/onnx 依赖。链路输出 = 事件尾（event_filter）产出的事件（last_events）。
     """
 
@@ -358,13 +359,16 @@ class Pipeline:
     crop: Optional[object] = None  # 目标裁剪阶段（TargetCrop.run(frame, dets, ts)）
     annotate: Optional[object] = None  # 标注阶段（Annotator.run(frame, dets, ts) -> 带框图）
     plate: Optional[object] = None  # 车牌识别阶段（PlateStage.run(frame, crops, ts)）
+    face: Optional[object] = None  # 人脸识别阶段（FaceStage.run(frame, crops, ts)）
     det_filter: Optional[DetFilter] = None  # 检测筛选阶段（有效性：逐条+成组，2026-10 自 YOLO 迁入）
     seq_filter: Optional[object] = None  # 时序判定阶段（节流/变化门控 + 事件，2026-10 自 Pipeline 迁入）
     event_filter: Optional[object] = None  # 事件尾（VLM/车牌等外部记录经 publish 走它出事件，可作链路尾）
     last_plates: List = field(default_factory=list)  # 最近一帧识别到的车牌（供驱动层读取）
+    last_faces: List = field(default_factory=list)  # 最近一帧检测到的人脸（供驱动层读取）
     last_crops: List = field(default_factory=list)  # 最近一帧目标裁剪产物（供驱动层读取）
     last_annotated: object = None  # 最近一帧标注图（供驱动层/VLM 素材读取）
     last_plate_input: List = field(default_factory=list)  # 最近一帧传给车牌阶段的车辆子图（门控后）
+    last_face_input: List = field(default_factory=list)  # 最近一帧传给人脸阶段的子图（门控后）
     last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
     last_events: List = field(default_factory=list)  # 最近一帧末段记录携带的事件（链路尾通用输出，见 records.events）
 
@@ -451,6 +455,12 @@ class Pipeline:
                        "content": {"plate_no": p.plate_no, "type_name": p.type_name,
                                    "color": p.color, "bbox": list(p.bbox)}}
                 plate_events += self.publish([rec], ts, frame_idx)
+        # 人脸识别阶段：检测 → 人脸产物（同源于 crop 产物）；落盘/计数/事件尾留驱动层。
+        self.last_faces = []
+        self.last_face_input = []
+        if self.face is not None and frame is not None:
+            self.last_face_input = list(self.last_crops)
+            self.last_faces = list(self.face.run(frame, self.last_crops, ts))
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
         # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
         self.last_events = (collect_events(dets) if dets else []) + plate_events

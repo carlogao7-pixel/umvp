@@ -162,6 +162,7 @@ agent 用自包含提示词（`.claude/agents/*.md`）+ 项目内文档（`doc/`
 | P2 链路定制 | pipeline spec 校验 + estimate/run 接口 + 前端链路设计器 + chain 运行器 | 网页拼出链路 → 估算 → 生成/运行可跑通 | ✅ 已落地 |
 | P3 文档完善 | 组装 agent 技术文档（`.claude/agents/`） | agent 读后能独立规划 | ✅ 已落地 |
 | P4 agent | `.claude/agents/pipeline-architect.md` + `pipeline-assembler.md` | 自然语言需求 → 方案（含资源估算）→ 自动生成测试跑通 → 回归集全绿 | ✅ 已落地 |
+| P5 拼接层端口协议 | 模块端口声明 + 壳内连线 + 校验器断言（分三步） | 声明的阶段必被装配执行；图像源（原帧/带框图/裁剪图…）可在壳内选择 | 📐 设计稿（[`../design/assembly_ports.md`](../design/assembly_ports.md)，WO-0002） |
 
 ## 八、验证与回归策略
 
@@ -192,3 +193,35 @@ agent 用自包含提示词（`.claude/agents/*.md`）+ 项目内文档（`doc/`
 
 > 模块参数维护规则：改参数先改 `web_lab/server.py` PARAMS（唯一权威源）→ 同步
 > `doc/modules/` 对应分册 → 若涉及资源指纹同步 `out/fingerprints.json` 标定。
+
+## 十一、下一阶段需求：拼接层端口协议（P5）
+
+> 状态：📐 需求已确认（2026-10-16），分步实施；详细设计见
+> [`../design/assembly_ports.md`](../design/assembly_ports.md)，实施工单 **WO-0002**。
+
+**背景（触发问题）**：PIPE0003 在测试台走专用单帧路径（`_face_step`）绕开通用 `Pipeline.step`，
+导致链路 spec 里声明的 `det_filter` **静默不执行**（详见 `../chains/pipe0003_face_capture.md`
+§4.1 与 WO-0001）。根因是「执行路径双轨 + 阶段连线硬编码」。
+
+**两条用户诉求**：
+
+1. **模块可复用**：模块不应被位置绑死（现在 crop 只能吃 dets、plate/face 只能吃 crops）；
+2. **壳内自由取数**：拼接层能规定模块从上游取哪部分——图像旁路里同时可能有原帧 / 带框图 /
+   低清图 / 裁剪图，接收模块（如 VLM）在**链路壳里**选择其一。
+
+**目标与规矩（确认结论）**：
+
+- 所有**逐帧分析阶段**一律走通用插槽（`Pipeline.step`），**禁止**驱动层专用单帧路径；
+  此规矩写入链路壳标准（`.claude/agents/assembler/01-shell-standard.md`，唯一权威）。
+- `validate_chain` 增加断言：**spec 声明的阶段必须全部被装配进执行路径**，否则报错。
+- 方案 = 产物端口协议（产物命名 / 模块自描述 / spec 声明 `inputs` / 校验 / 按表驱动），
+  缺省规则 = 现状（零回归）。
+
+**分步实施**：第 0 步消除例外（人脸并入 step + 断言 + 壳标准写规矩）→ 第 1 步旁路命名统一 +
+图像源选择（`image_source`）→ 第 2 步完整端口协议 + 设计器连线 UI。
+
+**设计决策（2026-10-16 确认）**：端口类型 `Image/Records/Vector` 三类够用；**每端口单一上游**
+（`inputs` 不允许多值）；协议须支持「同一产物被多个下游消费」（**分支链路列入后续路线**，
+本版仍线性执行）；**低清图暂不设计**。
+
+**边界**：落盘/展示/批量编排等**非逐帧**逻辑不进 Pipeline；本版不做通用 DAG 执行器。

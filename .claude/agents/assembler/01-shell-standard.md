@@ -28,6 +28,10 @@
 3. **终段**（`stages` 最后一段）必须是 `det_filter` / `seq_filter` / `plate_recog` /
    `face_detect` / `face_embed` 之一。
 4. `params` 只用该模块**参数白名单**内的精确键名，不塞未知键——**白名单以 `list_modules` 现取为准**。
+5. **逐帧分析阶段一律经 `Pipeline.step` 插槽执行**：帧管理 / 识别（yolo / 车牌 / 人脸）/ 筛选
+   （det_filter / seq_filter）/ 时序 / 裁剪 / 标注 / 研判（vlm）等**逐帧**阶段，**必须**由
+   `Pipeline` 的固定插槽驱动；**禁止**在驱动层（`web_lab/server.py` 等）为某类链路新增
+   **专用单帧路径**。
 
 **三类数据流（运行顺序由壳固定，不由 stages 数组顺序驱动）**：
 
@@ -43,8 +47,18 @@
 > 额外的 `id/seq` 字段。
 >
 > **为何每模块至多一次**：每个模块类型只有一个槽位（`Pipeline` 的 `yolo / det_filter / seq_filter / crop /
-> annotate / plate / vlm / event_filter` 各一个字段）；重复 `module_id` 无法表达（装配器只取第一份参数），
+> annotate / plate / face / vlm / event_filter` 各一个字段）；重复 `module_id` 无法表达（装配器只取第一份参数），
 > 故在 `validate_chain` 与 `db.save_pipeline` 处直接拒绝，避免静默丢弃。
+>
+> **执行路径（逐帧阶段一律走插槽）**：所有逐帧分析阶段**只**经 `Pipeline.step` 的固定插槽执行，
+> **不存在**"某类链路的专用单帧路径"。**新模块接入 = 三件套**：① `Pipeline` 提供插槽（鸭子类型
+> `run(...)`，与既有槽位对称）② 拼接层 `_chain_from_spec` 按 spec 注入 ③ `CHAIN_ASSEMBLED_MODULES`
+> （`web_lab/server.py`）登记；**缺任一件，spec 声明了它也不会执行**。平台以 `web_lab/validate_chain.py`
+> 的**「声明即执行」断言**兜底——声明但未被装配的阶段直接报错
+> （`声明即执行: 阶段 … 未被 _chain_from_spec 装配进执行路径`）。
+>
+> **反例警示（本条规矩的由来）**：人脸链（PIPE0003）历史上曾走驱动层**专用单帧路径**，导致 spec 声明的
+> `det_filter` **声明了却不执行**（静默失效，WO-0001）；现已并入 `Pipeline.step` 插槽修复。
 
 ## 1. 标准产物
 

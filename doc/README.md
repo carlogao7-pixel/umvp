@@ -106,13 +106,14 @@ doc/
 │                    六段式：定位→拼接结构→数据流→运行方式→输出→验证）
 ├── guides/          操作与参考手册（runbook=端口与启停 / database_schema=数据库结构）
 ├── design/          专题设计（storage_design / live_overlay＝web 已落地；
-│                    video_review_search / wemm_integration＝下期设计稿）
+│                    video_review_search / wemm_integration＝下期设计稿；
+│                    assembly_ports＝拼接层端口协议设计稿，P5）
 ├── agent/           挂载 agent 生成物（static_prompts / full_run_record；脚本生成勿手改）
 └── research/        历史选型调研（face_search_survey / plate_recog_survey；实现现状以 modules/ 为准）
 ```
 
 **维护归属**（多代理协作）：`modules/` + `chains/` → pipe-chain；`guides/` + `design/` 前两篇 → web；
-`agent/` → agent-builder；`requirements/` + `design/` 后两篇 + `research/` + 本页 → orchestrator。
+`agent/` → agent-builder；`requirements/` + `design/` 后三篇 + `research/` + 本页 → orchestrator。
 
 ### 3.1 快速上手
 
@@ -156,6 +157,7 @@ doc/
 | `design/live_overlay.md` | SSE 流式运行 + 视频叠加框的方案与约束（已落地） |
 | `design/video_review_search.md` | 语言询问→定位历史视频片段：离线片段索引（轻/语义/向量三档，PIPE0004）+ 三级检索 + 帧级精定位（设计稿，业务与实现方案总篇） |
 | `design/wemm_integration.md` | WeMM-Embedding 嵌入服务对接专篇：模型机制、serving 部署、WEMMClient 请求 schema、成本与联调清单（设计稿） |
+| `design/assembly_ports.md` | 拼接层端口协议（P5 设计稿）：产物命名 / 模块自描述输入输出 / 壳内 `inputs` 连线 / 校验断言；把「阶段插槽硬编码连线」升级为「模块自描述端口 + 壳内声明」；分三步实施（WO-0002） |
 
 ### 3.6 挂载 agent（agent/ 与 .claude/agents/）
 
