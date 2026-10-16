@@ -1,7 +1,7 @@
 ---
 description: UMVP 开发代理·web 端 —— 负责 web_lab 测试台（server/db/test.html/启停脚本/标定/spec 校验）与 umvp/resources.py 资源估算。
 mode: all
-model: deepseek/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的 **web 端开发代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。

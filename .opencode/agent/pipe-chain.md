@@ -1,7 +1,7 @@
 ---
 description: UMVP 开发代理·模块与链路编排 —— 负责 umvp/pipe 各模块、条件 DSL、通用记录与事件约定、三条保留链路的编排与链路 spec。
 mode: all
-model: deepseek/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的**模块及链路编排代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。

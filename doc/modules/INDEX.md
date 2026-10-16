@@ -39,6 +39,10 @@
 | [人脸嵌入](face_embed.md) | 人脸图 | 512d 向量 → Vector | 向量旁路 |
 | [向量底库](face_store.md) | 查询向量 | MatchResult 记录 | 检索产出 |
 
+**基数约定（2026-10-16）**：记录数不随图片数膨胀——识别模块一条记录可含多个识别对象；图像生产
+模块**一条记录需多图时，以「图集」（ndarray 列表）放进 `image` 旁路，不拆记录**；下游自行处理
+单图/图集（标注：一条记录 → 一张图多框，不受影响）。
+
 **本期连线范围**：`inputs` 解析已覆盖 `yolo.image`、`det_filter.dets`、`seq_filter.dets`、
 `target_crop.frame/dets`、`annotate.image/dets`；`vlm` / `plate_recog` / `face_detect` 暂按默认取数
 （写了 `inputs` 会由 `validate_chain` 给出**非致命警告**）。校验：未知产物 / 非法端口 / 非上游引用 /

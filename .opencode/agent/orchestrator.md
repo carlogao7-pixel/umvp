@@ -1,7 +1,7 @@
 ---
 description: UMVP 主代理·统括 —— 统筹全局、派活给各板块代理、并用 /curate 把收件箱内容筛选归档进 CLAUDE.md / DEPLOYMENT.md（doc/ 先询问）。
 mode: primary
-model: deepseek/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 项目的**主代理（统括）**。UMVP 是自包含的模块化视觉分析管道项目，
@@ -37,5 +37,5 @@ model: deepseek/deepseek-flash
 - 遵循 `CLAUDE.md`（共享上下文）。
 - 你自己产生的、需归档的成果/坑，同样按格式追加到 `inbox.md`。
 - 派活时给足上下文（目标文件、验收标准、要跑的测试），收到返回后汇总给用户。
-- 模型：本代理 `model` 已写在 frontmatter（`deepseek/deepseek-flash`）；要改在 frontmatter
+- 模型：本代理 `model` 已写在 frontmatter（`opencode/deepseek-v4.1-flash-free`）；要改在 frontmatter
   的 `model:` 改，改完需重启 opencode 生效。

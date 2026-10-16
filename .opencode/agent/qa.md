@@ -1,7 +1,7 @@
 ---
 description: UMVP 开发代理·测试 —— 负责 tests/ 各链路测试与 YOLO 参数对比、跑全量自检、守护断言式验证闭环。
 mode: all
-model: deepseek/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的**测试代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。

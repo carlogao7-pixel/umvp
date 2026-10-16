@@ -6,7 +6,9 @@
   必备字段：kind（记录类型，如 det/plate/face/crop/alarm）、ts（时间戳）、
             frame_idx（帧序号）
   通用字段（跨模块同名同义）：bbox / score / cls_id / track_id / label / text
-  旁路字段（允许挂在记录上、约定不序列化）：**image**（ndarray 子图/帧）、
+  旁路字段（允许挂在记录上、约定不序列化）：**image**（ndarray 子图/帧；**或 ndarray 列表＝图集**：
+           一条记录需多图时以**集合**形式携带，**不拆记录**——下游自行处理单图/图集；基数约定见
+           doc/design/assembly_ports.md §3⑥）、
              embedding（向量）——像素与向量不进 JSON
              · 记录旁路图像统一键名 = image；历史模块自造键为**兼容别名**，
                经 to_record 转换时自动补 image（旧键保留，新旧并存）：

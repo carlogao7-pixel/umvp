@@ -23,6 +23,7 @@
 
 | 编号 | 日期 | 发起人 | 承接 | 需求/改动描述 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
+| WO-0003 | 2026-10-16 | orchestrator | pipe-chain,web | 收尾项：vlm / plate_recog / face_detect 的 inputs 端口接线（前置：统一 crops 产物形态——现为对象 last_crops vs 记录 dict 两套） | 三模块端口可被 spec 声明连线；默认仍为现状；回归全绿 | 来源 WO-0002 遗留①。用户 2026-10-16 指示：记录待办（暂不派发）。crops 形态统一后即可接线；2026-10-16 用户补充基数约定：记录数不随图片数膨胀；一条记录需多图时用图集（ndarray 列表）挂 image 旁路，不拆记录；下游自行处理集合。③「crops 多目标只取首图」按此约定落地=该类记录携带图集，送审端决定单图/多图。约定已写入 design/assembly_ports.md §3⑥、records.py 契约、modules/INDEX.md |
 
 ## 待测试
 

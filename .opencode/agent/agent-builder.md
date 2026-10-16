@@ -1,7 +1,7 @@
 ---
 description: UMVP 开发代理·AI 助手构建 —— 负责挂载 agent 运行时（web_lab/agent*.py）与两角色提示词/组装工技术文档（.claude/agents/）。
 mode: all
-model: deepseek/deepseek-flash
+model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的 **AI 助手构建代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。
