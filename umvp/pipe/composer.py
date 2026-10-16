@@ -61,6 +61,19 @@ ARTIFACT_TYPES: Dict[str, str] = {
     ARTIFACT_PLATES: "Records",
 }
 
+# Pipeline.step 已纳入 inputs 解析的端口 —— **唯一来源**，与 step() 中 _port(...) 调用点一一对应。
+# {module_id: (端口名, ...)}：web 段（validate_chain 的 DAG 硬校验 / 设计器可连线下拉）据此开放；
+# 其余端口（vlm 等）写了 inputs 只给非致命警告、运行按默认取数。改核心时同步此表。
+RESOLVED_PORTS: Dict[str, Tuple[str, ...]] = {
+    "yolo": ("image",),
+    "det_filter": ("dets",),
+    "seq_filter": ("dets",),
+    "target_crop": ("frame", "dets"),
+    "annotate": ("image", "dets"),
+    "plate_recog": ("frame", "crops"),
+    "face_detect": ("frame", "crops"),
+}
+
 
 class PortResolutionError(ValueError):
     """端口连线解析失败（产物不存在 / 类型不符 / 端口未声明）——fail fast，含可读上下文。"""
@@ -557,8 +570,10 @@ class Pipeline:
         self.last_plate_input = []
         plate_events: List[dict] = []
         if self.plate is not None and frame is not None:
-            self.last_plate_input = list(self.last_crops)
-            self.last_plates = list(self.plate.run(frame, self.last_crops, ts))
+            plate_frame = self._port("plate_recog", self.plate, "frame", frame)
+            plate_crops = self._port("plate_recog", self.plate, "crops", self.last_crops)
+            self.last_plate_input = list(plate_crops)
+            self.last_plates = list(self.plate.run(plate_frame, plate_crops, ts))
             for p in self.last_plates:
                 if not p.plate_no:
                     continue
@@ -572,8 +587,10 @@ class Pipeline:
         self.last_faces = []
         self.last_face_input = []
         if self.face is not None and frame is not None:
-            self.last_face_input = list(self.last_crops)
-            self.last_faces = list(self.face.run(frame, self.last_crops, ts))
+            face_frame = self._port("face_detect", self.face, "frame", frame)
+            face_crops = self._port("face_detect", self.face, "crops", self.last_crops)
+            self.last_face_input = list(face_crops)
+            self.last_faces = list(self.face.run(face_frame, face_crops, ts))
         if self.face is not None and frame is not None:
             self.artifacts[ARTIFACT_FACES] = self.last_faces
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+

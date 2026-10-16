@@ -23,6 +23,7 @@ import numpy as np
 
 from face_detect.face_detector import FaceDetector
 from pipe.cropper import Cropper, iou
+from pipe.target_crop import as_crop
 
 
 @dataclass
@@ -71,10 +72,15 @@ class FaceStage:
         """在目标子图里检脸并出原分辨率人脸图。
 
         crops=None/[] → 无上游目标裁剪产物，不检测。
+        crops 元素可为 CropResult **对象**（last_crops，现路径）或裁剪**记录 dict**
+        （artifacts["target_crop.crops"]，接线时）——入口经 as_crop 类型归一，行为逐字等价。
         """
         results: List[FaceResult] = []
         accepted: List[Tuple[int, int, int, int]] = []  # 已接受的人脸框（原图坐标）
-        for c in crops or []:
+        for raw in crops or []:
+            c = as_crop(raw)
+            if c is None:
+                continue
             for fd in self.face_det.detect(c.img):
                 fb_orig = c.to_original(fd.bbox)
                 if any(iou(fb_orig, s) > self.dedup_iou for s in accepted):

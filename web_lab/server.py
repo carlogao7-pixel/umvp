@@ -233,6 +233,8 @@ def _vlm_material(frame, payload: dict, req) -> "np.ndarray":
 
 # VLM 送审图像源（spec 的 vlm 阶段参数 image_source；默认 annotated=现状语义）
 VLM_IMAGE_SOURCES = ("annotated", "frame", "crops")
+# VLM 送审张数（spec 的 vlm 阶段参数 image_pick；默认 first＝只送首张=现状语义）
+VLM_IMAGE_PICKS = ("first", "all")
 
 
 def _bbox_iou(a, b) -> float:
@@ -250,51 +252,100 @@ def _bbox_iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _match_crop_for_req(req, crops):
-    """在目标裁剪产物 last_crops 里找与本次报送目标对应的子图。
+def _match_crops_for_req(req, crops) -> list:
+    """在目标裁剪产物 last_crops 里找与本次报送目标对应的**全部**子图。
 
     匹配依据（下游可核对）：优先 req.det.bbox（单目标素材），否则取 req.dets 各框；
     按 bbox 精确相等或 IoU≥0.5 命中（裁剪含 margin/缩放，用 IoU 而非全等）。
-    找不到返回 None（由调用方回退默认源，不抛错）。
+    返回按 crops 顺序命中的对象列表（基数约定：一条报送记录可涉多个对象 → 图集）。
     """
     if not crops:
-        return None
+        return []
     wanted = []
     det = getattr(req, "det", None)
     if det is not None:
         wanted.append(tuple(int(v) for v in det.bbox))
     for d in getattr(req, "dets", None) or []:
         wanted.append(tuple(int(v) for v in d.bbox))
+    hits = []
     for c in crops:
         cb = tuple(int(v) for v in c.bbox)
-        for w in wanted:
-            if cb == w or _bbox_iou(cb, w) >= 0.5:
-                return c
-    return None
+        if any(cb == w or _bbox_iou(cb, w) >= 0.5 for w in wanted):
+            hits.append(c)
+    return hits
 
 
-def _pick_vlm_image(source: str, req, frame, pipe) -> tuple:
-    """按 vlm 阶段声明的 image_source 取本帧送审图。
+def _match_crop_for_req(req, crops):
+    """取首个匹配子图（单图语义，兼容既有调用）；无命中返回 None。"""
+    hits = _match_crops_for_req(req, crops)
+    return hits[0] if hits else None
 
-    返回 (图像, 说明, 是否回退)。任一路径缺源都回退到现状（annotated→本帧原图），
-    不抛错——链路无 annotate / 无匹配裁剪时行为与改动前一致。
+
+def _pick_vlm_images(source: str, req, frame, pipe) -> tuple:
+    """按 vlm 阶段声明的 image_source 取本帧送审图——**列表**（图集语义）。
+
+    - annotated / frame → 长度 1（现状语义）；
+    - crops → 该类报送记录所涉**全部对象**的裁剪子图（按 bbox 精确或 IoU≥0.5 收集，
+      用 records.image_set_of 取图=集合语义，兼容 CropResult 对象与统一记录）；
+    无源/未命中一律回退到现状（annotated→本帧原图），不抛错，回退列表取其源长度。
+    返回 (图像列表, 说明, 是否回退)；单图/多图由驱动层按 image_pick 决定（默认 first=现状）。
     """
+    from pipe.records import image_set_of
+
     annotated = getattr(pipe, "last_annotated", None)
     if source == "frame":
         if frame is not None:
-            return frame, "原帧", False
-        return annotated, "无本帧原图，回退标注图", True
+            return [frame], "原帧", False
+        return ([annotated] if annotated is not None else []), "无本帧原图，回退标注图", True
     if source == "crops":
-        crop = _match_crop_for_req(req, getattr(pipe, "last_crops", None) or [])
-        if crop is not None:
-            return crop.img, "裁剪子图", False
+        hits = _match_crops_for_req(req, getattr(pipe, "last_crops", None) or [])
+        imgs = [im for c in hits for im in image_set_of(c) if im is not None]
+        if imgs:
+            return imgs, "裁剪子图", False
         if annotated is not None:
-            return annotated, "无匹配裁剪子图，回退标注图", True
-        return frame, "无匹配裁剪子图，回退原帧", True
+            return [annotated], "无匹配裁剪子图，回退标注图", True
+        return ([frame] if frame is not None else []), "无匹配裁剪子图，回退原帧", True
     # annotated（默认，现状语义）
     if annotated is not None:
-        return annotated, "标注图", False
-    return frame, "无标注图，回退原帧", True
+        return [annotated], "标注图", False
+    return ([frame] if frame is not None else []), "无标注图，回退原帧", True
+
+
+def _apply_vlm_inputs(pipe, subs):
+    """vlm 阶段声明 inputs.dets 时，按指定上游产物重构送审请求（决定"报送哪些检测"）。
+
+    - 未声明 vlm.inputs.dets → 原样返回 step() 的默认 submits（零回归）；
+    - 声明了 → 从 pipe.artifacts 取该产物（yolo.dets=筛选前 / det_filter.dets=筛选后 /
+      seq_filter.dets=门控后），按 cls_id 分组复用 Pipeline._submits（gran=class 语义）；
+    - 产物本帧未登记（如上游无产出）→ 返回默认 submits（不抛错，行为与现状一致）。
+    Detection 对象与统一记录 dict（含 cls_id/bbox）均可消费；无 cls_id 的项跳过。
+    """
+    art = (getattr(pipe, "stage_inputs", None) or {}).get("vlm", {}).get("dets")
+    if not art:
+        return subs
+    items = (getattr(pipe, "artifacts", None) or {}).get(art)
+    if items is None:
+        return subs
+    dets = _as_detections(items)
+    try:
+        return list(pipe._submits(dets))  # 复用 Pipeline 的按类分组（gran=class）语义
+    except Exception:
+        return subs
+
+
+def _as_detections(items):
+    """把产物项归一成 Detection 列表：Detection 原样；dict 记录带 cls_id/bbox 时转换。"""
+    from pipe.composer import Detection
+    dets = []
+    for it in items or []:
+        if isinstance(it, Detection):
+            dets.append(it)
+        elif isinstance(it, dict) and "cls_id" in it and "bbox" in it:
+            dets.append(Detection(track_id=int(it.get("track_id", 0) or 0),
+                                  cls_id=int(it["cls_id"]), bbox=tuple(int(v) for v in it["bbox"]),
+                                  score=float(it.get("score", 0.0)),
+                                  model_path=it.get("model_path")))
+    return dets
 
 
 def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
@@ -314,9 +365,12 @@ def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
 
 
 def _vlm_real(p: dict, payload: dict, frame) -> tuple:
-    """OpenAI 兼容端点调用（返回 (action, description)）。
+    """OpenAI 兼容端点调用（返回 (action, description, content)）。
 
+    frame：单张 ndarray（现状，单图消息）或图集列表（image_pick=all，OpenAI 兼容
+    **多图**消息：多个 image_url content 项 + 末尾 text）。单图路径与改动前**逐字等价**。
     timeout=(连接, 读取)：连接阶段最多 5s（端点不可达时快速失败），读取按 vlm_timeout（默认 20s）。
+    注：端点对多图 content 的支持离线无法验证，**待真实端点联调**。
     """
     import requests
     url = str(p.get("vlm_endpoint") or "").strip() or "http://117.42.21.253:8000/v1/chat/completions"
@@ -324,33 +378,36 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
     key = str(p.get("vlm_key") or "").strip()
     read_timeout = int(p.get("vlm_timeout", 20) or 20)
     mr = tuple(payload.get("max_resolution") or (1280, 720))
-    h, w = frame.shape[:2]
-    scale = min(mr[0] / w, mr[1] / h)
-    if scale < 1.0:
-        frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not ok:
-        raise RuntimeError("帧转 JPEG 失败")
-    b64 = base64.b64encode(buf.tobytes()).decode()
+    frames = list(frame) if isinstance(frame, (list, tuple)) else [frame]
+    content = []
+    for f in frames:
+        h, w = f.shape[:2]
+        scale = min(mr[0] / w, mr[1] / h)
+        if scale < 1.0:
+            f = cv2.resize(f, (max(1, int(w * scale)), max(1, int(h * scale))))
+        ok, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise RuntimeError("帧转 JPEG 失败")
+        b64 = base64.b64encode(buf.tobytes()).decode()
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
     prompt = payload.get("prompt") or (
         "你是画面内容分析器。分析这张图像（可能画有目标框），只输出一个 JSON，"
         "不要任何多余文字或代码块：\n"
         "{\"result\": \"画面主要内容/动作，无异常填 none\", "
         "\"description\": \"一句话中文描述\", \"confidence\": 0.0}"
     )
+    content.append({"type": "text", "text": prompt})
     body = {
         "model": model, "temperature": 0.1, "max_tokens": 256,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            {"type": "text", "text": prompt},
-        ]}],
+        "messages": [{"role": "user", "content": content}],
     }
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     resp = requests.post(url, json=body, headers=headers, timeout=(5, read_timeout))
     resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
-    action, description = _parse_vlm_result(content)
-    return action, description, content
+    content_text = resp.json()["choices"][0]["message"]["content"]
+    action, description = _parse_vlm_result(content_text)
+    return action, description, content_text
 
 
 def _vlm_content(raw: str):
@@ -1058,6 +1115,11 @@ def h_pipeline_run(p: dict) -> dict:
     image_source = _str_param(vlm_cfg, "image_source", "annotated").lower()
     if image_source not in VLM_IMAGE_SOURCES:
         image_source = "annotated"
+    # 送审张数（image_pick）：first=只送首张（默认，与改动前逐字等价）/ all=送图集全部
+    # （仅 crops 源可能多张；端点多图支持待真实联调）。非法值回落默认 first。
+    image_pick = _str_param(vlm_cfg, "image_pick", "first").lower()
+    if image_pick not in VLM_IMAGE_PICKS:
+        image_pick = "first"
     vlm_fail = 0  # 真实调用失败次数（网络等），累计供结果提示
     # 真实 VLM 端点预探测：不可达则本轮直接跳过真实调用，避免每帧长超时把测试拖住
     _vlm_url = str(vlm_cfg.get("vlm_endpoint") or "").strip() \
@@ -1201,14 +1263,22 @@ def h_pipeline_run(p: dict) -> dict:
                             continue
                         try:
                             payload = pipe.vlm.prepare(s, None)
-                            # 送审图按壳内 image_source 选取（默认 annotated=现状；缺源回退）
-                            base, src_note, src_fallback = _pick_vlm_image(
+                            # 送审图按壳内 image_source 选取（默认 annotated=现状；缺源回退）；
+                            # 返回**列表**（crops 源可能为该类多个对象子图=图集）。
+                            images_list, src_note, src_fallback = _pick_vlm_images(
                                 image_source, s, frame, pipe)
+                            # image_pick：first=只送首张（默认，现状）；all=送图集全部。
+                            sent = images_list[:1] if image_pick == "first" else list(images_list)
+                            if not sent:
+                                continue
+                            # 图集多张时在素材备注里带张数（默认 first 单张不改文案）
+                            note = src_note + (f"×{len(sent)}" if len(sent) > 1 else "")
                             # 回退（或非默认源）时在研判日志里给出可读来源说明
                             src_tag = ("" if (image_source == "annotated" and not src_fallback)
-                                       else f"·素材:{src_note}")
-                            action, description, raw = _vlm_real(
-                                vlm_cfg, payload, _vlm_material(base, payload, s))
+                                       else f"·素材:{note}")
+                            materials = [_vlm_material(im, payload, s) for im in sent]
+                            base = materials[0] if len(materials) == 1 else materials
+                            action, description, raw = _vlm_real(vlm_cfg, payload, base)
                             _emit("vlm", f"研判 {action}"
                                   + (f" — {description}" if description else "")
                                   + f"（真实调用{src_tag}）",
@@ -1329,6 +1399,7 @@ def h_pipeline_run(p: dict) -> dict:
         dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else []
 
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
+        subs = _apply_vlm_inputs(pipe, subs)
         _step_out(0, 0.0, f"图片测试: {img_path.name}", dets, subs, al, frame=frame)
 
         if is_face_chain:
@@ -1413,6 +1484,7 @@ def h_pipeline_run(p: dict) -> dict:
             dets = pipe.yolo.infer(frame, track=pipe.track_needed())
 
         subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
+        subs = _apply_vlm_inputs(pipe, subs)
         _step_out(n, ts, tag, dets, subs, al, frame=frame)
 
         # 保存关键帧图片（检出框 + 车牌框）；人脸链只落人脸图（在 _step_out 里），不回灌关键帧
@@ -1484,19 +1556,21 @@ CHAIN_ASSEMBLED_MODULES = {
 
 
 # ---- 产物端口协议（P5 第 2 步，设计稿 doc/design/assembly_ports.md §3）----
-# 本期已在 Pipeline.step 纳入 inputs 解析的端口：设计器只对这些端口开放连线，
-# validate_chain 只对它们做 DAG 硬校验。其余端口（vlm / plate_recog / face_detect）
-# 本期不解析——写了 inputs 只给非致命警告（运行按默认取数）。与 composer.step 的
-# _port(...) 调用点一一对应，改核心时同步此处。
-CHAIN_RESOLVED_PORTS: dict = {
-    "yolo": ("image",),
-    "det_filter": ("dets",),
-    "seq_filter": ("dets",),
-    "target_crop": ("frame", "dets"),
-    "annotate": ("image", "dets"),
+# 设计器可连线端口 / validate_chain DAG 硬校验端口，**单一来源**：
+#   ① Pipeline.step 已纳入 inputs 解析的端口 = pipe.composer.RESOLVED_PORTS（唯一权威，
+#      与 step() 中 _port(...) 调用点一一对应；含 yolo/det_filter/seq_filter/target_crop/
+#      annotate/plate_recog/face_detect）；
+#   ② web 驱动层额外解析的端口 = _CHAIN_DRIVER_PORTS（不经 Pipeline.step）。
+# 别在本文件硬编码模块端口清单——改核心时同步 pipe.composer.RESOLVED_PORTS 即可。
+from pipe.composer import RESOLVED_PORTS as _COMPOSER_RESOLVED_PORTS  # noqa: E402
+_CHAIN_DRIVER_PORTS: dict = {
+    # vlm.dets：h_pipeline_run / h_pipeline_stream / h_chain 按 inputs 从 pipe.artifacts
+    # 取检测记录构造送审（见 _apply_vlm_inputs）；vlm.image 不开放（图片源统一由
+    # image_source 管，避免双机制——校验器对其报错）。
+    "vlm": ("dets",),
 }
-# 声明了 INPUTS 但本期未纳入解析的阶段（写了 inputs → 警告，不致命）。
-CHAIN_UNRESOLVED_INPUT_MODULES = ("vlm", "plate_recog", "face_detect", "extract_faces")
+CHAIN_RESOLVED_PORTS: dict = {**{m: tuple(p) for m, p in _COMPOSER_RESOLVED_PORTS.items()},
+                              **{m: tuple(p) for m, p in _CHAIN_DRIVER_PORTS.items()}}
 
 # module_id → (模块路径, 类名)：读取自描述 INPUTS/OUTPUTS 声明（惰性导入，纯声明不加载模型）
 _PORT_DECL_SOURCES = {
@@ -1537,6 +1611,15 @@ def artifact_types() -> dict:
     """产物名 → 类型（唯一来源：pipe.composer.ARTIFACT_TYPES）。"""
     from pipe.composer import ARTIFACT_TYPES
     return dict(ARTIFACT_TYPES)
+
+
+# 声明了 INPUTS 但未纳入解析的阶段（写了 inputs → 非致命警告，运行按默认取数）。
+# **推导**而非硬编码：取各模块自描述 INPUTS（module_port_decls）中不在 CHAIN_RESOLVED_PORTS
+# 的模块。本期全部已声明端口的模块均已解析（含 plate_recog/face_detect/vlm.dets）→ 为空元组；
+# 未来新增自描述模块而未同步解析时会自动进入此名单并触发警告。
+CHAIN_UNRESOLVED_INPUT_MODULES: tuple = tuple(sorted(
+    m for m, d in module_port_decls().items()
+    if d.get("inputs") and m not in CHAIN_RESOLVED_PORTS))
 
 
 def _chain_from_spec(spec: dict):
@@ -1785,6 +1868,7 @@ def h_pipeline_stream(write, params: dict) -> None:
                 continue
             dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo is not None else []
             subs, evs = pipe.step(n, ts, dets, frame=frame, force=True)
+            subs = _apply_vlm_inputs(pipe, subs)
             if vlm_feedback and pipe.vlm is not None:
                 for s in subs:  # 模拟回填（真实 VLM 见函数说明）
                     evs += pipe.publish([{"kind": "vlm", "label": vlm_action, "text": ""}], ts, n)
@@ -1906,6 +1990,7 @@ def h_chain(p: dict) -> dict:
             if pipe.yolo is not None:
                 dets = pipe.yolo.infer(frame, track=pipe.track_needed())
             subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
+            subs = _apply_vlm_inputs(pipe, subs)
             total_det += len(dets or [])
             total_plate += len(getattr(pipe, "last_plates", []))
             _step_out(n, ts, dets, subs, al)
@@ -1934,6 +2019,7 @@ def h_chain(p: dict) -> dict:
         canvas = frame.copy()
         _draw_tracks(canvas, dets or [])
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
+        subs = _apply_vlm_inputs(pipe, subs)
         for pl in getattr(pipe, "last_plates", []):
             px1, py1, px2, py2 = pl.bbox
             cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
@@ -1954,6 +2040,7 @@ def h_chain(p: dict) -> dict:
             dets = [Detection(track_id=start_track + t, cls_id=cls, bbox=(10, 10, 100, 200),
                               score=0.9, model_path="script") for t in range(count)]
             subs, al = pipe.step(frame_idx, ts, dets)
+            subs = _apply_vlm_inputs(pipe, subs)
             _step_out(frame_idx, ts, dets, subs, al)
     head = f"链路: {spec.get('name') or spec.get('description') or '未命名'}"
     return res(text=head + "\n" + "\n".join(log), images=images)
@@ -2058,6 +2145,11 @@ PARAMS = {
                          "help": "annotated=带框图（默认；无上游标注阶段时回退本帧原图）；"
                                  "frame=本帧原图；crops=与本次报送目标匹配的裁剪子图"
                                  "（匹配不到时回退 annotated/原帧，并记日志）"},
+        "image_pick": {"label": "送审张数（图集源）", "type": "select", "default": "first",
+                       "options": ["first", "all"],
+                       "help": "image_source=crops 且该类命中多个目标时：first=只送首张"
+                               "（默认，与改动前一致）；all=送该类全部对象的裁剪子图"
+                               "（OpenAI 兼容多图消息；端点支持待联调）"},
         "image": {"label": "测试图片（真实调用用）", "type": "file", "src": "img",
                   "test_only": True,
                   "help": "勾选真实大模型时，从这张图取素材发请求"},

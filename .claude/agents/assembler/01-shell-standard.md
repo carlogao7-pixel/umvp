@@ -82,16 +82,20 @@
 | `seq_filter` | 时序门控（检测流）+ 事件尾 | throttle、change、rules |
 | `target_crop` | 按上游检测框裁子图 | out_size、margin、classes、filter |
 | `annotate` | 帧上画检测框（供 VLM） | thickness、show_label、classes、filter |
-| `vlm` | 大模型研判（素材 + 推理） | max_resolution、image_source、prompt、use_real_vlm、vlm_endpoint/model/key |
+| `vlm` | 大模型研判（素材 + 推理） | max_resolution、image_source、image_pick、prompt、use_real_vlm、vlm_endpoint/model/key |
 | `plate_recog` | 车牌识别（消费车图） | detect_level、mode、margin、dedup_iou、track_dedup、track_cooldown |
 | `face_detect` | 人脸检测（消费人图） | device、det_thresh、det_size、max_num、use_crop、margin、dedup_iou |
 | `face_embed` | 人脸嵌入 | device |
 | `face_store` | 向量底库检索 | db_path、thresh、topk、device |
 
-**VLM 送审素材（`vlm.image_source`，连线相关）**：声明送审用哪张图——`annotated`（默认，＝带框图，
-无上游 `annotate` 时回退原帧）/ `frame`（本帧原帧）/ `crops`（与本次报送目标匹配的裁剪子图，
-**须链路同时含 `target_crop` 阶段**，按 bbox / IoU≥0.5 命中）。**缺省＝现状（零回归）；缺源一律回退、
-不报错**（`crops` 未命中 → `annotated` → 原帧）；参数细节见 `doc/modules/vlm.md`。
+**VLM 送审素材（`image_source` 选「哪张」× `image_pick` 选「几张」）**：
+- `vlm.image_source` ＝送审用**哪一类**图——`annotated`（默认，＝带框图，无上游 `annotate` 时回退
+  原帧）/ `frame`（本帧原帧）/ `crops`（与本次报送目标匹配的裁剪子图，**须链路同时含 `target_crop`
+  阶段**，按 bbox / IoU≥0.5 命中；按类报送时收集**该类全部命中对象**的子图＝图集）。
+- `vlm.image_pick` ＝从所选图源里送**几张**——`first`（默认，只送首张，与旧行为逐字等价）/ `all`
+  （送**图集全部**，多图 OpenAI 兼容 payload）。仅 `image_source=crops` 且该类命中多个目标时才有区别；
+  单图源下 `first`/`all` 等价。
+- **缺省＝现状（零回归）；缺源一律回退、不报错**（`crops` 未命中 → `annotated` → 原帧）；参数细节见 `doc/modules/vlm.md`。
 
 > **连线校验**：`validate_spec` 对非法取值报错，对「声明 `annotated` 但上游无 `annotate`」「声明
 > `crops` 但上游无 `target_crop`」给**警告**（非致命，缺源自会回退）。历史注脚：`target_crop + vlm`
@@ -124,6 +128,12 @@
 
 > 可用产物清单与类型以 `ARTIFACT_TYPES`（`pipe.composer`）为**唯一来源**，`validate_spec` / 设计器现取。
 
+**基数约定（记录 ↔ 图像）**：**记录数不随图片数膨胀**——一条记录需要多张图时，以「图集」（ndarray
+列表）放进该记录的 `image` 旁路，**不拆记录**；下游自行处理单图 / 图集（`records.image_of`＝单图语义，
+图集取首张、兼容既有调用；`records.image_set_of`＝集合语义，统一返回 list）。例：`target_crop.crops`＝
+记录 dict 列表（**每对象一条**，`image` 键存该对象子图）；VLM **按类报送**时，**一条记录携带该类命中
+对象的图集**，由送审端 `image_pick` 决定送 1 张还是 N 张。标注仍是一条记录一张图多框。
+
 **模块自描述（`INPUTS` / `OUTPUTS`）**：每个模块用类属性声明自己消费 / 产出的端口及类型
 （端口名 → 类型），供装配器、校验器、设计器读取：
 
@@ -149,13 +159,22 @@ class Annotator:
 - 端口类型须匹配（`Image` 端口不得喂 `Records`）→ 不符**报错**；
 - 引用必须是**上游**阶段产物（不能引用下游 / 自身）；值须为字符串（每端口单一上游）→ 违反**报错**。
 
-**本期未纳入 `inputs` 解析的端口**（写了 `inputs` 只会**警告**，运行时按**默认取数**，连线不生效）：
+**可连线端口清单（`RESOLVED_PORTS`，`pipe.composer` 唯一来源；设计器 / `validate_spec` 据此开放）**：
 
-- `vlm`——送审素材在**驱动层**消费，不在 `Pipeline.step` 内解析；
-- `plate_recog` / `face_detect` 等——消费上游裁剪**对象**，其形态本期待定。
+- `yolo.image`；`det_filter.dets`；`seq_filter.dets`；
+- `target_crop.frame` / `target_crop.dets`；`annotate.image` / `annotate.dets`；
+- **已纳入** `plate_recog.frame` / `plate_recog.crops`、`face_detect.frame` / `face_detect.crops`
+  （消费上游裁剪记录）；
+- `vlm.dets`（**仅此一个端口**）——决定「**报送哪些检测**」：`yolo.dets`＝筛选前全部检出 /
+  `det_filter.dets`＝筛选后（在驱动层解析，见下）。
 
-> 这些阶段仍可声明 `INPUTS/OUTPUTS`、仍参与其余断言，只是暂不响应 `inputs`（设计器仅对**已纳入解析**的
-> 端口开放连线）。后续纳入时再放开。
+> **`vlm.inputs.image` 不支持**——送审图片源统一由 `vlm.image_source`（选哪张）+ `image_pick`（送几张）
+> 管，避免"连线 + 参数"双机制；校验器对其**报错**并提示改用 `image_source`。
+
+**未纳入 `inputs` 解析的模块 = 本期为空**（所有声明了 `INPUTS` 的模块端口均已解析，含 `plate_recog` /
+`face_detect` / `vlm.dets`）。写了 `inputs` 仍按默认取数并给**警告**的机制**保留**给未来新增模块：
+推导名单 `CHAIN_UNRESOLVED_INPUT_MODULES`（`web_lab/server.py`）会自动纳入"声明了 `INPUTS` 但未同步
+解析"者；新模块接入时同步 `RESOLVED_PORTS` 即可（见 `03-patterns-and-extension.md`）。
 
 > **与参数的关系**：连线只决定"从上游取哪部分"，**不改变模块自身参数**；参数大全以 `list_modules` 现取为准，
 > 模块 I/O 字段级细节见 `doc/modules/INDEX.md`。新增模块如何被纳入见 `03-patterns-and-extension.md`。
@@ -196,14 +215,17 @@ class Annotator:
 - [ ] **输出事件** → 终段 `seq_filter.rules`（窗口 / 冷却 / 词表 / 动态事件名）或
       `det_filter.events`；VLM 结果由运行器 `publish()` 送入事件尾。**不要用 alarm/OutputPolicy**。
 - [ ] VLM 词表：`seq_filter.rules[].match`（如 `label in 治安类|交警类`）必须与 `vlm.prompt` 的输出词对齐。
-- [ ] VLM 送审素材：`vlm.image_source` 缺省 = `annotated`（零回归）；选 `crops` 须链路含 `target_crop`，
-      选 `annotated` 建议含 `annotate`（缺配套仅警告 / 回退，见 §2）。
+- [ ] VLM 送审素材：`image_source` 选**哪张**（缺省 `annotated`＝零回归；选 `crops` 须链路含 `target_crop`，
+      选 `annotated` 建议含 `annotate`），`image_pick` 选**几张**（缺省 `first`＝只送首张；`all`＝图集全部）；
+      缺配套仅警告 / 回退（见 §2）。
+- [ ] VLM 报送哪些检测：需要时用 `vlm.inputs.dets`（`yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后）；
+      **`vlm.inputs.image` 不支持**，图片源一律用 `image_source`。
 - [ ] 车牌链：`yolo.classes="2"` → `det_filter` → `target_crop(classes="2")` → `plate_recog`
       → 终段 `seq_filter(rules: kind==plate, cooldown<0)`。
 - [ ] 人脸链：`yolo.classes="0"` → `det_filter` → `target_crop(classes="0")` → `face_detect`（终段）。
 - [ ] 写了 `inputs` 连线时（§3）：产物在上游、类型匹配、端口已在模块 `INPUTS` 声明；**不写=现状**，
-      非必要不连；本期仅 `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效，
-      `vlm/plate_recog/face_detect` 写了只警告（按默认取数）。
+      非必要不连；本期可连线端口见 §3 清单（`yolo/det_filter/seq_filter/target_crop/annotate` +
+      **`plate_recog` / `face_detect`**；`vlm` 仅 `dets`）。
 - [ ] 用 `validate_spec` 工具自检，`0 error` 才算过。
 
 ## 6. 红线（旧概念，出现即错）

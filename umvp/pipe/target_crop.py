@@ -15,10 +15,15 @@
 并用 CropResult 的 offset/scale 把结果框还原回原图坐标。
 
 用法:
-    from pipe.target_crop import crop_targets
+    from pipe.target_crop import crop_targets, as_crop
     crops = crop_targets(frame, dets, scale=2.0, out_size="", classes=[2])
     for c in crops:
         ...  # c.img / c.bbox / c.offset / c.scale / c.track_id
+
+产物形态：`Pipeline.artifacts["target_crop.crops"]` 是该批裁剪的**记录 dict 列表**
+（每对象一条，`image`＝该对象单张子图；含 bbox/offset/scale/scale_x/scale_y/index 等键）；
+`Pipeline.last_crops` 仍是 CropResult **对象列表**（驱动层现路径在用）。下游用 `as_crop(x)`
+对"对象或记录"做类型归一，再走统一的 `img`/`bbox`/`to_original` 访问器。
 
 依赖: numpy, opencv-python
 """
@@ -26,6 +31,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -82,6 +88,41 @@ class CropResult:
             "size": [int(self.img.shape[1]), int(self.img.shape[0])],
             "index": self.index,
         }
+
+
+def as_crop(obj_or_rec) -> Optional["CropResult"]:
+    """把「裁剪对象（CropResult）」或「裁剪记录（dict）」统一为 CropResult 视图。
+
+    下游（人脸检测 / 车牌识别）由此既能消费对象列表（`Pipeline.last_crops`，现路径），
+    也能消费记录 dict 列表（`artifacts["target_crop.crops"]`，接线时来自产物端口）：
+
+      - 已是裁剪对象（具 `to_original`/`img`）→ **原样返回**（零拷贝，行为逐字不变）；
+      - 是记录 dict → 用其 `bbox`/`offset`/`scale`/`scale_x`/`scale_y` 等键**重建**
+        CropResult（子图取旁路键 `image`，`img` 兼容别名兜底）；缺失键走安全缺省；
+      - None → None；其它对象原样返回（交下游鸭子类型兜底）。
+
+    重建后 `to_original`/`kps_to_original` 与原对象逐字等价（字段同源）。
+    """
+    if obj_or_rec is None:
+        return None
+    if hasattr(obj_or_rec, "to_original") and hasattr(obj_or_rec, "img"):
+        return obj_or_rec
+    if isinstance(obj_or_rec, Mapping):
+        img = obj_or_rec.get("image")
+        if img is None:
+            img = obj_or_rec.get("img")
+        return CropResult(
+            img=img,
+            bbox=tuple(obj_or_rec.get("bbox") or (0, 0, 0, 0)),
+            offset=tuple(obj_or_rec.get("offset") or (0, 0)),
+            scale=float(obj_or_rec.get("scale") or 1.0),
+            cls_id=int(obj_or_rec.get("cls_id") if obj_or_rec.get("cls_id") is not None else -1),
+            score=float(obj_or_rec.get("score") or 0.0),
+            track_id=int(obj_or_rec.get("track_id") or 0),
+            index=int(obj_or_rec.get("index") or 0),
+            scale_x=obj_or_rec.get("scale_x"),
+            scale_y=obj_or_rec.get("scale_y"))
+    return obj_or_rec
 
 
 def _parse_out_size(text) -> Tuple[float, int, Optional[Tuple[int, int]]]:

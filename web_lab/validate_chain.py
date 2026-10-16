@@ -17,8 +17,11 @@
      这条正是「人脸链声明 det_filter 却静默不执行」事故（WO-0001）的回归测试。
   6) 端口连线（P5 第 2 步，设计稿 §3④）：各 stage 可选字段 inputs（{端口: 上游产物名}）
      DAG 校验——产物名须在 ARTIFACT_TYPES、端口须在该模块 INPUTS 声明、引用须指向上游阶段、
-     端口类型匹配、每端口单一上游（值须字符串）。对本期未纳入解析的阶段（vlm/plate_recog/
-     face_detect…）写了 inputs 只给非致命警告。未声明 inputs 的旧 spec 不报错不警告。
+     端口类型匹配、每端口单一上游（值须字符串）。**可连线端口清单与"未纳入解析"名单均
+     从 server.CHAIN_RESOLVED_PORTS（推导自 pipe.composer.RESOLVED_PORTS + 驱动层
+     vlm.dets）推导**，不再硬编码。`vlm.inputs` 只允许 `dets`（决定"报送哪些检测"）；
+     `vlm.inputs.image` 不接受（图片源统一由 vlm 参数 image_source 管，避免双机制），
+     校验器报错并提示改用 image_source。未声明 inputs 的旧 spec 不报错不警告。
   7) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
      - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
        （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
@@ -123,7 +126,8 @@ def _validate_stage_inputs(i: int, mid: str, st: dict, upstream: list,
       ④ 引用须指向上游阶段（同阶段/下游 → 错）；
       ⑤ 类型匹配：ARTIFACT_TYPES[产物] vs 模块 INPUTS[端口]（不匹配 → 错）。
     同一产物被多个下游引用**允许**（分支留路，不报警）。
-    对本期未纳入解析的阶段（vlm/plate_recog/face_detect…）：写了 inputs 只给非致命警告。
+    对本期未纳入解析的阶段（见 server.CHAIN_UNRESOLVED_INPUT_MODULES）：写了 inputs
+    只给非致命警告；本期该名单已为空（plate_recog/face_detect/vlm.dets 均已解析）。
     未声明 inputs（None/空）→ 不报错不警告（零回归）。
     """
     ins = st.get("inputs")
@@ -141,6 +145,13 @@ def _validate_stage_inputs(i: int, mid: str, st: dict, upstream: list,
         if art not in ARTIFACT_TYPES:
             errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用未知产物 {art!r}"
                         f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
+            continue
+        # vlm 仅开放 dets（决定"报送哪些检测"）；图片源统一由 image_source 管，避免双机制。
+        if mid == "vlm" and port != "dets":
+            hint = ("；图片源请改用 vlm 参数 image_source（annotated/frame/crops）"
+                    if port == "image" else "")
+            errs.append(f"stages[{i}] vlm.inputs 只允许端口 'dets'（报送检测集），"
+                        f"不接受 {port!r}{hint}")
             continue
         if port not in declared:
             errs.append(f"stages[{i}] {mid}.inputs 端口 {port!r} 未在该模块 INPUTS 声明中"

@@ -90,16 +90,22 @@ def decl_checks() -> None:
     check("decl: plate_recog 吃 frame:Image+crops:Records 出 plates:Records",
           decl["plate_recog"]["inputs"] == {"frame": "Image", "crops": "Records"}
           and decl["plate_recog"]["outputs"] == {"plates": "Records"})
-    # 本期已在 step() 纳入解析的端口集合（设计器开放连线 / 校验硬校验的依据）
-    check("decl: CHAIN_RESOLVED_PORTS 对齐已解析端口",
-          server.CHAIN_RESOLVED_PORTS == {"yolo": ("image",), "det_filter": ("dets",),
-                                          "seq_filter": ("dets",),
-                                          "target_crop": ("frame", "dets"),
-                                          "annotate": ("image", "dets")},
+    # 本期已纳入解析的端口集合（设计器开放连线 / 校验硬校验的依据）——**单一来源**：
+    # 推导自 pipe.composer.RESOLVED_PORTS（step 解析）+ 驱动层 vlm.dets，不再硬编码。
+    from pipe.composer import RESOLVED_PORTS as _COMPOSER_PORTS
+    check("decl: CHAIN_RESOLVED_PORTS 推导自 composer.RESOLVED_PORTS + 驱动层 vlm.dets",
+          server.CHAIN_RESOLVED_PORTS == {**{m: tuple(p) for m, p in _COMPOSER_PORTS.items()},
+                                          "vlm": ("dets",)},
           str(server.CHAIN_RESOLVED_PORTS))
-    check("decl: 未解析模块集合含 vlm/plate_recog/face_detect/extract_faces",
-          set(server.CHAIN_UNRESOLVED_INPUT_MODULES) == {"vlm", "plate_recog",
-                                                         "face_detect", "extract_faces"})
+    check("decl: plate_recog/face_detect 已纳入解析端口",
+          server.CHAIN_RESOLVED_PORTS.get("plate_recog") == ("frame", "crops")
+          and server.CHAIN_RESOLVED_PORTS.get("face_detect") == ("frame", "crops"),
+          str(server.CHAIN_RESOLVED_PORTS))
+    check("decl: vlm 仅开放 dets（image 走 image_source）",
+          server.CHAIN_RESOLVED_PORTS.get("vlm") == ("dets",))
+    check("decl: 未纳入解析名单已清空（全部已解析）",
+          server.CHAIN_UNRESOLVED_INPUT_MODULES == (),
+          str(server.CHAIN_UNRESOLVED_INPUT_MODULES))
     # 产物类型表覆盖 Pipeline 登记的全部产物常量
     check("decl: ARTIFACT_TYPES 覆盖全部登记产物常量",
           {ARTIFACT_FRAME, ARTIFACT_DETS, ARTIFACT_DET_FILTER_DETS, ARTIFACT_SEQ_FILTER_DETS,
@@ -295,6 +301,74 @@ def cli_checks() -> None:
     check("CLI: 非法 spec [ERR] 文案含产物名", "nope.dets" in out)
     check("CLI: 非法 spec 不出 [OK]", "[OK]" not in out)
 
+    # vlm.inputs.image 不开放（图片源走 image_source）→ 校验器拒绝（CLI exit=1）
+    vlm_spec = {"name": "qa-vlm", "stages": [
+        {"module_id": "frame_manager", "params": {"sampling": "analysis", "frame_skip": 1}},
+        {"module_id": "yolo", "params": {"model_path": "models/yolov8n.pt", "classes": "0"}},
+        {"module_id": "det_filter", "params": {"filter": ""}},
+        {"module_id": "annotate", "params": {"thickness": 2}},
+        {"module_id": "vlm", "params": {"use_real_vlm": False},
+         "inputs": {"image": "annotate.annotated"}},
+        {"module_id": "seq_filter", "params": {"throttle": "", "change": "", "rules": ""}},
+    ]}
+    code, out = _cli(vlm_spec)
+    check("CLI: vlm.inputs.image → exit=1 且提示 image_source",
+          code == 1 and "image_source" in out, f"exit={code} out={out.strip()[-100:]}")
+
+
+# ==================== 6. vlm.inputs.dets：报送检测集由产物决定（驱动层） ====================
+
+def _vlm_dets_spec(art: str | None) -> dict:
+    """fm→yolo→det_filter→vlm→seq_filter；按需给 vlm 注入 inputs.dets。"""
+    vlm_stage = {"module_id": "vlm", "params": {"use_real_vlm": False}}
+    if art is not None:
+        vlm_stage["inputs"] = {"dets": art}
+    return {"name": "qa-vlm-dets", "stages": [
+        {"module_id": "frame_manager", "params": {"sampling": "analysis", "frame_skip": 1}},
+        {"module_id": "yolo", "params": {"model_path": "models/yolov8n.pt", "classes": "0"}},
+        {"module_id": "det_filter", "params": {"filter": "score >= 0.5"}},
+        vlm_stage,
+        {"module_id": "seq_filter", "params": {"throttle": "", "change": "", "rules": ""}},
+    ]}
+
+
+_RAW_VLM = [
+    Detection(track_id=1, cls_id=0, bbox=(0, 0, 10, 10), score=0.9),
+    Detection(track_id=2, cls_id=0, bbox=(0, 0, 10, 10), score=0.2),  # 低于 0.5，筛选前在/后不在
+    Detection(track_id=3, cls_id=0, bbox=(0, 0, 10, 10), score=0.7),
+]
+
+
+def vlm_dets_checks() -> None:
+    def run(art):
+        pipe = server._chain_from_spec(_vlm_dets_spec(art))
+        subs, _ = pipe.step(0, 0.0, dets=list(_RAW_VLM), frame=object(), force=True)
+        subs = server._apply_vlm_inputs(pipe, subs)
+        return pipe, subs
+
+    # 默认（不声明 inputs）：step 内 submits（det_filter 过滤后 2 条）
+    p_def, s_def = run(None)
+    check("vlm-dets 默认: stage_inputs 为空（零回归）", p_def.stage_inputs == {})
+    check("vlm-dets 默认: 报送 = 过滤后 2 条",
+          sum(len(s.dets) for s in s_def) == 2, str([len(s.dets) for s in s_def]))
+
+    # vlm.inputs.dets = yolo.dets（筛选前 3 条）→ 送审检测数确实不同
+    p_raw, s_raw = run("yolo.dets")
+    check("vlm-dets: 声明透传为 stage_inputs",
+          p_raw.stage_inputs == {"vlm": {"dets": "yolo.dets"}}, str(p_raw.stage_inputs))
+    check("vlm-dets: yolo.dets 报送 3 条（含被筛掉的 0.2）",
+          sum(len(s.dets) for s in s_raw) == 3, str([len(s.dets) for s in s_raw]))
+    check("vlm-dets: yolo.dets 与默认送审检测数不同",
+          sum(len(s.dets) for s in s_raw) != sum(len(s.dets) for s in s_def))
+
+    # vlm.inputs.dets = det_filter.dets（筛选后 2 条）→ 与默认一致、与 yolo.dets 不同
+    p_fil, s_fil = run("det_filter.dets")
+    check("vlm-dets: det_filter.dets 报送 2 条",
+          sum(len(s.dets) for s in s_fil) == 2, str([len(s.dets) for s in s_fil]))
+    check("vlm-dets: det_filter.dets 与默认一致、与 yolo.dets 不同",
+          sum(len(s.dets) for s in s_fil) == sum(len(s.dets) for s in s_def)
+          and sum(len(s.dets) for s in s_fil) != sum(len(s.dets) for s in s_raw))
+
 
 def main() -> None:
     print("== 1. module_port_decls：模块自描述端口声明 ==")
@@ -307,6 +381,8 @@ def main() -> None:
     failfast_checks()
     print("== 5. CLI 退出码 ==")
     cli_checks()
+    print("== 6. vlm.inputs.dets：报送检测集由产物决定 ==")
+    vlm_dets_checks()
     print(f"\n全部通过: {PASS} 项断言")
 
 

@@ -48,9 +48,11 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 
 **阶段可选连线（`inputs`）**：阶段可加 `"inputs": {端口: 上游产物名}` 指定"从上游取哪一部分"
 （如 `"inputs": {"dets": "det_filter.dets"}`）；**不写 = 现状固定流水（零回归）**，非必要不连，
-每端口只接一个上游产物。本期仅 `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效；
-其余模块（`vlm` / `plate_recog` / `face_detect`）写 `inputs` 只给**警告**（按默认取数）。语法与校验见
-`01-shell-standard.md §3`。
+每端口只接一个上游产物。本期可连线端口：`yolo/det_filter/seq_filter/target_crop/annotate` ＋
+**`plate_recog` / `face_detect`**（消费上游裁剪）＋ `vlm.dets`（**仅此端口**，管"报送哪些检测"：
+`yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后）。**`vlm.inputs.image` 不支持**——图片源用
+`vlm.image_source` 选哪张 + `image_pick` 选几张（`first` 默认只送首张 / `all` 送图集全部）。语法与
+校验见 `01-shell-standard.md §3`。
 
 **三类固定数据流**（**运行顺序由壳固定**，不由 stages 数组顺序驱动）：
 

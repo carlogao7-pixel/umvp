@@ -43,9 +43,10 @@
 模块**一条记录需多图时，以「图集」（ndarray 列表）放进 `image` 旁路，不拆记录**；下游自行处理
 单图/图集（标注：一条记录 → 一张图多框，不受影响）。
 
-**本期连线范围**：`inputs` 解析已覆盖 `yolo.image`、`det_filter.dets`、`seq_filter.dets`、
-`target_crop.frame/dets`、`annotate.image/dets`；`vlm` / `plate_recog` / `face_detect` 暂按默认取数
-（写了 `inputs` 会由 `validate_chain` 给出**非致命警告**）。校验：未知产物 / 非法端口 / 非上游引用 /
+**本期连线范围**（唯一来源 `pipe.composer.RESOLVED_PORTS`）：`yolo.image`、`det_filter.dets`、
+`seq_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、**`plate_recog.frame/crops`**、
+**`face_detect.frame/crops`**；**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
+`inputs.image` 不支持）。校验：未知产物 / 非法端口 / 非上游引用 /
 类型不符 / 值非字符串 → 报错；同一产物被多个下游引用 → 允许（分支留路）。
 
 ## 一、主干生产者（向数据流放入新记录）

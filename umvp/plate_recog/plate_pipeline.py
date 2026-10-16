@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from pipe.composer import IntervalGate
+from pipe.target_crop import as_crop
 from plate_recog.plate_recognizer import PlateRecognizer, PlateResult, extract_plates
 
 
@@ -69,12 +70,17 @@ class PlateStage:
 
         crops=None → 无上游目标裁剪阶段，整帧直读；
         crops=[]   → 上游本帧无可裁目标（没检出车 / 被门控拦截），不识别。
+        crops 元素可为 CropResult **对象**（last_crops，现路径）或裁剪**记录 dict**
+        （artifacts["target_crop.crops"]，接线时）——入口经 as_crop 类型归一，行为逐字等价。
         """
         if self.mode == "direct" or crops is None:
             return self.plate.recognize(frame)
 
         keep = []
-        for c in crops:
+        for raw in crops:
+            c = as_crop(raw)
+            if c is None:
+                continue
             tid = int(getattr(c, "track_id", 0) or 0)
             if tid > 0 and self._gate is not None:
                 if not self._gate.allow(tid, ts):

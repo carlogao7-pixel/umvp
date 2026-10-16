@@ -38,6 +38,7 @@ from pipe.composer import (
     IntervalGate,
     Pipeline,
     PortResolutionError,
+    RESOLVED_PORTS,
     SAMPLING_ANALYSIS,
     SAMPLING_FRAME_COUNT,
     SAMPLING_WALL_CLOCK,
@@ -45,6 +46,8 @@ from pipe.composer import (
     compose,
 )
 from pipe.det_filter import DetFilter
+from pipe.records import image_of, image_set_of, to_record
+from pipe.target_crop import as_crop
 
 
 PASS = 0
@@ -384,5 +387,145 @@ e4 = _run_err(Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_
                        stage_inputs={"target_crop": {"frame": ARTIFACT_FRAME}}))
 check("端口未声明 → 报错含模块已声明端口", bool(e4) and "INPUTS" in e4 and "frame" in e4)
 # 零回归：非法声明只在被消费时触发；未声明 inputs 的旧链路完全不受影响（见 1-11 节全绿）
+
+# ============ 15. 图集契约：image_set_of / image_of 两读取器语义 ============
+print("== 15. 图集契约（records 读取器） ==")
+_a, _b = object(), object()
+check("image_set_of: 单图 → [图]（长度 1）", image_set_of({"image": _a}) == [_a])
+check("image_set_of: 图集 → 原样列表", image_set_of({"image": [_a, _b]}) == [_a, _b])
+check("image_set_of: 无旁路图 → []", image_set_of({}) == [])
+check("image_set_of: 兼容别名 img 也识别", image_set_of({"img": _a}) == [_a])
+check("image_of: 单图语义 → 该图", image_of({"image": _a}) is _a)
+check("image_of: 图集 → 首张（单图语义，兼容既有调用）", image_of({"image": [_a, _b]}) is _a)
+check("image_of: 无 → None", image_of({}) is None)
+
+# ============ 16. crops 产物记录化（记录 dict 列表，键齐全） ============
+print("== 16. crops 产物记录化 ==")
+class _CropObj:
+    """最小裁剪对象：与 CropResult 同形的几何字段 + to_original/kps_to_original。"""
+    def __init__(self, img, bbox, offset, scale, track_id=0, index=0):
+        self.img, self.bbox, self.offset = img, tuple(bbox), tuple(offset)
+        self.scale, self.scale_x, self.scale_y = float(scale), None, None
+        self.cls_id, self.score = 0, 0.9
+        self.track_id, self.index = track_id, index
+    def _s(self): return self.scale or 1.0
+    def to_original(self, bbox):
+        x1, y1, x2, y2 = bbox; ox, oy = self.offset; s = self._s()
+        return (int(round(x1 / s)) + ox, int(round(y1 / s)) + oy,
+                int(round(x2 / s)) + ox, int(round(y2 / s)) + oy)
+    def kps_to_original(self, kps):
+        ox, oy = self.offset; s = self._s()
+        return [((x / s) + ox, (y / s) + oy) for x, y in kps]
+
+class _CropGeom:
+    """桩目标裁剪：产带完整几何字段的对象（供 to_record → 记录 dict 列表）。"""
+    INPUTS = {"frame": "Image", "dets": "Records"}
+    OUTPUTS = {"crops": "Records"}
+    def __init__(self): self.outs = []
+    def run(self, frame, dets, ts=0.0):
+        self.outs = [_CropObj("IMG%d" % d.track_id, (0, 0, 8, 8), (2, 2), 2.0,
+                              track_id=d.track_id, index=i)
+                     for i, d in enumerate(dets or [])]
+        return self.outs
+
+_cg = _CropGeom()
+_pr = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_cg, det_filter=fdef)
+_pr.step(0, 0.0, frame=object(), force=True)
+_cr = _pr.artifacts[ARTIFACT_CROPS][0]
+_need = {"image", "bbox", "offset", "scale", "scale_x", "scale_y",
+         "cls_id", "score", "track_id", "index"}
+check("crops 产物元素是记录 dict（非对象）", isinstance(_cr, dict) and len(_pr.artifacts[ARTIFACT_CROPS]) == 1)
+check("crops 记录键齐全（image + 几何字段），供下游归一消费", _need <= set(_cr), str(sorted(_cr)))
+check("crops 记录 image＝该对象单张子图（旁路键统一）", _cr["image"] == "IMG0" and _cr["img"] == "IMG0")
+
+# as_crop：对象原样 / 记录重建，行为逐字等价
+_rec = to_record(_CropObj("IMG", (0, 0, 8, 8), (2, 2), 2.0, track_id=7, index=3))
+_orig = _CropObj("IMG", (0, 0, 8, 8), (2, 2), 2.0, track_id=7, index=3)
+_norm = as_crop(_rec)
+check("as_crop: 裁剪对象原样返回（零拷贝，现路径不变）", as_crop(_orig) is _orig)
+check("as_crop: 记录重建后 to_original 等价（同框同参）",
+      _norm.to_original((0, 0, 4, 4)) == _orig.to_original((0, 0, 4, 4)))
+check("as_crop: 记录重建后 kps_to_original 等价",
+      _norm.kps_to_original([(2, 2), (4, 4)]) == _orig.kps_to_original([(2, 2), (4, 4)]))
+check("as_crop: 重建保留 track_id/bbox/offset/scale",
+      _norm.track_id == 7 and tuple(_norm.bbox) == (0, 0, 8, 8)
+      and tuple(_norm.offset) == (2, 2) and _norm.scale == 2.0)
+
+# ============ 17. face/plate 的 crops 端口纳入 inputs 解析（默认零回归） ============
+print("== 17. face/plate crops 端口 inputs ==")
+class _SpyStage:
+    """桩识别阶段：记录收到的 crops，结果仅由归一后的几何决定（对象/记录应一致）。"""
+    INPUTS = {"frame": "Image", "crops": "Records"}
+    OUTPUTS = {"faces": "Records"}
+    def __init__(self): self.got = None; self.ret = None; self.frame_in = None
+    def run(self, frame, crops, ts=0.0):
+        self.got = list(crops or []); self.frame_in = frame
+        self.ret = [list(as_crop(c).to_original((0, 0, 4, 4))) for c in self.got]
+        return self.ret
+
+class _PlateRes:
+    """最小车牌结果（供 composer 车牌事件尾读字段）。"""
+    def __init__(self, geo):
+        self.plate_no = "P%s" % (geo,); self.score = 0.9
+        self.type_name = "t"; self.color = "c"; self.bbox = (0, 0, 1, 1)
+
+class _SpyPlate(_SpyStage):
+    """桩车牌阶段：composer 会读结果的 plate_no 等字段，故返回对象（几何仍归一）。"""
+    OUTPUTS = {"plates": "Records"}
+    def run(self, frame, crops, ts=0.0):
+        self.got = list(crops or []); self.frame_in = frame
+        self.ret = [list(as_crop(c).to_original((0, 0, 4, 4))) for c in self.got]
+        return [_PlateRes(g) for g in self.ret]
+
+_face_def, _face_in = _SpyStage(), _SpyStage()
+_pd = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_CropGeom(),
+               face=_face_def, det_filter=fdef)
+_frame_d = object()
+_pd.step(0, 0.0, frame=_frame_d, force=True)
+check("默认：face 收到对象列表（last_crops，零回归）",
+      _face_def.got and not isinstance(_face_def.got[0], dict))
+check("默认：face frame 端口＝本帧原图", _face_def.frame_in is _frame_d)
+check("默认：last_face_input 与 last_crops 一致（现状不变）",
+      _face_def.got == _pd.last_face_input and len(_pd.last_face_input) == len(_pd.last_crops))
+
+_pd2 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_CropGeom(),
+                face=_face_in, det_filter=fdef,
+                stage_inputs={"face_detect": {"crops": ARTIFACT_CROPS}})
+_pd2.step(0, 0.0, frame=object(), force=True)
+check("声明 inputs：face 收到记录 dict 列表（来自 artifacts）",
+      _face_in.got and isinstance(_face_in.got[0], dict))
+check("声明 inputs：face 结果与传对象时一致（同帧同参）", _face_in.ret == _face_def.ret)
+check("声明 inputs：last_face_input 记录实际收到的 crops（记录列表）",
+      _face_in.got == _pd2.last_face_input)
+
+_plate_def, _plate_in = _SpyPlate(), _SpyPlate()
+_pd3 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_CropGeom(),
+                plate=_plate_def, det_filter=fdef)
+_pd3.step(0, 0.0, frame=object(), force=True)
+check("默认：plate 收到对象列表（last_crops，零回归）",
+      _plate_def.got and not isinstance(_plate_def.got[0], dict))
+_pd4 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_CropGeom(),
+                plate=_plate_in, det_filter=fdef,
+                stage_inputs={"plate_recog": {"crops": ARTIFACT_CROPS}})
+_pd4.step(0, 0.0, frame=object(), force=True)
+check("声明 inputs：plate 收到记录 dict 列表", _plate_in.got and isinstance(_plate_in.got[0], dict))
+check("声明 inputs：plate 结果与传对象时一致（同帧同参）", _plate_in.ret == _plate_def.ret)
+
+# 未声明 crops 端口时，plate/face 的 frame 端口仍按现状默认
+_pd5 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=_CropGeom(),
+                plate=_SpyPlate(), det_filter=fdef,
+                stage_inputs={"plate_recog": {"crops": ARTIFACT_CROPS}})
+_f5 = object()
+_pd5.step(0, 0.0, frame=_f5, force=True)
+check("声明 crops 不动 frame 端口（仍默认本帧原图）", _pd5.plate.frame_in is _f5)
+
+# ============ 18. RESOLVED_PORTS 清单（web 段开放连线 / 校验的唯一来源） ============
+print("== 18. RESOLVED_PORTS ==")
+check("RESOLVED_PORTS：plate_recog/face_detect 的 frame+crops 已纳入解析",
+      RESOLVED_PORTS.get("plate_recog") == ("frame", "crops")
+      and RESOLVED_PORTS.get("face_detect") == ("frame", "crops"))
+check("RESOLVED_PORTS：既有端口保持（yolo/target_crop/annotate）",
+      RESOLVED_PORTS.get("yolo") == ("image",) and RESOLVED_PORTS.get("target_crop") == ("frame", "dets")
+      and RESOLVED_PORTS.get("annotate") == ("image", "dets"))
 
 print(f"\n全部通过: {PASS} 项断言")

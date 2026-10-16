@@ -34,6 +34,26 @@
 
 ## 记录
 
+### 2026-10-16(五) · WO-0003：记录↔图像基数约定（图集）落地 + VLM 送审图集与连线
+- 变更内容：①**基数约定**（用户确认）：记录数不随图片数膨胀——一条记录需多图时以**图集**
+  （ndarray 列表）挂 `image` 旁路，不拆记录；下游自行处理。落地：`records.image_set_of`
+  （集合语义）/ `image_of`（单图语义，图集取首张）；`artifacts["target_crop.crops"]` 改为
+  **记录 dict 列表**（每对象一条）；`target_crop.as_crop` 做对象/记录归一；`plate_recog` /
+  `face_detect` **纳入 `inputs` 解析**（端口唯一来源 `pipe.composer.RESOLVED_PORTS`）。
+  ②`vlm` 新增参数 **`image_pick`**（`first` 默认＝只送首张＝旧行为 / `all`＝送图集全部，多图
+  OpenAI 兼容 payload）；`image_source=crops` 收集该类**全部命中对象**子图；`vlm.inputs` 仅允许
+  `dets`（`yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后），`inputs.image` 报错并提示改用
+  `image_source`；校验器端口清单改从 `RESOLVED_PORTS` 推导（未纳入名单为空）。
+  ③文档：壳标准/决策表/两角色提示词/快照、`doc/modules/{vlm,INDEX}.md`、设计稿 §3⑥ 同步。
+- 影响面：**DB**（`vlm` 参数表新增 `image_pick` 列，随 schema 双向收敛在下次 `init_db`/重启时
+  自动补列）、配置（spec 新字段 `inputs`、`image_pick`）、结构（records/artifacts 契约）
+- 部署注意：换机拉代码重启即得；带 `image_pick` 的链路需 DB 完成补列（`init_db` 自动）；
+  **真实 VLM 端点对多图（`image_pick=all`）的支持待联调**（离线仅验证 payload 构造）。
+- 验证：`test_composer` 59→**85**、`test_image_source` 59→**73**、`test_port_inputs` 39→**49**、
+  `test_validate_chain` 30→**34**、`test_face_capture_pipeline` 63、`test_plate_recog_pipeline` 28、
+  `test_police_uav_pipeline` 全通过、`test_agent_runtime` 39；CLI 非法 spec `exit=1`。
+  **注：本单 qa 整单验收按用户要求延后**（子单 WO-0003.1/.2 状态＝待测试）。
+
 ### 2026-10-16(五) · 多代理协作基建入 git（.opencode/ + opencode.json）
 - 变更内容：`.opencode/`（agent/ 五代理定义、command/curate.md、memory/ 收件箱与工单、
   tool/ticket.py 工单工具、package*.json 插件依赖；node_modules/ 已内部 ignore）与根

@@ -223,7 +223,7 @@ def test_validate_legacy_signature_unchanged():
 # ---------------- 端口连线 inputs（P5 第 2 步 DAG 校验） ----------------
 # 模块 INPUTS/OUTPUTS 声明 + 产物类型表见 pipe.composer.ARTIFACT_TYPES / web_lab.server。
 # 规则逐条：①未知产物 ②非法端口 ③非上游/自引用 ④类型不符 ⑤值非字符串（列表）
-# ⑥同一产物多下游→允许 ⑦vlm/plate_recog/face_detect 写 inputs→警告不致命
+# ⑥同一产物多下游→允许 ⑦vlm.inputs 仅 dets（image→提示 image_source）
 # ⑧旧 spec（无 inputs）→ 无错无警告。
 
 _PORT_PARAMS = {
@@ -308,20 +308,60 @@ def test_inputs_same_artifact_multi_downstream_ok():
     assert errs == [] and w == [], (errs, w)
 
 
-def test_inputs_unresolved_modules_warn_not_fatal():
-    # ⑦ vlm/plate_recog/face_detect 本期不解析 inputs → 有警告无 error（按默认取数）
-    # vlm：fm→yolo→det_filter→vlm→seq_filter
-    mods_vlm = ["frame_manager", "yolo", "det_filter", "vlm", "seq_filter"]
-    errs, w = _warns(_port_chain({"vlm": {"image": "frame_manager.frame"}}, mods_vlm))
-    assert errs == [] and any("vlm" in x and "不解析" in x for x in w), (errs, w)
-    # plate_recog：fm→yolo→det_filter→target_crop→plate_recog
+def test_inputs_newly_resolved_modules_ok_and_checked():
+    # plate_recog/face_detect 本期已纳入解析：合法连线零 error 零 warning；
+    # 非法连线走既有 DAG 规则报错（不再只给警告）。
     mods_plate = ["frame_manager", "yolo", "det_filter", "target_crop", "plate_recog"]
+    errs, w = _warns(_port_chain({"plate_recog": {"crops": "target_crop.crops"}}, mods_plate))
+    assert errs == [] and w == [], (errs, w)
     errs, w = _warns(_port_chain({"plate_recog": {"frame": "frame_manager.frame"}}, mods_plate))
-    assert errs == [] and any("plate_recog" in x and "不解析" in x for x in w), (errs, w)
-    # face_detect：fm→yolo→det_filter→target_crop→face_detect
+    assert errs == [] and w == [], (errs, w)
+    # 类型不符（crops:Records 喂 frame:Image）
+    errs, _ = _warns(_port_chain({"plate_recog": {"frame": "target_crop.crops"}}, mods_plate))
+    assert any("类型不符" in e for e in errs), errs
+    # 未知产物
+    errs, _ = _warns(_port_chain({"plate_recog": {"crops": "nope.crops"}}, mods_plate))
+    assert any("未知产物" in e for e in errs), errs
+
     mods_face = ["frame_manager", "yolo", "det_filter", "target_crop", "face_detect"]
-    errs, w = _warns(_port_chain({"face_detect": {"frame": "frame_manager.frame"}}, mods_face))
-    assert errs == [] and any("face_detect" in x and "不解析" in x for x in w), (errs, w)
+    errs, w = _warns(_port_chain({"face_detect": {"crops": "target_crop.crops"}}, mods_face))
+    assert errs == [] and w == [], (errs, w)
+    errs, _ = _warns(_port_chain({"face_detect": {"frame": "target_crop.crops"}}, mods_face))
+    assert any("类型不符" in e for e in errs), errs
+
+
+def test_inputs_vlm_dets_ok():
+    # vlm.dets 已开放（驱动层据 artifacts 构造送审）：det_filter.dets / yolo.dets 均合法。
+    mods = ["frame_manager", "yolo", "det_filter", "vlm", "seq_filter"]
+    errs, w = _warns(_port_chain({"vlm": {"dets": "det_filter.dets"}}, mods))
+    assert errs == [] and w == [], (errs, w)
+    errs, w = _warns(_port_chain({"vlm": {"dets": "yolo.dets"}}, mods))
+    assert errs == [] and w == [], (errs, w)
+    # 非上游（det_filter 在 vlm 之前，yolo 也在前；改用下游 seq_filter.dets 应报"非上游"）
+    errs, _ = _warns(_port_chain({"vlm": {"dets": "seq_filter.dets"}}, mods))
+    assert any("不是上游产物" in e for e in errs), errs
+
+
+def test_inputs_vlm_image_rejected_hint_image_source():
+    # vlm.image 不开放（图片源统一由 image_source 管）→ error 并提示改用 image_source
+    mods = ["frame_manager", "yolo", "det_filter", "annotate", "vlm", "seq_filter"]
+    errs, w = _warns(_port_chain({"vlm": {"image": "annotate.annotated"}}, mods))
+    assert any("只允许端口 'dets'" in e and "image_source" in e for e in errs), errs
+    assert w == [], w
+
+
+def test_inputs_vlm_other_port_rejected():
+    # vlm 其余端口（如 frame）同样报错（无 image_source 提示）
+    mods = ["frame_manager", "yolo", "det_filter", "vlm", "seq_filter"]
+    errs, w = _warns(_port_chain({"vlm": {"frame": "frame_manager.frame"}}, mods))
+    assert any("只允许端口 'dets'" in e and "'frame'" in e for e in errs), errs
+    assert w == [], w
+
+
+def test_inputs_unresolved_list_empty():
+    # 未纳入解析名单本期为空（plate_recog/face_detect/vlm.dets 均已解析）
+    import server
+    assert server.CHAIN_UNRESOLVED_INPUT_MODULES == (), server.CHAIN_UNRESOLVED_INPUT_MODULES
 
 
 def test_inputs_old_spec_no_error_no_warn():

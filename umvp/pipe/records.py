@@ -7,8 +7,11 @@
             frame_idx（帧序号）
   通用字段（跨模块同名同义）：bbox / score / cls_id / track_id / label / text
   旁路字段（允许挂在记录上、约定不序列化）：**image**（ndarray 子图/帧；**或 ndarray 列表＝图集**：
-           一条记录需多图时以**集合**形式携带，**不拆记录**——下游自行处理单图/图集；基数约定见
-           doc/design/assembly_ports.md §3⑥）、
+            一条记录需多图时以**集合**形式携带，**不拆记录**——下游自行处理单图/图集；基数约定见
+            doc/design/assembly_ports.md §3⑥）。
+            读取器两个，语义有别：**image_of(rec)**＝单图语义（图集时取首张，兼容既有调用）；
+            **image_set_of(rec)**＝集合语义（统一返回 list：单图→[图]；图集→原样；无→[]）——下游要
+            消费"整条记录的图片集合"用后者）、
              embedding（向量）——像素与向量不进 JSON
              · 记录旁路图像统一键名 = image；历史模块自造键为**兼容别名**，
                经 to_record 转换时自动补 image（旧键保留，新旧并存）：
@@ -43,8 +46,12 @@ IMAGE_KEY = "image"
 IMAGE_ALIASES = ("img", "face_img", "plate_img")  # target_crop / face_detect / plate_recog
 
 
-def image_of(rec) -> Any:
-    """从记录/dict 取旁路图：优先 image，回退兼容别名；都没有返回 None。"""
+def _raw_image(rec) -> Any:
+    """取记录旁路图**原始值**（可能为单图 ndarray，也可能为图集 list[ndarray]）。
+
+    优先 image，回退兼容别名（img/face_img/plate_img）；都没有返回 None。
+    dict 走键取值，对象走属性取值。
+    """
     if isinstance(rec, Mapping):
         for k in (IMAGE_KEY, *IMAGE_ALIASES):
             v = rec.get(k)
@@ -56,6 +63,33 @@ def image_of(rec) -> Any:
         if v is not None:
             return v
     return None
+
+
+def image_of(rec) -> Any:
+    """从记录/dict 取旁路图——**单图语义**（兼容既有调用）。
+
+    单图 → 返回该图；图集（list[ndarray]）→ 返回**首张**；无 → None。
+    需要消费整条记录的图集请用 image_set_of（集合语义）。
+    """
+    v = _raw_image(rec)
+    if isinstance(v, (list, tuple)):
+        return v[0] if v else None
+    return v
+
+
+def image_set_of(rec) -> List[Any]:
+    """从记录/dict 取旁路图——**集合语义**：统一返回 list（供下游按集合消费）。
+
+    单图 → [图]（长度 1）；图集（list[ndarray]）→ 原样列表；无 → []。
+    与 image_of（单图语义：图集时取首张）的区别即"整条记录的图集 vs 一张图"；
+    基数约定见 doc/design/assembly_ports.md §3⑥（记录数不随图片数膨胀）。
+    """
+    v = _raw_image(rec)
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return [v]
 
 
 def _unify_image_key(rec: dict) -> dict:

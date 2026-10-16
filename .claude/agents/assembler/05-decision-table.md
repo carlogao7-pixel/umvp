@@ -18,9 +18,20 @@
 
 > 模块与参数白名单以 `list_modules` 现取为准；本表只给组合骨架与方向。
 
-**VLM 送审素材（`vlm.image_source`）**：默认 `annotated`（带框图，＝现状）；要 VLM 看原帧用 `frame`；
-要它只看目标子图用 `crops`（该组合须同时含 `target_crop`，即上表"行为研判"行可加一段 `target_crop`）。
-缺省不变、缺源回退，细节见 `doc/modules/vlm.md` 与 `01-shell-standard.md §2`。
+**VLM 送审素材（`image_source` 选「哪张」× `image_pick` 选「几张」）**：
+默认 `image_source=annotated`（带框图，＝现状）；要 VLM 看原帧用 `frame`；要它只看目标子图用 `crops`
+（该组合须同时含 `target_crop`，即上表"行为研判"行可加一段 `target_crop`）。`crops` 按类报送时收集
+**该类全部命中目标**的子图（图集），`image_pick` 决定送 1 张还是 N 张：
+
+| `image_source` | 场景 → `image_pick` |
+|---|---|
+| `annotated`（默认） | 一般行为研判 / 场景级判断——送整帧带框图；单图源，`first`（`all` 等价） |
+| `frame` | 需看原始画面（无框遮挡）——单图源，`first` |
+| `crops` + `first`（默认） | **单主体 / 成本敏感**：只送该类**首张**子图，省 token（＝旧行为，零回归） |
+| `crops` + `all` | **多主体同帧需逐一看清**（多车牌 / 多人行为）：送该类**全部**子图（多图 payload） |
+
+> 缺省不变、缺源回退，细节见 `doc/modules/vlm.md` 与 `01-shell-standard.md §2`。**取哪张用
+> `image_source`、取几张用 `image_pick`；`vlm.inputs.image` 不支持**（图片源统一走 `image_source`）。
 
 **产物连线（`inputs`）用法**（端口协议，见 `01-shell-standard.md §3`）：默认各阶段已按**固定流水**接好
 （`det_filter` / `seq_filter` ← `dets`，`target_crop` / `annotate` ← `frame` + `dets`），
@@ -30,10 +41,16 @@
   节流 / 变化）；不写则 annotate 吃检测流末端（det_filter → seq_filter 之后）。
 - `annotate.dets = yolo.dets` → 画**筛选前**的原始检出（调试图省 / 看漏检）。
 - `target_crop.dets = yolo.dets` → 按**原始检出**裁剪（跳过 `det_filter` 有效性筛选）。
+- **VLM 两旋钮正交**：`image_source` 管**送哪张图**，`vlm.inputs.dets` 管**报送哪些检测**（决定按哪些
+  目标报送、从而决定 `crops` 命中谁）——组合示例：
+  - `image_source=crops` + `vlm.inputs.dets = yolo.dets` → 对**筛选前全部检出**逐个裁子图送审
+    （不写 `dets` 则用筛选后）；配 `image_pick=all` 把该类全部目标子图一次送审。
+  - `image_source=crops` + `vlm.inputs.dets = det_filter.dets` → 只对**有效性筛选后**的目标裁子图送审。
 
-> **多数场景无需连线**（默认即现状）；端口与类型以模块 `INPUTS/OUTPUTS` 声明为准。本期仅
-> `yolo/det_filter/seq_filter/target_crop/annotate` 的端口生效，`vlm/plate_recog/face_detect` 写
-> `inputs` 只会**警告**、运行时按默认取数。
+> **多数场景无需连线**（默认即现状）；端口与类型以模块 `INPUTS/OUTPUTS` 声明为准。本期可连线端口：
+> `yolo/det_filter/seq_filter/target_crop/annotate` ＋ **`plate_recog`/`face_detect`**（消费上游裁剪）
+> ＋ `vlm.dets`（**仅此端口**；`vlm.inputs.image` 不支持）；未纳入解析名单现为**空**。详见
+> `01-shell-standard.md §3`。
 
 ## 2. YOLO 检测 / 跟踪参数初值（实测，2026-08-12）
 

@@ -124,7 +124,9 @@ class Annotator:
 
 > 落地含义：`image_source=crops` 在按类报送下应产出**该类全部对象的子图集合**（图集），
 > 而非"首个命中"；送审端可单图（取集合首张，现状语义）或图集（多图 payload），
-> 由下游决定。该条并入 WO-0003 落地。
+> 由下游决定。**✅ 已落地（2026-10-16，WO-0003）**：`records.image_set_of` / `image_of`、
+> `artifacts["target_crop.crops"]` 记录化、`target_crop.as_crop` 归一、`plate_recog`/`face_detect`
+> 纳入 `inputs`、`vlm.image_pick`（first 默认/all 图集）与 `vlm.inputs.dets`；整单 qa 验收待办。
 
 ## 4. 分步实施（每步独立可交付、可回归）
 

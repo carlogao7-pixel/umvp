@@ -23,12 +23,14 @@
 
 | 编号 | 日期 | 发起人 | 承接 | 需求/改动描述 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
-| WO-0003 | 2026-10-16 | orchestrator | pipe-chain,web | 收尾项：vlm / plate_recog / face_detect 的 inputs 端口接线（前置：统一 crops 产物形态——现为对象 last_crops vs 记录 dict 两套） | 三模块端口可被 spec 声明连线；默认仍为现状；回归全绿 | 来源 WO-0002 遗留①。用户 2026-10-16 指示：记录待办（暂不派发）。crops 形态统一后即可接线；2026-10-16 用户补充基数约定：记录数不随图片数膨胀；一条记录需多图时用图集（ndarray 列表）挂 image 旁路，不拆记录；下游自行处理集合。③「crops 多目标只取首图」按此约定落地=该类记录携带图集，送审端决定单图/多图。约定已写入 design/assembly_ports.md §3⑥、records.py 契约、modules/INDEX.md |
 
 ## 待测试
 
 | 编号 | 日期 | 发起人 | 承接 | 需求/改动描述 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
+| WO-0003.2 | 2026-10-16 | web | web | 第2段（web）：图集送审 image_pick（first 默认零回归/all 多图）+ vlm.inputs.dets 接线 + 端口清单单一来源 | py_compile server/validate_chain; test_validate_chain=34; test_image_source=73; test_port_inputs=49; test_face_capture=63; test_composer=85; test_police_uav=全通过; test_plate_recog=28 | 第2段（web）完成：图集送审 image_pick（first 默认零回归/all 多图）+ vlm.inputs.dets 接线 + 端口清单单一来源。断言数：validate_chain 30→34、image_source 59→73、port_inputs 39→49、face_capture 63、composer 85、police_uav 全通过、plate_recog 28。进程内证据：image_pick 缺省==显式 first 逐像素一致；all 捕获多图列表（长度=该类命中数）与 OpenAI 兼容多图 payload；vlm.inputs.dets=yolo.dets 送审 3 条 vs =det_filter.dets 2 条；vlm.inputs.image 校验器拒绝并提示 image_source。待真实端点联调：多图 payload 端点支持。；待 qa 验收（延后）；实现与自测见 INB-0031，image_source 59→73 / port_inputs 39→49 / validate_chain 30→34 |
+| WO-0003.1 | 2026-10-16 | pipe-chain | pipe-chain | 第1段：图集契约 image_set_of + crops 记录化 + face/plate 纳入 inputs 解析（默认零回归） | umvp/pipe/test_composer.py=85; tests/test_target_crop.py=35; tests/test_cropper.py=26; tests/test_face_capture_pipeline.py=63; tests/test_face_extract_pipeline.py=28; tests/test_plate_recog_pipeline.py=28; tests/test_police_uav_pipeline.py=全通过; tests/test_image_source.py=59; tests/test_port_inputs.py=39; tests/test_validate_chain.py=30 | 待 qa 验收（延后）；实现与自测见 INB-0030，test_composer 59→85 |
+| WO-0003 | 2026-10-16 | orchestrator | pipe-chain,web | 收尾项：vlm / plate_recog / face_detect 的 inputs 端口接线（前置：统一 crops 产物形态——现为对象 last_crops vs 记录 dict 两套） | 三模块端口可被 spec 声明连线；默认仍为现状；回归全绿 | 来源 WO-0002 遗留①。用户 2026-10-16 指示：记录待办（暂不派发）。crops 形态统一后即可接线；2026-10-16 用户补充基数约定：记录数不随图片数膨胀；一条记录需多图时用图集（ndarray 列表）挂 image 旁路，不拆记录；下游自行处理集合。③「crops 多目标只取首图」按此约定落地=该类记录携带图集，送审端决定单图/多图。约定已写入 design/assembly_ports.md §3⑥、records.py 契约、modules/INDEX.md；第1段（pipe-chain）完成：图集契约 image_set_of + crops 记录化 + face/plate 纳入 inputs 解析（默认零回归）。test_composer 59→85 断言；face_capture 63 / face_extract 28 / plate_recog 28 / target_crop 35 / cropper 26 / image_source 59 / port_inputs 39 / validate_chain 30 / police_uav 全通过。子单 WO-0003.1 待测试。；第2段（web）完成：图集送审 image_pick（first 默认零回归/all 多图）+ vlm.inputs.dets 接线；断言数 validate_chain 34 / image_source 73 / port_inputs 49 / face_capture 63 / composer 85 / police_uav 全通过 / plate_recog 28。子单 WO-0003.2 待测试。；另：图集/image_pick/vlm 接线已写入壳标准与技术文档（agent-builder 段）；2026-10-16 收尾：三段（.1 pipe-chain 图集契约/形态统一 / .2 web 图集送审+vlm接线 / 文档 agent-builder 壳标准提示词快照）均已实现，子单待测试；**qa 整单验收按用户要求延后**（用户原话：先收个尾，晚点验收）。DEPLOYMENT 台账已记 |
 
 ## 已完成
 

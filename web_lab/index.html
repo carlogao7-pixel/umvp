@@ -889,8 +889,8 @@ function upstreamArtifacts(stageIndex){
   return out;
 }
 
-// 渲染某阶段的「输入连线」区：只对 resolved_ports（本期已纳入解析的端口）开放连线；
-// 未开放端口（vlm/plate_recog/face_detect）给出说明，不渲染下拉。
+// 渲染某阶段的「输入连线」区：只对 resolved_ports（后端 CHAIN_RESOLVED_PORTS：Pipeline.step
+// 解析的端口 + 驱动层 vlm.dets）开放连线；未开放端口给出说明，不渲染下拉。
 function renderWiring(stageEl){
   const box = stageEl.querySelector(".stage-wiring");
   if (!box) return;
