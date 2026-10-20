@@ -34,6 +34,84 @@
 
 ## 记录
 
+### 2026-10-20(二) · WO-0010：代理模型免重启切换（frontmatter 去 model + 项目默认配置 + 切换脚本/模型页签）
+- 变更内容：①五份 .opencode/agent/*.md 删除 frontmatter model 行；②新增项目级 .opencode/opencode.json（$schema + model=zai-coding-plan/glm-5.2）作为默认模型；③新增 .opencode/tool/agent_model.py（show/set/clear/default）；④ticketd 新增「模型」页签与 /api/models 系列端点，配置项 models_tab（默认 true）；⑤CLAUDE.md §四模型条款、各 agent 正文、doc/guides/ticketd_service.md 同步。
+- 影响面：**配置**、**入口**
+- 部署注意：生效语义：会话内 /model 即时生效且子代理跟随（零重启）；agent_model/页签改配置后新会话生效。换机/新克隆：确保 .opencode/opencode.json 存在（缺失则代理回落到全局 config model）。其它项目复用 ticketd 可设 models_tab=false 关闭页签（但 models_tab=true 时页签读写的是运行机器上的真实 agent 目录，非本项目）。
+- 验证：agent_model.py --self-test 52 断言；ticket_web.py --self-test 184 断言；node --check tickets.html script OK；真实实例 GET /api/models 正常；ticket.py check 32 条
+
+### 2026-10-20(二) · WO-0009：工单看板新增收件箱/部署台账页签 + ledger 统一记录 CLI（ticketd 新配置字段）
+- 变更内容：①ticketd（.opencode/tool）新增「收件箱」「部署台账」两页签与 6 个 REST 端点（/api/inbox 系列、/api/deployment 系列、/api/entry 统一编号查询）；②新增 ledger.py 统一记录 CLI：按编号（INB/WO/DEP）取单条、list 筛选、append 追加（INB 自动编号/台账四字段）、move 流转；③ticketd 配置新增 inbox_file/deployment_file（null/缺省=隐藏页签与 API，向后兼容），install_ticketd.sh 幂等补键；④ticket.py new 主单强制 --business/--approach（描述两段式前缀），check 对在办主单缺前缀告警。
+- 影响面：**入口**、**配置**
+- 部署注意：本机 ticketd@umvp 已重启并启用两页签；其它项目实例不配置两字段则零影响；代理取记录改用 ledger get 按编号（如 ledger.py get INB-0049），不再读整个 inbox.md。
+- 验证：ticket_web.py --self-test 166 断言全绿；ticket.py check 31 条全绿；CLI 差分 29 用例除 3 个主单用例（--business 强制，有意）外逐字一致
+
+### 2026-10-19(一) · WO-0008：图编排 P2-0+P2-1（同模块复用 + 连线一等公民，DB 新增 2 表）
+- 变更内容：
+  1) **节点实例身份**（P2-0）：产物全名改为 `{module_id}#{position}.{artifact}`（短名在唯一实例时可解析，多实例歧义报错不猜）；`Pipeline.stage_inputs` 键由 `module_id` 改为位置串 `"#<position>"`；`composer.resolve_artifact()` 为产物名解析的**单一实现**（`web_lab` 侧复用）。解除「同链路每模块最多一次」的四道锁（单插槽 / 装配取首 / 校验器 / `save_pipeline`），同模块多实例按位置升序链式执行；**执行顺序本期不变**（仍按 `Pipeline.step()` 既有顺序，spec 顺序不驱动执行）。
+  2) **连线入库**（P2-1）：新增 `pipeline_edges`（连线，位置键 + 产物全名 + `edge_seq`）与 `module_ports`（端口能力目录，代码声明为真相源、启动 upsert）两表；`save_pipeline` 在**同一事务**内随 `pipeline_steps` 重建 `pipeline_edges` 并**双写** `meta_json.stage_inputs`；读取优先级 `edges > meta > 代码默认`，`load_pipeline` 回填后与只读 meta 逐字节一致；写入期按 `module_ports.fan_in` 校验「单上游端口不接受第二条入边」。
+  3) 新增迁移脚本 `web_lab/migrate_stage_inputs.py`（`--dry-run` / `--only`，幂等；旧 `module_id` 键遇多实例返回 1 并跳过，要求人工确认）。
+  4) 设计稿 `doc/design/graph_chain.md`；P2-2（拓扑驱动执行）/P2-3（merge/join/to_images/split 过渡节点）/P2-4（vlm 通用化 + 图编辑画布）为后续期。
+- 影响面：DB（新增 `pipeline_edges` / `module_ports` 两张表）、配置（产物名与 `stage_inputs` 键形状变化，旧 spec 零回归）、入口（新增迁移脚本）
+- 部署注意：启动 `web_lab/server.py` 时 `init_db()` **自动建表**，`module_ports` 自动 upsert（21 行）；已有库无需手工 DDL，如需把历史 `meta.stage_inputs` 落到新表可跑 `conda run -n ai python web_lab/migrate_stage_inputs.py --dry-run` 先看，再去掉 `--dry-run`。三条保留链路未显式声明连线，`pipeline_edges` 为 0 行属正常（默认取数仍属代码契约）。
+- 验证：`umvp/pipe/test_composer.py` 108 / `tests/test_port_inputs.py` 59 / `tests/test_validate_chain.py` 34 / `web_lab/test_graph_chain.py` 44 / `tests/test_image_source.py` 73 / `test_target_crop` 35 / `test_cropper` 26 / `test_annotate` 16 / `test_det_filter` 66 / `test_seq_filter` 43 / `test_face_capture` 63 / `test_face_extract` 28 / `test_plate_recog` 28 / `test_police_uav_pipeline` 全通过 / `selfcheck_vlm_env` 34 / `test_agent_runtime` 39 / `test_video_transcode` 18；另做独立验收 25 项（多实例独立生效、连线不覆盖、校验器放行/拒绝、DB 往返逐字节一致、删阶段重排、迁移幂等与拒绝猜测）全过。
+
+### 2026-10-19(一) · WO-0006：真实 VLM 端点支持环境变量注入（VLM_*，兼容 GLM_API_KEY）
+- 变更内容：`web_lab/server.py` 的 `_vlm_real` 端点/模型/key 三项解析改为
+  「**环境变量优先 → 链路 spec 阶段参数 → 内置默认**」：新增 `VLM_ENDPOINT` / `VLM_MODEL` /
+  `VLM_API_KEY`（key 兼容别名 `GLM_API_KEY`，两者都设时 `VLM_API_KEY` 优先），
+  **不设任何 env 时逐字零回归**（端点仍 `http://117.42.21.253:8000/v1/chat/completions`、
+  模型仍 `qwen3-vl-32b`）；端点 4xx（401/403 鉴权、429 限额）抛 `VlmHttpError` 并给**中文可读提示**，
+  链路内**每轮最多提示一条**（不逐帧刷屏），原有「连续失败≥3 改用素材包」行为不变；
+  `PARAMS["vlm"]` 三项 help 注明 env 优先、`vlm_key` 注明「会入库，建议改用环境变量」。
+  新增自检脚本 `web_lab/selfcheck_vlm_env.py`（34 项断言，任意 cwd 可跑）。
+- 影响面：**环境变量**（新增 `VLM_ENDPOINT` / `VLM_MODEL` / `VLM_API_KEY`（兼容 `GLM_API_KEY`））、
+  **入口**（新增自检脚本 `web_lab/selfcheck_vlm_env.py`）
+- 部署注意：要用外部 VLM 端点（如智谱开放平台）时，**导出环境变量后重启 web_lab 即全场切换**，
+  不必改 DB 链路；不导出则行为与改动前完全一致。**API key 只走环境变量，勿写入仓库或链路 spec**
+  （spec 的 `vlm_key` 仍保留为回退，会入库）。已实测可用的组合：
+  `VLM_ENDPOINT=https://open.bigmodel.cn/api/paas/v4/chat/completions`、`VLM_MODEL=glm-4v-flash`
+  （免费视觉模型，单图与多图 payload 均支持，1.6–4.6 s/帧 @1280×720）；付费的 `glm-4.5v` / `glm-4.6v`
+  当前账号无资源包（429 code 1113），免费的 `glm-4.6v-flash` 持续 429 code 1305（服务端过载）。
+- 验证：`py_compile web_lab/server.py` OK；`selfcheck_vlm_env.py` 34 断言全绿；qa 独立验收 50 条自研断言
+  （零回归差分 11/11、优先级 10 项、实发请求 spy 12 项、4xx 语义 12 项、提示去重、密钥扫描 371 文件 0 命中）；
+  回归 `test_image_source.py`=73 / `test_validate_chain.py`=34 / `test_port_inputs.py`=49 /
+  `test_police_uav_pipeline.py` 全通过；真实端点冒烟（spec 故意给老端点，仅靠 env 覆盖）→ GLM 200 返回非空。
+
+### 2026-10-19(一) · WO-0005：ticketd 工单看板常驻服务（systemd user 级，一份代码多项目）
+- 变更内容：工单看板从"手动跑脚本"升级为**本机常驻服务**。
+  ①新增 `.opencode/tool/install_ticketd.sh`（幂等安装器）：生成配置
+  `~/.config/ticketd/<项目名>.json`、systemd **user** 模板 unit
+  `~/.config/systemd/user/ticketd@.service`、包装脚本 `~/.local/bin/ticketd`，
+  然后 `daemon-reload` + `enable --now`；含端口冲突检测（配置重复 exit 3 / 端口占用 exit 4）、
+  `--uninstall`（保留配置）、`--force`、`--no-start`。
+  ②`ticket.py` / `ticket_web.py` / `tickets.html` **参数化**：配置优先级
+  `CLI 参数 > 环境变量 TICKET_CONFIG（兼容 TICKETD_CONFIG） > ~/.config/ticketd/<name>.json（尊重 XDG_CONFIG_HOME） > 内置默认`；
+  可配 `file / host / port / title / statuses / agents / readonly`；服务入口新增 `--config/--name`、
+  web 新增 `/api/meta`（标题/状态/代理由后端注入，前端去掉 UMVP 硬编码）；`readonly:true` 实例禁用全部写操作。
+  ③`ticket.py` 默认工单文件改**基于脚本自身位置**（`__file__`）解析，不再依赖 cwd（换机/服务化后免 `cd`）；
+  默认（不传配置）时 UMVP 行为保持零回归（功能子命令 stdout/stderr/退出码/生成文件逐字一致，
+  仅 `--help` 因新增 `--config/--name` 多出 3 行，属有意差异）。
+  ④新增文档 `doc/guides/ticketd_service.md`（定位/配置字段/常用命令/多项目与端口规划/WSL 注意/换机重建/FAQ），
+  并在 `doc/README.md` 登记。
+- 影响面：**入口**（新增 systemd user 服务 `ticketd@<项目名>`，默认端口 **8010**；新增 CLI 参数
+  `--config/--name`）、**配置**（新增 `~/.config/ticketd/*.json`、环境变量
+  `TICKET_CONFIG`/`TICKETD_CONFIG`、`~/.local/bin/ticketd`）、**结构**（`.opencode/tool/` 新增
+  3 个文件 + 模板 unit 落在用户家目录，不入仓库）
+- 部署注意：**零新增依赖、不用 conda `ai`、不用 MySQL**——运行时只需系统 `python3`（标准库），
+  与 web_lab 主服务（8001 + MySQL 3307）完全解耦，互不影响启停。换机/新克隆重建：
+  `bash .opencode/tool/install_ticketd.sh --name <项目名> --port <端口>`（路径自动取仓库位置）。
+  前提：`/etc/wsl.conf` 有 `[boot] systemd=true` 且 `loginctl show-user $USER -p Linger` = `Linger=yes`；
+  **项目务必放 Linux 家目录（勿放 `/mnt/c/...`）**，DrvFs 上 flock 语义不完整。
+  注意：默认工单文件按**脚本自身位置**解析 ⇒ 自检/一次性脚本做写测试时**必须显式传 `--file <临时副本>`**。
+- 验证：`ticket.py check` 全绿（14 条）；`ticket_web.py --self-test` **72 断言**（仓库根与 `/tmp` 均可跑）；
+  CLI 差分 44 组（功能写用例 23/23 + 原地读用例 8/8 逐字 0 diff，`--help` 差异仅 usage 行 +
+  `--config`/`--name` 两项）；qa 独立验收 **154 条断言**（配置优先级 28 / fail-fast 57 / 多实例隔离 19 /
+  installer 30 / 只读+安全 20）；systemd：`is-active=active`、`is-enabled=enabled`、
+  `curl http://127.0.0.1:8010/api/tickets` 200、`restart` 与 `kill -9` 后 4s 内自愈、日志无 traceback；
+  多实例（umvp:8010 + 临时实例:8012）各自隔离、真实工单文件 md5 全程未变；路径穿越 9 向量全 404。
+  工单：WO-0005（主）/ WO-0005.1 均已「已完成」。
+
 ### 2026-10-16(五) · WO-0003：记录↔图像基数约定（图集）落地 + VLM 送审图集与连线
 - 变更内容：①**基数约定**（用户确认）：记录数不随图片数膨胀——一条记录需多图时以**图集**
   （ndarray 列表）挂 `image` 旁路，不拆记录；下游自行处理。落地：`records.image_set_of`
