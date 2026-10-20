@@ -161,7 +161,10 @@ $PY web_lab/selfcheck_vlm_env.py          # 真实 VLM 端点 env 注入自检�
 $PY umvp/plate_recog/fetch_models.py      # 拉取车牌模型（换机 / 新克隆必跑）
 python3 .opencode/tool/ticket.py check    # 工单表结构校验（改工单后必跑）
 python3 .opencode/tool/ledger.py get <编号>  # 按编号取记录单条（INB/WO/DEP；代理取记录用，勿读全文件）
+python3 .opencode/tool/ledger.py list --status 待同步  # 待同步记录清单（/curate 入口）
+python3 .opencode/tool/agent_model.py show   # 代理模型现状；set/clear/default 改配置（新会话生效）
 bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂等，见 doc/guides/ticketd_service.md）
+# 看板（常驻）：http://127.0.0.1:8010/ —— 工单 / 收件箱 / 部署台账 / 模型 四页签
 ```
 
 ## 七、注意事项
@@ -170,5 +173,17 @@ bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂
   正常现象）和 `Duplicate provider` 警告，均不影响结果，验证时用 `grep -v` 过滤。
 - 性能基线以 `out/fingerprints.json`（`web_lab/calibrate.py` 产出）为唯一权威；机器变化
   （换卡 / 换机）只需重跑 `calibrate.py`，代码零改动。
+- **真实 VLM 端点**：`web_lab` 的 `_vlm_real` 三项走「环境变量优先 → spec → 内置默认」——
+  `VLM_ENDPOINT` / `VLM_MODEL` / `VLM_API_KEY`（兼容 `GLM_API_KEY`）；**key 只走环境变量，勿入仓**
+  （取自全局 `~/.config/opencode/opencode.jsonc` 的 `Z_AI_API_KEY`）。实测可用 = 智谱
+  `glm-4v-flash`（`https://open.bigmodel.cn/api/paas/v4/chat/completions`，单/多图均可，1.6~4.6 s/帧@1280×720）；
+  `glm-4.5v`/`glm-4.6v` 账号无资源包、`glm-4.6v-flash` 免费池持续过载（429 code 1305），均不可用。
+- **工单 / 记录工具的临时脚本**：`ticket.py` / `ledger.py` / `ticket_web.py` 的默认文件按**脚本自身位置**
+  解析——临时脚本、差分比对、自检一律**显式** `--file`/`--deployment-file` 指向临时副本，否则会写坏真实
+  工单文件（INB-0039 教训）。
+- **已知限制（未修，待评估）**：`face_embed` 去重阈值未进 `web_lab` PARAMS（`server.py`），驱动层恒取
+  默认 0.55，需按链路配阈值时要补 `thresh`（含 DB 参数表列）；另 `_chain_from_spec` 对含
+  face_detect/face_embed 的 spec 在**装配期**即构造模型（即加载权重），`h_chain` 等非链路入口同样加载。
+
 - 联网检索 / 抓取优先用 GLM 系 MCP 工具（web-search-prime / web-reader / zread 免确认直用），
   完整优先级与配置见全局 `~/.config/opencode/AGENTS.md`。
