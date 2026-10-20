@@ -14,7 +14,7 @@
 | 行为研判（VLM） | `frame_manager → yolo → det_filter → annotate → vlm → seq_filter`（事件尾） |
 | 车牌识别 | `frame_manager → yolo(车) → det_filter → target_crop(车) → plate_recog → seq_filter` |
 | 人脸截取 | `frame_manager → yolo(人) → det_filter → target_crop(人) → face_detect` |
-| 人脸身份 | 上者 + `face_embed → face_store` |
+| 人脸身份 | 上者 + `face_embed`（**链路终段**；⚠ `face_store` 检索**未纳入链路 spec**，声明会被 `validate_spec` 拒绝） |
 
 > 模块与参数白名单以 `list_modules` 现取为准；本表只给组合骨架与方向。
 
@@ -73,7 +73,8 @@
 
 ## 3. 链路形态备忘
 
-- 人脸：YOLO(识人) → 目标裁剪(裁人+坐标还原) → SCRFD(检脸) → ArcFace(嵌入) → FaceStore(检索)。
+- 人脸：YOLO(识人) → 目标裁剪(裁人+坐标还原) → SCRFD(检脸) → ArcFace(嵌入，**链路终段**)；
+  `face_store` 检索**不在链路 spec 内**（声明即被 `validate_spec` 拒绝，仅专用运行器 / 自身测试页用）。
 - 监控：抽帧 + 人脸检索持续扫（`face_scan.FaceMonitor`）。
 
 ## 4. 决策原则

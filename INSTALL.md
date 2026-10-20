@@ -25,7 +25,7 @@ umvp/                                ← 项目根（独立部署包）
 │   │   ├── conditions.py            ← 条件 DSL 引擎（与/或/非/括号 + 派生 w/h/short/long/area，筛选/裁剪/标注共用）
 │   │   ├── records.py               ← 通用记录 Record 约定 + to_record 对象适配
 │   │   ├── crop_restore.py          ← extract_faces 兼容编排（已拆为「目标裁剪+人脸检测」两模块）
-│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），64 项断言
+│   │   └── test_composer.py         ← 纯逻辑测试（不加载模型），85 项断言
 │   ├── face_detect/
 │   │   ├── face_detector.py         ← SCRFD 人脸检测 + 5点对齐裁剪（默认读项目内 face_models/）
 │   │   ├── test_face_detect.py      ← 人脸检测验证（--image/--video/--camera）
@@ -37,10 +37,11 @@ umvp/                                ← 项目根（独立部署包）
 │   ├── face_scan/
 │   │   ├── face_monitor.py          ← 人脸管道编排（流/视频/摄像头；取帧+背压复用 pipe.composer.FrameManager）
 │   │   └── test_face_scan.py        ← 视频人脸扫描验证
-│   └── plate_recog/
+│   ├── plate_recog/
 │       ├── plate_recognizer.py      ← HyperLPR3 车牌检测+矫正+识别（默认读项目内 plate_models/）
 │       ├── plate_pipeline.py        ← 车牌链路阶段 PlateStage（消费上游车框：裁车→识别→坐标还原）
 │       └── fetch_models.py          ← 拉取车牌模型到 plate_models/（新克隆/换机）
+│   └── resources.py                 ← P1 资源估算（静态公式 + 实测指纹两层）
 ├── models/                        ← YOLO 模型选择池（web_lab 前端自动列出，COCO person=0/car=2）
 │   ├── yolov8n.pt                 ← v8 轻量档（默认，CPU 单帧 ~0.2s）
 │   ├── yolov8s.pt                 ← v8 均衡档（精度优先）
@@ -54,16 +55,32 @@ umvp/                                ← 项目根（独立部署包）
 │   └── buffalo_l/                   ← 已解压（det_10g.onnx / w600k_r50.onnx 等，默认加载路径）
 ├── plate_models/                    ← 车牌模型（不入库；fetch_models.py 拉取重建）
 │   └── hyperlpr3/20230229/onnx/     ← 检测 320/640 + 识别 + 颜色分类
+├── web_lab/                       ← 可视化测试台（模块测试页 + 链路设计器 + 批量运行 + 资源估算）
+│   ├── server.py                  ← stdlib HTTP 服务（REST + SSE；默认 8001）
+│   ├── db.py                      ← MySQL 持久化（模块 preset / 链路 spec；惰性连接）
+│   ├── validate_chain.py          ← 链路 stages spec 校验 CLI（产物/端口 DAG）
+│   ├── selfcheck_vlm_env.py       ← 真实 VLM 端点环境变量注入自检（34 断言，不打网络）
+│   ├── calibrate.py               ← 实测标定 → out/fingerprints.json（换机必跑）
+│   └── ...
 ├── tests/
 │   ├── test_police_uav_pipeline.py  ← 警用链路（警用无人机）逻辑断言
 │   ├── test_police_uav_video.py     ← 警用链路端到端（真实 YOLO + mock VLM）
 │   ├── test_yolo_params.py          ← YOLO 推理参数对比（重叠场景截图）
+│   ├── test_yolo_standalone.py      ← YOLO 单模块探索性跑图（无断言计数）
 │   ├── test_cropper.py              ← 通用裁剪模块纯逻辑断言（含轻量性检查，秒级）
 │   ├── test_target_crop.py          ← 目标裁剪模块纯逻辑断言（裁剪/分辨率/条件 DSL）
 │   ├── test_annotate.py             ← 标注模块纯逻辑断言（画框/条件 DSL）
-│   ├── test_face_extract_pipeline.py← 人脸提取链路（YOLO 识人→目标裁剪裁人→SCRFD）
-│   ├── test_plate_recog_pipeline.py ← 车牌识别链路（整帧 + 目标裁剪裁车→识别→坐标还原）
-│   └── data/                        ← 测试视频（face1 / rescue1 / traffic / 车牌识别）+ 截图
+│   ├── test_det_filter.py           ← 检测筛选纯逻辑断言（66）
+│   ├── test_seq_filter.py           ← 时序判定纯逻辑断言（43）
+│   ├── test_image_source.py         ← 送审图像源 + 图集契约（73）
+│   ├── test_port_inputs.py          ← 端口连线端到端（49）
+│   ├── test_validate_chain.py       ← spec 校验器（34）
+│   ├── test_face_capture_pipeline.py← 人脸截取链路（PIPE0003，63）
+│   ├── test_face_extract_pipeline.py← 人脸提取链路（YOLO 识人→目标裁剪裁人→SCRFD，28）
+│   ├── test_plate_recog_pipeline.py ← 车牌识别链路（整帧 + 目标裁剪裁车→识别→坐标还原，28）
+│   ├── test_agent_runtime.py        ← 挂载 agent 运行时（离线，39）
+│   ├── test_video_transcode.py      ← 视频转码（18）
+│   └── data/                        ← 测试素材：pic/（图片 6 张）、vid/（视频 8 段）、out/（产物）
 ├── requirements.txt                 ← Python 依赖清单
 ├── README.md                        ← 包说明
 └── INSTALL.md                       ← 本指南
@@ -94,7 +111,7 @@ conda run -n ai python -c "import cv2, ultralytics, insightface"
 ls face_models/buffalo_l/
 #    应看到 det_10g.onnx w600k_r50.onnx 等 5 个文件
 
-# 3) 纯逻辑测试冒烟（59 项断言，不加载模型，秒级完成）
+# 3) 纯逻辑测试冒烟（85 项断言，不加载模型，秒级完成）
 cd <项目根>
 conda run -n ai python umvp/pipe/test_composer.py
 ```
@@ -190,13 +207,13 @@ PY="conda run -n ai python"   # 便携：ai conda 环境解释器（或先 conda
 ```
 
 ```bash
-# 1) 纯逻辑测试（不加载任何模型，最快）→ 应输出「全部通过: 59 项断言」
+# 1) 纯逻辑测试（不加载任何模型，最快）→ 应输出「全部通过: 85 项断言」
 $PY umvp/pipe/test_composer.py
 
 # 1b) 通用裁剪模块（纯逻辑 + 轻量性检查 → 26 项断言）
 $PY tests/test_cropper.py
 
-# 2) 人脸链路注册+自检（读项目内 face_models/；test_imgs 建库并逐条自检 → 7/7 命中）
+# 2) 人脸链路注册+自检（读项目内 face_models/；test_imgs 建库并逐条自检 → 35/35 命中）
 $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
 
 # 3) YOLO 推理参数对比（重叠场景截图，真实推理 yolov8n.pt）
@@ -207,12 +224,35 @@ $PY tests/test_police_uav_video.py
 
 # 5) 车牌识别链路（整帧识别 + YOLO 识车→裁车放大→坐标还原 → 28 项断言）
 $PY tests/test_plate_recog_pipeline.py
+
+# 6) 其余逻辑断言（不加载模型，秒级）：目标裁剪 35 / 标注 16 / 检测筛选 66 / 时序判定 43
+$PY tests/test_target_crop.py; $PY tests/test_annotate.py
+$PY tests/test_det_filter.py; $PY tests/test_seq_filter.py
+
+# 7) 链路/端口契约类：图集与送审图像源 73 / 端口连线 49 / spec 校验 34 / 人脸截取 63 / 人脸提取 28
+$PY tests/test_image_source.py; $PY tests/test_port_inputs.py
+$PY tests/test_validate_chain.py; $PY tests/test_face_capture_pipeline.py
+$PY tests/test_face_extract_pipeline.py
+
+# 8) 挂载 agent 运行时（离线，39 项断言）；视频转码 18 项
+$PY tests/test_agent_runtime.py; $PY tests/test_video_transcode.py
+
+# 9) 链路 spec 校验 CLI（stages spec → [OK]/[ERR] + 退出码）
+$PY web_lab/validate_chain.py <spec.json>
+
+# 10) 真实 VLM 端点配置自检（环境变量注入机制，34 项断言，不打网络）
+$PY web_lab/selfcheck_vlm_env.py
 ```
 
 ### 注意事项
 
 - **VLM 端点可达性**：警用链路测试（`tests/test_police_uav_video.py`）默认用 mock VLM；
-  真实端点配置在链路 vlm 阶段参数（vlm_endpoint/vlm_model），不可达时测试台记日志继续。
+  测试台批量运行时的真实端点配置走链路 vlm 阶段参数（vlm_endpoint/vlm_model/vlm_key），
+  或**直接导出环境变量**（优先级更高、key 不必入库）：
+  `VLM_ENDPOINT` / `VLM_MODEL` / `VLM_API_KEY`（兼容 `GLM_API_KEY`），
+  三者优先级＝环境变量 > 链路阶段参数 > 内置默认；端点不可达时测试台记日志继续
+  （连续失败≥3 本轮改用素材包，401/403/429 给可读提示，每轮最多一条）。详见
+  `doc/guides/runbook.md` §4.3。
 - **运行目录**：从项目根运行（测试脚本内部按根目录定位模块与数据）。
 - **首次推理慢**：YOLO 首帧加载模型约 1~2 秒；SCRFD/ArcFace 首次加载 onnx 同理，属正常。
 - **性能基线（全 CPU，权威值见 `out/fingerprints.json`）**：YOLO @640 各档 40–280ms
@@ -229,5 +269,5 @@ $PY tests/test_plate_recog_pipeline.py
 | `ImportError: libgomp.so.1` | torch 缺 OpenMP | 装 `libgomp1` |
 | `ModuleNotFoundError: ultralytics/insightface` | 依赖没装或环境没激活 | 确认 `pip install -r requirements.txt` + `conda activate ai` |
 | 人脸模块报「未找到 det_10g.onnx」 | `face_models/buffalo_l/` 缺失或未解压 | 解压 `face_models/buffalo_l.zip` 到 `face_models/`；或检查是否用 `model_root` 覆盖到了不存在路径 |
-| `test_3modes` 的 VLM 步骤报错 | 端点不可达/超时 | 改 `VLM_URL`，或先跑 1)/2)/3) 跳过 VLM 验证管道 |
+| `test_police_uav_video` 的 VLM 步骤报错 | 端点不可达/超时/鉴权/限额 | 配 `VLM_ENDPOINT`/`VLM_MODEL`/`VLM_API_KEY`（或链路 vlm 阶段参数）；或先跑 1)/2)/3) 跳过 VLM 验证管道 |
 | `RuntimeError: Found no NVIDIA driver` | torch 装了 CUDA 版但机器无 GPU | 重装 CPU 版 torch，或用 `device=cpu` |

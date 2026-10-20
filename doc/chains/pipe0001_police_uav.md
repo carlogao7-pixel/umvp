@@ -55,6 +55,11 @@ PIPE0001 警用无人机链路（pipelines 表，streams=1）
 > VLM 研判结果经 `Pipeline.publish()` 构造成记录（`label`=警情类型、`content`=原始 JSON），
 > 走 SEQ0001 的 `rules` 出事件——即链路输出；不再有独立的告警物化阶段。
 
+**端口与连线（P5）**：本链路未显式声明 `inputs`，各阶段按现状默认取数（零回归）——对应产物名
+`frame_manager.frame` → `yolo.dets` → `det_filter.dets` → `annotate.annotated` / `seq_filter.dets`，
+逐帧登记在 `Pipeline.artifacts`；VLM 的送审图像源由阶段参数 `image_source`（默认 `annotated`＝带框图）
+选取。链路尾 `Pipeline.last_events` ＝末段记录携带的事件汇总。
+
 ## 4. 运行方式（test.html 链路测试台）
 
 打开 `http://127.0.0.1:8001/test.html` → 视频测试页：
@@ -80,6 +85,8 @@ PIPE0001 警用无人机链路（pipelines 表，streams=1）
 - **结果图网格**：关键帧/标注图/告警帧 data URL。
 - **落盘**：output_dir 下关键帧与告警帧图片。
 - VLM 真实调用失败时记 fail 条目继续跑，不中断整链（连续失败 ≥3 本轮改用素材包）。
+  端点返回 401/403（鉴权）/429（限额）时驱动层给**中文可读提示、每轮最多一条**（`VlmHttpError.hint`）；
+  VLM 端点/模型/key 支持环境变量覆盖（`VLM_ENDPOINT`/`VLM_MODEL`/`VLM_API_KEY`，见 [VLM 研判](../modules/vlm.md) §2.2）。
 
 ## 6. 验证
 

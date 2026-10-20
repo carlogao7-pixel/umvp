@@ -23,9 +23,15 @@
 
 `classes` 与 `filter` 同时生效（AND）；条件 DSL 与「标注」「检测筛选」共用 `pipe.conditions`。
 
+> `scale`（缩放倍数，默认 1.0）是代码级构造参数，链路上不暴露（`_chain_from_spec` 不传、等效 1.0）；
+> 链路里要做缩放请用 `out_size`（如 `×2`）。仅旧 `extract_faces` 兼容路径以它的 `upscale` 传入。
+
 `image`、`bbox` 为模块测试页参数（test_only，不落库、不进链路）。
 
 ## 3. 输入 / 输出
+
+端口声明（模块自描述，P5 端口协议）：`INPUTS = {"frame": "Image", "dets": "Records"}`、
+`OUTPUTS = {"crops": "Records"}`——即产物 `target_crop.crops`（`image` 旁路＝该对象单张子图）。
 
 `crop_targets(frame, dets=None, boxes=None, *, scale=1.0, margin=0.0, classes=None, filter="", out_size=None)`
 
@@ -52,6 +58,16 @@
 方法：`to_original(bbox)` / `kps_to_original(kps)` —— 子图坐标 → 原图坐标
 （除以 scale 加 offset）；下游识别模块据此还原车牌/人脸框并出原分辨率小图。
 
+**产物形态与类型归一（`as_crop`）**：
+
+- `Pipeline.last_crops`：本帧 `CropResult` **对象列表**（驱动层现路径在用）；
+- `Pipeline.artifacts["target_crop.crops"]`：同一批裁剪的**记录 dict 列表**——**逐对象一条记录**
+  （每对象含 `bbox`/`offset`/`scale`/`scale_x`/`scale_y`/`index` 等主干键 + 一张 `image` 子图），
+  不是"一条记录多图"（基数约定见 [拼接层端口协议设计稿](../design/assembly_ports.md) §3⑥）；
+- 下游（人脸检测 / 车牌识别）用 `as_crop(x)` 对"对象或记录"做类型归一（对象零拷贝原样返回；
+  dict 用其键重建 `CropResult`，子图取 `image`、`img` 兜底），再走统一的 `img`/`bbox`/`to_original`
+  访问器——因此既能消费 `last_crops`（对象），也能消费 `inputs` 连线取到的裁剪记录。
+
 ## 4. 上下游衔接
 
 - 上游：YOLO 检测框（人/车）或任意坐标。
@@ -60,7 +76,11 @@
   - **人脸检测**（`face_detect.face_pipeline.FaceStage`）：在人图里检脸 → 还原坐标 → 原图出脸。
   - **VLM**：需要送该类 ROI 裁剪时，YOLO 之后插本模块。
 - 装配：`web_lab/server.py` 的 `_chain_from_spec` 构造 `TargetCrop` 注入 `Pipeline.crop`；
-  `Pipeline.step` 把上游（检测筛选/时序门控后）的 `dets` 交给裁剪产出 `last_crops`。
+  `Pipeline.step` 把上游（检测筛选/时序门控后）的 `dets` 交给裁剪产出 `last_crops`，并把
+  `to_record` 后的记录列表登记为产物 `target_crop.crops`。
+- 端口连线：`target_crop.frame` / `target_crop.dets` 本期已纳入 `inputs` 解析——spec 阶段可显式声明
+  `"inputs": {"frame": "frame_manager.frame", "dets": "det_filter.dets"}` 换上游；**不声明＝现状默认**
+  （frame←本帧原帧、dets←当前检测流），零回归。
 
 ## 5. 保留链路
 

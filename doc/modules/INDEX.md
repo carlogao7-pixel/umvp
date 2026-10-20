@@ -11,7 +11,11 @@
 
 - **JSON 主干**：记录必备 `kind` / `ts` / `frame_idx`；通用字段 `bbox` / `score` / `cls_id` /
   `track_id` / `label` / `text`；事件字段 `events`（列表，一条记录可携带多个事件）。
-- **旁路字段**（约定不序列化）：`image`（ndarray 子图/帧，**记录旁路图像统一键名**）、`embedding`（向量）——像素与向量不进 JSON。
+- **旁路字段**（约定不序列化）：`image`（ndarray 子图/帧，**记录旁路图像统一键名**；
+  **或 ndarray 列表＝图集**——一条记录需多图时以集合形式携带、**不拆记录**）、`embedding`（向量）——像素与向量不进 JSON。
+  读取器两个（语义有别）：**`image_of(rec)`＝单图语义**（图集时取首张，兼容既有调用）、
+  **`image_set_of(rec)`＝集合语义**（单图→长度 1 列表、图集→原样、无→空）；下游要消费
+  "整条记录的图片集合"用后者。
   历史模块自造键为**兼容别名**（`to_record` 转换时自动补 `image`，旧键保留）：
   目标裁剪 `img` / 人脸检测 `face_img` / 车牌识别 `plate_img`。
 - **适配与事件 API**：老对象在边界经 `to_record` 统一（dataclass 自动转，特殊类型 `@register_adapter`）；
@@ -39,13 +43,20 @@
 | [人脸嵌入](face_embed.md) | 人脸图 | 512d 向量 → Vector | 向量旁路 |
 | [向量底库](face_store.md) | 查询向量 | MatchResult 记录 | 检索产出 |
 
+> 上表前 9 行为**已声明 `INPUTS`/`OUTPUTS` 的逐帧阶段**（端口/产物名即代码里的类属性，权威来源）；
+> 末两行（人脸嵌入 / 向量底库）为向量旁路模块，**未声明端口、不登记产物**，表中仅为语义说明。
+
 **基数约定（2026-10-16）**：记录数不随图片数膨胀——识别模块一条记录可含多个识别对象；图像生产
 模块**一条记录需多图时，以「图集」（ndarray 列表）放进 `image` 旁路，不拆记录**；下游自行处理
-单图/图集（标注：一条记录 → 一张图多框，不受影响）。
+单图/图集（标注：一条记录 → 一张图多框，不受影响）。注意区分：**目标裁剪是"逐对象一条记录"
+（每个对象一条、各带一张 `image`），不属"一条记录多图"**；图集只用于"一条记录确需多图"的场景
+（如按类报送时该类全部命中子图），权威约定见
+[拼接层端口协议设计稿](../design/assembly_ports.md) §3⑥。
 
-**本期连线范围**（唯一来源 `pipe.composer.RESOLVED_PORTS`）：`yolo.image`、`det_filter.dets`、
-`seq_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、**`plate_recog.frame/crops`**、
-**`face_detect.frame/crops`**；**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
+**本期连线范围**（唯一来源 `web_lab/server.py` 的 `CHAIN_RESOLVED_PORTS` ＝
+`pipe.composer.RESOLVED_PORTS` ＋ 驱动层额外解析的 `vlm.dets`）：`yolo.image`、`det_filter.dets`、
+`seq_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、`plate_recog.frame/crops`、
+`face_detect.frame/crops`；**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
 `inputs.image` 不支持）。校验：未知产物 / 非法端口 / 非上游引用 /
 类型不符 / 值非字符串 → 报错；同一产物被多个下游引用 → 允许（分支留路）。
 

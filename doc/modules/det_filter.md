@@ -125,6 +125,11 @@ collect_events(items)                        # 链路尾汇总为输出
 放行元素组成的子集（`list`）——**原元素原样返回**，不构造新对象、不改字段；
 上游是 Detection 出来就是 Detection，是 dict 出来就是同一个 dict。
 
+端口声明（模块自描述，P5 端口协议）：`INPUTS = {"dets": "Records"}`、`OUTPUTS = {"dets": "Records"}`
+——产物 `det_filter.dets` ＝放行子集（逐帧登记在 `Pipeline.artifacts`），下游可经 `inputs` 引用它
+表示"筛选后"语义（如 `annotate.dets` / `vlm.inputs.dets` 连 `det_filter.dets`，对比连
+`yolo.dets`＝筛选前）。`det_filter.dets` 端口本期已纳入解析。
+
 ## 5. 上下游衔接
 
 - 上游：任何产出 list[Detection] 或 list[Record] 的模块（YOLO `infer()` 最典型）。

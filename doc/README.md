@@ -104,10 +104,12 @@ doc/
 │                    按「JSON 主干 × 图像/向量旁路」的数据流角色分组）
 ├── chains/          保留链路专篇（pipe0001_police_uav / pipe0002_plate / pipe0003_face_capture，
 │                    六段式：定位→拼接结构→数据流→运行方式→输出→验证）
-├── guides/          操作与参考手册（runbook=端口与启停 / database_schema=数据库结构）
+├── guides/          操作与参考手册（runbook=端口与启停 / database_schema=数据库结构 /
+│                    ticketd_service=工单看板常驻服务与多项目复用）
 ├── design/          专题设计（storage_design / live_overlay＝web 已落地；
 │                    video_review_search / wemm_integration＝下期设计稿；
-│                    assembly_ports＝拼接层端口协议设计稿，P5）
+│                    assembly_ports＝拼接层端口协议设计稿，P5；
+│                    graph_chain＝图编排设计稿，P2）
 ├── agent/           挂载 agent 生成物（static_prompts / full_run_record；脚本生成勿手改）
 └── research/        历史选型调研（face_search_survey / plate_recog_survey；实现现状以 modules/ 为准）
 ```
@@ -153,11 +155,13 @@ doc/
 |---|---|
 | `guides/runbook.md` | 端口、启停命令、web 页面使用、FAQ（操作手册） |
 | `guides/database_schema.md` | 表结构/业务 ID 前缀/播种清单/参数表机制/数据快照（参考手册；设计动机见 design/storage_design.md） |
+| `guides/ticketd_service.md` | 工单看板常驻服务（systemd user）：多项目复用 / 配置字段 / 常用命令 / 收件箱/部署台账/模型页签 + ledger CLI + agent_model CLI / WSL 注意 / 换机重建 / FAQ |
 | `design/storage_design.md` | presets/pipelines 存储设计决策记录（已落地） |
 | `design/live_overlay.md` | SSE 流式运行 + 视频叠加框的方案与约束（已落地） |
 | `design/video_review_search.md` | 语言询问→定位历史视频片段：离线片段索引（轻/语义/向量三档，PIPE0004）+ 三级检索 + 帧级精定位（设计稿，业务与实现方案总篇） |
 | `design/wemm_integration.md` | WeMM-Embedding 嵌入服务对接专篇：模型机制、serving 部署、WEMMClient 请求 schema、成本与联调清单（设计稿） |
 | `design/assembly_ports.md` | 拼接层端口协议（P5 设计稿）：产物命名 / 模块自描述输入输出 / 壳内 `inputs` 连线 / 校验断言；把「阶段插槽硬编码连线」升级为「模块自描述端口 + 壳内声明」；分三步实施（WO-0002） |
+| `design/graph_chain.md` | 图编排（P2 设计稿）：节点实例身份（产物全名 `{模块}#{位置}.{产物}`）/ 同模块复用 / `pipeline_edges`+`module_ports` 两表 / 迁移与双写；P2-0+P2-1 实施中（WO-0008），拓扑驱动执行与过渡节点（merge/join/to_images/split）为其后续期 |
 
 ### 3.6 挂载 agent（agent/ 与 .claude/agents/）
 

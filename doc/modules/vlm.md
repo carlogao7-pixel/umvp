@@ -23,11 +23,22 @@
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | image_source | select | annotated | **送审图像源**（连线相关，2026-10-16 新增）：`annotated`＝带框图（缺则回退原帧，＝旧行为）/ `frame`＝本帧原帧 / `crops`＝与送审目标匹配的裁剪子图（按 bbox 精确或 IoU≥0.5 命中，**链路须含 `target_crop` 阶段**；未命中回退并在 timeline 标注素材来源）。缺省＝现状（零回归），缺源一律回退不报错 |
-| image_pick | select | first | **送审张数**（2026-10-16 新增）：`first`＝只送首张（＝旧行为）/ `all`＝送**图集全部**（`image_source=crops` 时该类全部命中对象子图，多图 payload）。与 `image_source` 正交：前者选"哪张"、后者选"几张" |
+| image_pick | select | first | **送审张数**（2026-10-16 新增）：`first`＝只送首张（＝旧行为，逐字等价）/ `all`＝送**图集全部**（`image_source=crops` 时该类全部命中对象子图，OpenAI 兼容**多图** payload）。与 `image_source` 正交：前者选"哪张"、后者选"几张" |
 | use_real_vlm | bool | false | true=真发 HTTP 请求到端点；false=只演示素材包不推理 |
-| vlm_endpoint | str | （见库内值） | OpenAI 兼容接口地址（/v1/chat/completions） |
-| vlm_model | str | qwen3-vl-32b | 调用的模型名 |
-| vlm_key | str | 空 | API Key，免鉴权端点留空 |
+| vlm_endpoint | str | （见库内值） | OpenAI 兼容接口地址（/v1/chat/completions）；**环境变量 `VLM_ENDPOINT` 优先** |
+| vlm_model | str | qwen3-vl-32b | 调用的模型名；**环境变量 `VLM_MODEL` 优先** |
+| vlm_key | str | 空 | API Key，免鉴权端点留空；**环境变量 `VLM_API_KEY`（兼容 `GLM_API_KEY`）优先** |
+
+> **端点/模型/key 三级优先级**（`web_lab/server.py:_resolve_vlm_cfg`，2026-10-19 WO-0006）：
+> **环境变量 > 链路 spec 阶段参数 > 内置默认**。环境变量 `VLM_ENDPOINT` / `VLM_MODEL` /
+> `VLM_API_KEY`（key 兼容别名 `GLM_API_KEY`，两者都设时 `VLM_API_KEY` 优先）为**部署级强制覆盖**——
+> 导出即全链路切到该端点、无需改 DB；**不设任何 env 时逐字回落到改动前行为（零回归）**。
+> 端点返回 401/403（鉴权）/429（限额）时抛 `VlmHttpError`（携带中文可读提示 `hint`），
+> 驱动层每轮**最多提示一次**（参见 [警用无人机链路](../chains/pipe0001_police_uav.md) §5 失败处理）。
+> 环境变量注入只存在于驱动层（`server.py`），模块自身（`VLMAnalyzer`）不读环境变量。
+
+> **多图送审实测**：`image_pick=all` 的 OpenAI 兼容多图 payload 已由真实端点（`glm-4v-flash`）
+> 实证支持（见收件箱 INB-0040）；单图路径（`first`，默认）与改动前逐字等价。
 
 > **连线（inputs）**：`vlm.inputs` 仅支持 `dets` 端口（决定"报送哪些检测"，如 `yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后）；`vlm.inputs.image` **不支持**——图片源请用 `image_source`。
 
@@ -83,6 +94,15 @@ vlm_model=qwen3-vl-32b`，prompt 为警情四分类提示词（要求返回 JSON
 
 - 上游：YOLO 识别的 SubmitRequest + 原帧。
 - 下游：研判记录经 `Pipeline.publish()` 走事件尾（`event_filter`）——词表命中+冷却后出事件。
+- **端口声明（P5）**：`VLMAnalyzer.INPUTS = {"image": "Image", "dets": "Records"}`、`OUTPUTS = {}`
+  ——模块只做素材准备/回调封装，**不产出登记产物**（研判内容经 `publish` 回写记录的
+  `label`/`content` 走事件尾，不在 `Pipeline.step` 内登记为产物）。
+- **连线（inputs）**：只有 `vlm.inputs.dets` 由驱动层解析（`_apply_vlm_inputs` 按声明从
+  `pipe.artifacts` 取检测记录重构送审请求，如 `yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后）；
+  `vlm.inputs.image` **不接受**（图片源统一由 `image_source` 参数管，避免双机制，校验器报错并提示）。
+  未声明 `inputs` 的旧 spec 不报错不警告（零回归）。
+- **送审图像源与张数**：`image_source`（annotated/frame/crops）选"哪张"、`image_pick`（first/all）选"几张"，
+  由驱动层 `_pick_vlm_images` 按 `records.image_set_of`（集合语义）取图。
 
 ## 6. 验证
 

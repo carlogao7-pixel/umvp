@@ -1,7 +1,7 @@
 # 人脸截取链路 PIPE0003
 
 > 类型：模块自定义拼接链路 | 装配：`web_lab/server.py`（`_chain_from_spec` 装配，
-> `_seed_pipeline` 播种） | 运行：`web_lab/test.html` 链路测试台（专用 `_face_step` 路径）
+> `_seed_pipeline` 播种） | 运行：`web_lab/test.html` 链路测试台（通用 `Pipeline.step` 路径）
 > 数据库：pipelines 表 `PIPE0003` + pipeline_steps 5 步（引用 5 条模块 preset）
 
 ## 1. 链路定位
@@ -10,10 +10,10 @@
 人脸检测（子图检脸 + 原图出脸）**。面向"把人脸抓出来存档"：截取落盘即是目的，
 **不含嵌入 / 底库检索 / 事件尾**（身份去重不在本链路）。
 
-spec 由模块 preset 拼装，链路本身无专属代码；但**测试台的运行路径有人脸专属分支**
-（`_face_step`）——它不经过通用 `Pipeline.step`，因而本链路的 `det_filter` 阶段
-**声明但不执行**。这是本链路与 PIPE0001 / PIPE0002 最关键的区别，详见
-[§4.1 两条执行路径的差异](#41-两条执行路径的差异核心)与文末[已知差异（待决事项）](#已知差异待决事项)。
+spec 由模块 preset 拼装，链路本身无专属代码；逐帧阶段一律走通用 `Pipeline.step` 插槽执行
+（2026-10-16 起，与 PIPE0001 / PIPE0002 完全一致）——`det_filter` 阶段**真正生效**。
+历史上本链路曾走测试台专用的 `_face_step` 直连分支（绕过 `Pipeline`，`det_filter` 声明却不执行），
+差异与修复见文末[历史差异与修复](#历史差异与修复2026-10-16已关闭)。
 
 各阶段参数细节见模块分册（[帧管理](../modules/frame_manager.md)、[YOLO 识别](../modules/yolo.md)、
 [检测筛选](../modules/det_filter.md)、[目标裁剪](../modules/target_crop.md)、
@@ -25,7 +25,7 @@ spec 由模块 preset 拼装，链路本身无专属代码；但**测试台的�
 PIPE0003 人脸截取链路（pipelines 表，streams=1）
  ├─ 步骤0  FM0003    人脸截取·帧管理     （frame_skip=5）
  ├─ 步骤1  YOLO0003  人脸截取·YOLO识人   （classes=0，只识人，纯推理）
- ├─ 步骤2  DF0003    人脸截取·检测筛选   （long>=30；group_limits 人≥1）——测试台路径不执行
+ ├─ 步骤2  DF0003    人脸截取·检测筛选   （long>=30；group_limits 人≥1）
  ├─ 步骤3  CROP0003  人脸截取·目标裁剪   （classes=0，按人框裁人，out_size="" 原尺寸）
  └─ 步骤4  FDET0002  人脸截取·人脸检测   （FaceStage：子图检脸 + 原图出原分辨率人脸）
 ```
@@ -43,50 +43,58 @@ PIPE0003 人脸截取链路（pipelines 表，streams=1）
 `_SEED_FACE_STAGES`，`_seed_pipeline` → `_seed_chain`）。规则与门控的完整字段见
 [数据库结构](../guides/database_schema.md) §7 与各模块分册。
 
-> ⚠ **det_filter 声明但测试台不执行**：DF0003 在 spec / 数据库里存在，但测试台人脸链走
-> `_face_step` 直连 YOLO → 目标裁剪，**跳过 `pipe.det_filter`**（详见 §4.1）。PIPE0001 /
-> PIPE0002 及不含人脸阶段的链路经 `Pipeline.step` 执行，det_filter 正常生效。
+> ⚠ **det_filter 现已真正生效**（2026-10-16 起）：DF0003 在 spec / 数据库里存在，且测试台人脸链
+> 与其它链路一样走通用 `Pipeline.step`，`pipe.det_filter` 逐帧执行——小人框（long<30）不再进入
+> 裁剪与检脸。历史上的 `_face_step` 专用路径（声明却不执行）已删除，详见 §4.1 与文末
+> [历史差异与修复](#历史差异与修复2026-10-16已关闭)。
 
 ## 3. 数据流（逐阶段记录怎么变）
 
-以下按**测试台实际执行**的路径描述（`_face_step`）；被跳过的 det_filter 以虚框标注。
+以下按**通用 `Pipeline.step`**（全链路统一执行路径）描述：
 
 ```
 视频帧 ──FM0003 要图决策（每 5 帧取 1，积压自适应放宽）
             │ 要图的帧（驱动层 pipe.frame.wants_frame 门控；帧记录：frame_idx/ts）
             ▼
-        YOLO0003 纯推理（_face_step 内 pipe.yolo.infer(frame, track=False)）
-            │ → Detection 列表（bbox/score/cls_id=0；track 不启用）
-            │  ┌─────────────────────────────────────────────┐
-            │  │ DF0003 检测筛选（long>=30）——测试台路径**不执行** │
-            │  │ 全部 dets 直接下探（小人框 long<30 也进裁剪）      │
-            │  └─────────────────────────────────────────────┘
+        YOLO0003 纯推理（pipe.yolo.infer(frame, track=False)）
+            │ → Detection 列表（bbox/score/cls_id=0；人脸链不启用 track）
+            │ 产物 yolo.dets（筛选前原始检出）
             ▼
-        CROP0003 目标裁剪（f_crop.run(frame, dets, ts)，按人框裁人）→ CropResult 列表
-            │ （旁路字段 img=人子图；bbox/offset/scale/cls_id/score 入主干）
+        DF0003 检测筛选（long>=30；group_limits 人≥1）
+            │ 有效检测才下探（小人框 long<30 视为"未识别"）
+            │ 产物 det_filter.dets（放行子集）
             ▼
-        FDET0002 人脸检测（fstage.run(frame, crops, ts)，FaceStage）
+        CROP0003 目标裁剪（按人框裁人）→ CropResult 列表
+            │ （对象字段 img=人子图；记录化后旁路键 image；bbox/offset/scale/cls_id/score 入主干）
+            │ 产物 target_crop.crops（逐对象一条记录，各带一张 image）
+            ▼
+        FDET0002 人脸检测（FaceStage.run(frame, crops, ts)）
             │ ① 在人子图里跑 SCRFD 检脸（bbox/kps，子图坐标系）
             │ ② to_original() 把脸框/关键点还原回原图坐标
             │ ③ Cropper.extract 从**原帧**裁原分辨率人脸图（margin 外扩，零缩放）
             │ ④ 人脸框 IoU>dedup_iou(0.6) 去重（上游重叠人框会让同一张脸进多个子图）
+            │ 产物 face_detect.faces
             ▼
         FaceResult 列表（person_bbox / face_bbox / face_img / score / kps / upscale / index）
             │ 逐张落盘为原分辨率人脸图（face_{序号}_{ts}s.{格式}）
             ▼
-        链路输出 = 原分辨率人脸图 + timeline（仅 frame_manager / target_crop / face_detect 三段）
+        链路输出 = 原分辨率人脸图 + timeline（frame / yolo / det_filter / target_crop / face_detect 全阶段）
 ```
 
 关键机制：
 
-- **两级裁剪**：第一级「目标裁剪」按 YOLO 人框机械裁人子图（旁路字段 `img`）；
+- **两级裁剪**：第一级「目标裁剪」按 YOLO 人框机械裁人子图（旁路字段 `img`，记录化后 `image`）；
   第二级在人子图内检脸（识别模块内部），再把脸框还原回原图、从**原图**裁原分辨率人脸
   （`FaceStage` 归属人脸检测模块，见 [人脸检测](../modules/face_detect.md) §1）。
-- **人脸链走专用路径**：测试台的 `_face_step` 直接编排 YOLO → 目标裁剪 → FaceStage，
-  不经 `Pipeline.step`；`Pipeline.step` 本身不装配人脸阶段（`FaceStage` 只由 web 人脸路径构造）。
+- **统一走 `Pipeline.step`**：装配层（`_chain_from_spec`）按 `face_detect` 阶段构造 `FaceStage`
+  注入 `Pipeline.face` 插槽，逐帧统一编排（见 §4.1）；`det_filter` 因此真正生效。
 - **无事件尾**：本链路不以 `det_filter`/`seq_filter` 收尾，也不构造报送；输出即落盘人脸图。
   这与 PIPE0001（VLM+事件）、PIPE0002（车牌事件）不同。
-- **旁路字段**：人子图与出的人脸图是图像旁路，不进 JSON 主干（记录契约见 `umvp/pipe/records.py`）。
+- **旁路字段**：人子图与出的人脸图是图像旁路（统一键 `image`，旧名 `img`/`face_img` 兼容），
+  不进 JSON 主干（记录契约见 `umvp/pipe/records.py`）。
+- **端口连线（P5）**：本链路未显式声明 `inputs`，全部按现状默认取数（frame←本帧原帧、
+  dets←当前检测流、crops←上游目标裁剪 `last_crops`），与产物名 `frame_manager.frame` /
+  `yolo.dets` / `det_filter.dets` / `target_crop.crops` / `face_detect.faces` 一一对应。
 
 ## 4. 运行方式（test.html 链路测试台）
 
@@ -120,13 +128,14 @@ frame_manager → yolo → det_filter → target_crop → face_detect
 > 即报错。历史例外见文末「历史差异与修复」。
 
 > 注：`/api/test/chain`（`h_chain`）与 `/api/test/pipeline_run` 共用同一装配器
-> （`_chain_from_spec`，`server.py:1677` / `:1589`）；测试台**选链路运行**用人脸链入口
+> （`server.py` 的 `_chain_from_spec`）；测试台**选链路运行**用人脸链入口
 > `/api/test/pipeline_run`（`test.html` 的 `fetch('/api/test/pipeline_run', …)`），人脸图的
 > 展示与落盘由它承担。
 
 ### 4.2 timeline 阶段标签与落盘
 
-timeline 条目由 `_stage_order`（`server.py:1029`）驱动，人脸链现在**全阶段**可见：
+timeline 条目由 `_stage_order`（`server.py` 的 `h_pipeline_run`，按 spec `stages` 顺序）驱动，
+人脸链现在**全阶段**可见：
 
 - `frame`（`stage=frame_manager`）：本帧放行；
 - `yolo` / **`det_filter`**（`stage=yolo` / `det_filter`）：检出与筛选统计（如
@@ -146,7 +155,7 @@ timeline 条目由 `_stage_order`（`server.py:1029`）驱动，人脸链现在*
 - **timeline 结构化时间线**：逐条 `{kind, text, stage, to, stage_label, to_label, data, ts, frame}`，
   kind `face`（检出的人脸，data=FaceResult.to_dict：person_bbox/face_bbox/face_size/score/kps/upscale）
   与 `info`（过程信息，如"裁出 N 张人子图""检出人脸 N 张"）；`frame` 为帧序数。
-  **测试台人脸链的 timeline 不含 det_filter 阶段条目**（该阶段未执行）。
+  **全阶段可见**（含 `det_filter` 阶段条目，见 §4.2）。
 - **落盘上限**：`max_saved_images`（默认 200 张）生效，超限跳过写盘。
 - 结果头含「处理 N 帧 | 截取人脸 N 张」，与另两条链路的「事件 N 个」不同（本链路无事件尾）。
 

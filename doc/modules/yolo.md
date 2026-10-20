@@ -11,9 +11,10 @@
 
 三个职责中，本模块**只保留推理**（`infer()`：conf/iou/imgsz/max_det/classes/device）；
 **有效性过滤**（置信度/尺寸/成组数量，不达标视为"未识别"）归链上独立的
-[检测筛选 DetFilter](det_filter.md) 阶段；**按类报送 + 节流**（构造 `SubmitRequest`）归装配器
-`Pipeline`（`_submits()` / `_pass_dets()`）。这样"画面里有什么"与"哪些算有效""多久往下送一次"
-解耦，检测筛选可作几乎所有模块的下游。
+[检测筛选 DetFilter](det_filter.md) 阶段；**按类报送**（构造 `SubmitRequest`）归装配器
+`Pipeline`（`_submits()`）。这样"画面里有什么"与"哪些算有效""多久往下送一次"
+解耦，检测筛选可作几乎所有模块的下游。向下传递的节流/变化门控由 [时序判定 SeqFilter](seq_filter.md)
+（`throttle`/`change`，承接原 `check_interval`/`track_change_only`）承担。
 
 ## 2. 参数
 
@@ -73,6 +74,10 @@ classes="0,2"`
 
 - `infer(frame, track=False) → list[Detection]`：**纯推理结果**，不做有效性过滤
   （不达标目标也在此）；`track=True` 用跟踪器保持 track_id 稳定。
+- 端口声明（模块自描述，P5 端口协议）：`INPUTS = {"image": "Image"}`、`OUTPUTS = {"dets": "Records"}`
+  ——产物 `yolo.dets`＝本帧纯推理原始检出（筛选前），逐帧登记在 `Pipeline.artifacts`。
+  下游可经 `inputs` 连它（如 `det_filter.dets` 端口连 `yolo.dets` 即"筛选前"语义）；
+  `yolo.image` 本期已纳入解析，spec 可换送 YOLO 的图（默认＝本帧原帧，零回归）。
 - 有效性 → 链上 `Pipeline.det_filter`（DetFilter，对所有下游一致生效）。
 - VLM 报送（→`SubmitRequest`）→ `Pipeline._submits`（按类分组；节流/变化门控在上游
   det_filter/seq_filter 已生效）。`SubmitRequest` 字段（track_key/gran/ref/det/dets）与

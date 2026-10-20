@@ -36,9 +36,10 @@
 select→VARCHAR(64) / file|str→VARCHAR(255) / text→TEXT），而非一律 TEXT——这样才能按列
 约束/查询；具体映射表见 [`../guides/database_schema.md`](../guides/database_schema.md) §6。
 
-**列变更双向收敛（改 schema 不用手工 DDL）**：加参数 → `init_db()` 对每个已注册模块校验
-表/列存在性（`SHOW COLUMNS`），缺列时 `ALTER TABLE ... ADD COLUMN` 自动补列；参数下线/标记
-`test_only` 后其历史列自动删除（`_prune_stale_columns`）。取舍：**列随 schema 双向收敛**
+**列变更双向收敛（改 schema 不用手工 DDL）**：加参数 → `init_db()` 对每个已注册模块
+（`_ensure_module_table`）校验表/列存在性（`SHOW COLUMNS`），缺列时
+`ALTER TABLE ... ADD COLUMN` 自动补列；参数下线/标记 `test_only` 后其历史列自动删除
+（`_prune_stale_columns`）。取舍：**列随 schema 双向收敛**
 （2026-09-20 起，原"删参数不删列（保守）"约定作废）——参数数据可再生，一致性优先。
 
 **读写路径**：save = 事务内 upsert `presets`（`params_json=''`）+ upsert
@@ -93,6 +94,14 @@ web_lab 已支持把模块参数以 `kind='module'` 存入 `presets`。目标：
 3. **引用完整性（缺）**：直接删除被链路引用的模块 preset 会让链路悬空 → `delete_preset`
    先查引用、命中则**拒绝并报错（带链路名）**；DB 层加 `FOREIGN KEY ... ON DELETE RESTRICT` 兜底。
 
+**阶段间端口连线随 meta JSON 存（不新建列/表）**：P5 端口协议引入的 stage `inputs`
+（`{端口: 上游产物名}`，即"这条线接哪个上游产物"）**不落在 `pipeline_steps`**，而是存进
+`pipelines.meta_json.stage_inputs`（`{module_id: {端口: 上游产物名}}`）；`load_pipeline`
+取回时回填到各 stage 的 `inputs`。理由：连线随模块/端口演进，给步骤表加列会牵动外键与
+`position` 语义；而 `meta_json` 已是链路级扩展字段（`description` 同处），改这里零 DDL，
+旧链路无此键即零回归。当前结构事实见
+[`../guides/database_schema.md`](../guides/database_schema.md) §4.2。
+
 **为什么用子表而非 JSON 列**：MySQL 表本身无序 → 顺序需要显式 `position` 列；子表可加外键、
 可直接回答"哪些链路引用了这个 preset"；覆盖链路 = 删 steps 重建（事务保证原子）。
 
@@ -105,7 +114,7 @@ web_lab 已支持把模块参数以 `kind='module'` 存入 `presets`。目标：
 |---|---|
 | `list_pipelines()` | 列出全部链路（含每步 `{position, preset_id, module_id}`），按 `updated_at DESC` |
 | `save_pipeline(name, preset_ids, streams=1, budget=None, meta=None)` | 新建/同名覆盖；校验步骤非空、preset 存在且为 `kind='module'`；事务内重建 steps，返回 `(id, 是否新建)` |
-| `load_pipeline(pipeline_id)` | 按 id 取回完整链路：`{id, name, streams, budget, meta, stages:[...]}` |
+| `load_pipeline(pipeline_id)` | 按 id 取回完整链路：`{id, name, streams, budget, meta, stages:[...]}`；stages 的 `inputs` 由 `meta.stage_inputs` 回填（P5 端口连线，旧链路无此键则不加） |
 | `delete_pipeline(pipeline_id)` | 删除链路（steps 级联/显式删），幂等 |
 | `delete_preset(...)`（改动） | 先查 `pipeline_steps` 引用，命中则抛 `ValueError`（含链路名） |
 

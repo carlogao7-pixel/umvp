@@ -74,8 +74,12 @@ PIPE0002 车牌识别链路（pipelines 表，streams=1）
   同一辆车 `track_cooldown` 秒内只识别一次、`track_cooldown=0` 只识别一次（应对首帧模糊）。
 - **坐标还原**：车牌框在车辆子图坐标系里检出，经 `CropResult.to_original()` 还原到原图
   （除以 scale 加 offset）；原分辨率车牌小图由 `Cropper.extract` 从**原帧**直接裁出（零缩放）。
-- **旁路字段**：车图（crop `img`）与车牌小图（`plate_img`）是图像旁路，不进 JSON 主干；
-  主干只带文本/坐标/score（记录契约见 `umvp/pipe/records.py`）。
+- **旁路字段**：车图（crop `img`，记录化后统一键 `image`）与车牌小图（`plate_img`，记录化后
+  `image`）是图像旁路，不进 JSON 主干；主干只带文本/坐标/score（记录契约见 `umvp/pipe/records.py`）。
+- **端口与连线（P5）**：本链路未显式声明 `inputs`，各阶段按现状默认取数（零回归）——产物名
+  `frame_manager.frame` → `yolo.dets` → `det_filter.dets` → `target_crop.crops` →
+  `plate_recog.plates` → `seq_filter.dets`，逐帧登记在 `Pipeline.artifacts`。`plate_recog.crops`
+  等端口已开放显式连线（`inputs`），默认不写即现状。链路尾 `Pipeline.last_events` ＝末段记录携带的事件汇总。
 
 ## 4. 运行方式（test.html 链路测试台）
 

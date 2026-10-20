@@ -82,11 +82,11 @@
 | `seq_filter` | 时序门控（检测流）+ 事件尾 | throttle、change、rules |
 | `target_crop` | 按上游检测框裁子图 | out_size、margin、classes、filter |
 | `annotate` | 帧上画检测框（供 VLM） | thickness、show_label、classes、filter |
-| `vlm` | 大模型研判（素材 + 推理） | max_resolution、image_source、image_pick、prompt、use_real_vlm、vlm_endpoint/model/key |
+| `vlm` | 大模型研判（素材 + 推理） | max_resolution、image_source、image_pick、prompt、use_real_vlm、vlm_endpoint、vlm_model、vlm_key |
 | `plate_recog` | 车牌识别（消费车图） | detect_level、mode、margin、dedup_iou、track_dedup、track_cooldown |
 | `face_detect` | 人脸检测（消费人图） | device、det_thresh、det_size、max_num、use_crop、margin、dedup_iou |
 | `face_embed` | 人脸嵌入 | device |
-| `face_store` | 向量底库检索 | db_path、thresh、topk、device |
+| `face_store` | 向量底库检索（**非链路阶段**：未纳入链路装配，声明进 spec 会校验报错） | db_path、thresh、topk、device |
 
 **VLM 送审素材（`image_source` 选「哪张」× `image_pick` 选「几张」）**：
 - `vlm.image_source` ＝送审用**哪一类**图——`annotated`（默认，＝带框图，无上游 `annotate` 时回退
@@ -96,6 +96,13 @@
   （送**图集全部**，多图 OpenAI 兼容 payload）。仅 `image_source=crops` 且该类命中多个目标时才有区别；
   单图源下 `first`/`all` 等价。
 - **缺省＝现状（零回归）；缺源一律回退、不报错**（`crops` 未命中 → `annotated` → 原帧）；参数细节见 `doc/modules/vlm.md`。
+
+**VLM 端点配置（`vlm_endpoint` / `vlm_model` / `vlm_key` 三项）**：解析**优先级＝环境变量 > 阶段参数 > 内置默认**
+（部署级强制覆盖；导出即整条链路切端点，无需改 spec）——`VLM_ENDPOINT` / `VLM_MODEL` / `VLM_API_KEY`
+（key 兼容别名 `GLM_API_KEY`，两者都设时 `VLM_API_KEY` 优先）；**不设任何 env 时逐字回落** 阶段参数 → 内置默认
+（`vlm_endpoint` 默认 `http://117.42.21.253:8000/v1/chat/completions`、`vlm_model` 默认 `qwen3-vl-32b`、`vlm_key` 默认空）
+＝**零回归**。真调时 401/403（鉴权）/429（限额）抛**中文可读提示**（如提示导出 `VLM_API_KEY`/`GLM_API_KEY`），
+每轮最多提示一次、**不中断整轮测试**。三项与 `use_real_vlm` 均以 `list_modules` 现取为准。
 
 > **连线校验**：`validate_spec` 对非法取值报错，对「声明 `annotated` 但上游无 `annotate`」「声明
 > `crops` 但上游无 `target_crop`」给**警告**（非致命，缺源自会回退）。历史注脚：`target_crop + vlm`
@@ -218,6 +225,8 @@ class Annotator:
 - [ ] VLM 送审素材：`image_source` 选**哪张**（缺省 `annotated`＝零回归；选 `crops` 须链路含 `target_crop`，
       选 `annotated` 建议含 `annotate`），`image_pick` 选**几张**（缺省 `first`＝只送首张；`all`＝图集全部）；
       缺配套仅警告 / 回退（见 §2）。
+- [ ] VLM 端点（可选）：`vlm_endpoint`/`vlm_model`/`vlm_key` **环境变量优先**（`VLM_ENDPOINT`/`VLM_MODEL`/
+      `VLM_API_KEY`，key 兼容 `GLM_API_KEY`）；不设 env 时回落阶段参数 → 默认（零回归，见 §2）。
 - [ ] VLM 报送哪些检测：需要时用 `vlm.inputs.dets`（`yolo.dets`＝筛选前 / `det_filter.dets`＝筛选后）；
       **`vlm.inputs.image` 不支持**，图片源一律用 `image_source`。
 - [ ] 车牌链：`yolo.classes="2"` → `det_filter` → `target_crop(classes="2")` → `plate_recog`

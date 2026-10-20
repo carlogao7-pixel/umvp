@@ -74,6 +74,13 @@ SCRFD 人脸检测（InsightFace buffalo_l 包 det_10g.onnx）：定位人脸 +
 - `FaceStage`：消费上游「目标裁剪」的 `CropResult` 子图，产出原分辨率人脸
   （`FaceResult`：person_bbox / face_bbox / face_img / score / kps）；链路编排见 [人脸截取链路 PIPE0003](../chains/pipe0003_face_capture.md)。
   记录化（`to_record`）后旁路图像统一键名 `image`（旧名 `face_img` 兼容，指向同一 ndarray）。
+- **端口声明（P5）**：`FaceStage.INPUTS = {"frame": "Image", "crops": "Records"}`、
+  `OUTPUTS = {"faces": "Records"}`——产物 `face_detect.faces` 即产出的人脸记录列表（`image` 旁路＝
+  原分辨率人脸图）。`face_detect.frame` / `face_detect.crops` 本期已纳入 `inputs` 解析，spec 可显式连线；
+  **不声明＝现状默认**（frame←本帧原帧、crops←上游「目标裁剪」的 `last_crops`），零回归。
+- **crops 元素类型归一**：`FaceStage.run` 入口经 `pipe.target_crop.as_crop` 归一——既收 `CropResult`
+  **对象**（现路径 `last_crops`），也收裁剪**记录 dict**（`inputs` 连线取到的 `target_crop.crops`），
+  两者行为逐字等价。
 
 ## 6. 验证
 

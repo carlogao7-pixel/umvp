@@ -54,6 +54,10 @@ UMVP（统一模块化视觉分析管道）是一套自包含的视觉分析系�
 `vlm.image_source` 选哪张 + `image_pick` 选几张（`first` 默认只送首张 / `all` 送图集全部）。语法与
 校验见 `01-shell-standard.md §3`。
 
+**VLM 端点/模型/key**（`vlm_endpoint` / `vlm_model` / `vlm_key`）解析优先级＝**环境变量 > 阶段参数 >
+内置默认**（`VLM_ENDPOINT` / `VLM_MODEL` / `VLM_API_KEY`，key 兼容别名 `GLM_API_KEY`）；不设 env 时零回归。
+细节见 `01-shell-standard.md §2`。
+
 **三类固定数据流**（**运行顺序由壳固定**，不由 stages 数组顺序驱动）：
 
 ```

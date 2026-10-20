@@ -87,10 +87,16 @@
   key=类别；间隔内整类扣留）；② **按车辆**
   （车牌阶段自身）：`track_dedup` 按 track_id 去重——同一 track 只识别一次，
   `track_cooldown` 秒后可重试（应对首帧模糊）。新目标入场延迟由帧管理取帧间隔
-  （frame_skip）兜底。上游跟踪由 `Pipeline.track_needed()` 自动开启
-  （存在车牌阶段时 `yolo.infer(track=True)`）。
+  （frame_skip）兜底。上游跟踪由 `Pipeline.track_needed()` 自动开启——它读
+  `PlateStage.use_track`（＝`track_dedup and mode != "direct"`）：**仅当按车辆去重开启且
+  `mode=crop` 时**，`yolo.infer(track=True)` 才启用。
   实测：车牌识别.MP4 20–35s（90 分析帧 / 332 车辆框）→ 开启前逐帧识别，开启后
   仅 3 次（每车一次，5s 冷却刷新）。
+- **端口声明（P5）**：`PlateStage.INPUTS = {"frame": "Image", "crops": "Records"}`、
+  `OUTPUTS = {"plates": "Records"}`——产物 `plate_recog.plates` 即产出的车牌记录列表
+  （`image` 旁路＝原分辨率车牌图）。`plate_recog.frame` / `plate_recog.crops` 本期已纳入 `inputs`
+  解析，spec 可显式连线；**不声明＝现状默认**（frame←本帧原帧、crops←上游「目标裁剪」`last_crops`），
+  零回归。`PlateStage.run` 入口经 `as_crop` 归一，既收 `CropResult` 对象、也收裁剪记录 dict。
 - 下游：`PlateResult` 可接去重 / 送 VLM 复核 / 事件尾；识别到的新车牌进链路事件尾
   （`SeqFilter` 规则 `kind==plate` + `cooldown<0`），按**车牌号**去重——同车牌只出一次
   事件。车牌链路无 VLM 阶段，不构造报送（日志"报送 0 条"属正常）。

@@ -90,6 +90,10 @@ events = [{"name": 事件名, "ts": 达成时刻, "detail": {"key","count","span
 放行的**原元素**列表：无规则（纯门控）→ 门控存活者；有规则 → 命中单条规则的
 记录、或凑满窗口的第 n 条记录（均带 `events` 列表）；其余扣留。
 
+端口声明（模块自描述，P5 端口协议）：`INPUTS = {"dets": "Records"}`、`OUTPUTS = {"dets": "Records"}`
+——产物 `seq_filter.dets` ＝门控后存活者（逐帧登记在 `Pipeline.artifacts`），下游可经 `inputs`
+引用它表示"门控后"语义。`seq_filter.dets` 端口本期已纳入解析。
+
 ## 5. 上下游衔接
 
 - 上游：任意产出记录列表的模块；链路上紧随 DetFilter（先有效性、后门控/确认）。

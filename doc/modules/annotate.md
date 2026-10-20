@@ -35,12 +35,20 @@
 
 输出：标注后的 BGR 帧（与原帧同尺寸）。类别名映射：`{0:人, 2:车, 3:摩托, 5:公交, 7:卡车}`，未收录用 `cls{编号}`。
 
+端口声明（模块自描述，P5 端口协议）：`INPUTS = {"image": "Image", "dets": "Records"}`、
+`OUTPUTS = {"annotated": "Image"}`——产物 `annotate.annotated`（带框图，图像旁路）。
+
 ## 4. 上下游衔接
 
 - 上游：YOLO 检测框。
 - 下游：VLM（`Pipeline.last_annotated` 作为素材；`web_lab` 的 VLM 素材准备优先用标注图）。
 - 装配：`web_lab/server.py` 的 `_chain_from_spec` 构造 `Annotator` 注入 `Pipeline.annotate`；
-  `Pipeline.step` 在 YOLO 之后产出 `last_annotated`。
+  `Pipeline.step` 在 YOLO 之后产出 `last_annotated`，并登记产物 `annotate.annotated`。
+- 端口连线：`annotate.image` / `annotate.dets` 本期已纳入 `inputs` 解析——spec 可显式声明
+  `"inputs": {"image": "frame_manager.frame", "dets": "det_filter.dets"}` 换上游（如标注筛选后的框）；
+  **不声明＝现状默认**（image←本帧原帧、dets←当前检测流），零回归。
+- 与 VLM 的取图关系：`annotate.annotated` 是 `vlm.image_source=annotated`（默认源）的素材来源；
+  缺 `annotate` 阶段时 VLM 回退本帧原图。
 
 ## 5. 保留链路
 

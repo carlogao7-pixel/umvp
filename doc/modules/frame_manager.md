@@ -67,6 +67,9 @@ frame_skip=15 为警用无人机远角视频实调值（约 0.5s 取一帧 @30fp
 - 上游：视频解码循环（test.html 链路运行器 / FaceMonitor 等取帧层）。
 - 下游：`wants_frame()==True` 的帧才交给 YOLO 识别；推理耗时通过
   `note_inference()` 回喂形成闭环。
+- **端口声明（P5）**：`INPUTS = {}`（链路源头，不消费上游产物）、`OUTPUTS = {"frame": "Image"}`
+  ——产物 `frame_manager.frame` ＝本帧原图，逐帧登记在 `Pipeline.artifacts`，可被下游
+  `inputs` 引用（如 `target_crop.frame` / `annotate.image` / `face_detect.frame`）。
 
 ## 6. 验证
 

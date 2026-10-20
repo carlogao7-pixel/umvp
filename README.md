@@ -27,13 +27,13 @@
 ```bash
 # 在项目根目录下
 
-# 1. 纯逻辑测试（不加载模型，最快）→ 59 项断言
+# 1. 纯逻辑测试（不加载模型，最快）→ 85 项断言
 conda run -n ai python umvp/pipe/test_composer.py
 
 # 2. 通用裁剪模块（纯逻辑 + 轻量性检查 → 26 项断言）
 conda run -n ai python tests/test_cropper.py
 
-# 3. 人脸链路注册+自检（读项目内 face_models/；用 test_imgs 建库并逐条自检 → 7/7 命中）
+# 3. 人脸链路注册+自检（读项目内 face_models/；用 test_imgs 建库并逐条自检 → 35/35 命中）
 conda run -n ai python umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
 
 # 4. YOLO 推理参数对比（重叠场景截图，真实推理）
@@ -50,6 +50,15 @@ conda run -n ai python tests/test_plate_recog_pipeline.py
 
 # 8. 拉取车牌模型到 plate_models/（换机/新克隆必跑一次）
 conda run -n ai python umvp/plate_recog/fetch_models.py
+
+# 9. 其余逻辑断言（不加载模型）：目标裁剪 35 / 标注 16 / 检测筛选 66 / 时序判定 43 /
+#    人脸截取 63 / 人脸提取 28 / 图集与图像源 73 / 端口连线 49 / spec 校验 34 /
+#    agent 运行时 39 / 视频转码 18（详见 INSTALL.md 第四节）
+conda run -n ai python tests/test_target_crop.py
+
+# 10. 链路 spec 校验 CLI（[OK]/[ERR] + 退出码）与真实 VLM 端点配置自检（34 断言）
+conda run -n ai python web_lab/validate_chain.py <spec.json>
+conda run -n ai python web_lab/selfcheck_vlm_env.py
 ```
 
 > 若 `ai` 环境已激活（`conda activate ai`），上述命令简写为 `python ...`。

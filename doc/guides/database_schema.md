@@ -3,14 +3,15 @@
 > 参考手册：web_lab 命名配置暂存（presets）所用 MySQL 库的**当前结构事实**——
 > 表结构、业务 ID 前缀、播种清单、参数表机制、数据快照、读写语义、与 HTTP 接口的对应。
 > 设计动机与决策理由见 [`../design/storage_design.md`](../design/storage_design.md)（本文只记结构，不重复论证）。
-> 数据依据：2026-10-16 对运行实例的实测；与代码同步更新。
+> 数据依据：2026-10-16 对运行实例的实测；结构说明 2026-10-19 与代码复核更新。
 
 ## 1. 概览
 
 - **用途**：web_lab 前端"命名配置暂存/取用"的后端存储，把各模块/链路的命名配置
   （preset）存下来，供以后按名字取回复用。
 - **数据库名**：`umvp`（默认，可用 `MYSQL_DB` 覆盖）
-- **表数量**：3 张主表（`presets` / `pipelines` / `pipeline_steps`）
+- **表数量**：5 张主表（`presets` / `pipelines` / `pipeline_steps` /
+  `pipeline_edges` / `module_ports`，后两张为图编排 P2-1，见 §5.5/§5.6）
   \+ 每模块一张参数表 `preset_params_<module_id>`（当前 11 张，见 §6）
 - **ID 规则**：presets.id / pipelines.id 为"前缀+4 位序号"的业务编号
   （如 `YOLO0001`、`PIPE0001`），新建时按前缀自动递增；前缀表见 §3.2
@@ -91,8 +92,8 @@ CREATE TABLE `presets` (
 | yolo | YOLO | target_crop | CROP |
 | vlm | VLM | plate_recog | PLATE |
 | det_filter | DF | seq_filter | SEQ |
-| face_detect | FDET | （链路：pipelines / kind='pipeline'） | PIPE |
-| face_embed | FEMB | | |
+| face_detect | FDET | face_embed | FEMB |
+| annotate | ANNO | （链路：pipelines / kind='pipeline'） | PIPE |
 
 > 未登记前缀的模块取 `module_id` 前 4 字符大写兜底；`extract_faces`（EXTF）为已下线模块，
 > 前缀仍登记但不再建表/播种。
@@ -184,13 +185,15 @@ CREATE TABLE `pipelines` (
 | name | 链路名 | 必须唯一；重复保存＝覆盖旧链路（id 不变、步骤重建），不新建 |
 | streams | 路数 | 多路外推，默认 1 |
 | budget_json | 资源预算 | JSON，如 `{"vram_mb": 8192}`；链路级字段，不属于任何模块 |
-| meta_json | 扩展字段 | JSON，如场景描述；链路级字段 |
+| meta_json | 扩展字段 | JSON，链路级字段：场景描述 `description` + **端口连线 `stage_inputs`**（2026-10-19 图编排 P2-1 起：连线的一等公民是 `pipeline_edges` 表（§5.5），保存时**双写** meta；读取优先级 `pipeline_edges > meta.stage_inputs > 代码默认`。meta 里的形状规范为位置键 `{"#<position>": {端口: 产物名}}`，产物名为全名 `{module}#{position}.{artifact}`（短名在唯一实例时亦可）；`load_pipeline` 取回时回填到对应 stage 的 `inputs`，与只读 meta 时逐字节一致；旧链路 meta 无此键则原样（零回归） |
 | created_at / updated_at | 时间戳 | 列表按 `updated_at DESC, id DESC` 倒序 |
 
 ### 4.3 当前数据快照（2026-10-16 实测）
 
 - 行数：**3**——`PIPE0001` 警用无人机链路、`PIPE0002` 车牌识别链路、`PIPE0003` 人脸截取链路
   （均 streams=1，meta 带 description），步骤引用见 §7。
+- 三条保留链路由 `_seed_pipeline()` 播种，meta **仅含 `description`、无 `stage_inputs`**——
+  端口连线只在经设计器保存过连线的链路里才有。
 
 ## 5. 表：`pipeline_steps`（链路步骤）
 
@@ -221,18 +224,78 @@ CREATE TABLE `pipeline_steps` (
 | position | 步骤顺序 | 同链路内 0..n-1 唯一；`load` 按它排序还原链路 |
 | preset_id | 模块配置引用 | 外键 → `presets.id`（如 YOLO0001），且该行 `kind` 必须为 `module`；"角色"（yolo/vlm…）从 `presets.module_id` 反查，不另存 |
 
+> 阶段间**端口连线**（`inputs = {端口: 上游产物名}`）自 2026-10-19（图编排 P2-1）起
+> 独立落 `pipeline_edges`（§5.5），并与本表**同一事务**按提交的 `stages` 数组重建
+> （`position` = 数组下标）；`pipelines.meta_json.stage_inputs` 作为双写副本与回退读路径保留。
+
 ### 5.3 引用完整性
 
 - 删链路 → 步骤级联删除（`ON DELETE CASCADE`）。
 - 删被引用的模块 preset → **拒绝**：`ON DELETE RESTRICT` 兜底 + `delete_preset` 先查引用、
   报错带引用它的链路名。
 
-### 5.4 当前数据快照（2026-10-16 实测）
+### 5.4 当前数据快照（2026-10-19 实测）
 
 - 链路步骤共 **17**：PIPE0001 的 0..5 引用 FM0001 / YOLO0001 / DF0001 / ANNO0002 /
   VLM0001 / SEQ0001；PIPE0002 的 0..5 引用 FM0002 / YOLO0002 / DF0002 / CROP0002 /
   PLATE0002 / SEQ0002；PIPE0003 的 0..4 引用 FM0003 / YOLO0003 / DF0003 / CROP0003 /
   FDET0002。
+- `pipeline_edges` **0 行**：三条保留链路未显式声明连线（全走代码默认取数规则）；
+  只有经设计器保存过显式连线的链路才会落行（设计稿 `design/graph_chain.md` §3.3）。
+
+### 5.5 表：`pipeline_edges`（链路连线，图编排 P2-1）
+
+```sql
+CREATE TABLE IF NOT EXISTS pipeline_edges (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  pipeline_id   VARCHAR(24) NOT NULL,
+  dst_position  INT NOT NULL,             -- 下游阶段位置（= stages 数组下标）
+  dst_module_id VARCHAR(32) NOT NULL,     -- 冗余：便于审计/兼容旧读法
+  dst_port      VARCHAR(32) NOT NULL,
+  src_position  INT NULL,                 -- 上游阶段位置；NULL=帧源
+  artifact      VARCHAR(96) NOT NULL,     -- 产物全名 {module}#{position}.{artifact}
+  edge_seq      INT NOT NULL DEFAULT 0,   -- 同端口多入边排序（fan_in 端口，P2-3 启用）
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_edge (pipeline_id, dst_position, dst_port, src_position, artifact),
+  KEY idx_pipe (pipeline_id),
+  CONSTRAINT fk_edge_pipe FOREIGN KEY (pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+```
+
+| 字段 | 含义 | 说明 |
+|---|---|---|
+| dst_position / dst_port | 连线终点 | 下游阶段位置 + 输入端口名 |
+| src_position | 连线起点 | 上游阶段位置；由产物全名的 `#position` 解析而来 |
+| artifact | 产物名 | 规范全名 `{module}#{position}.{artifact}`；短名在保存时**原样保留**（往返一致），解析时按唯一实例归一 |
+| edge_seq | 同端口序号 | 仅 `fan_in=1` 的端口会有 `>0`（本期无此类端口） |
+
+- **只存显式声明**：默认取数规则仍属代码契约，不落行（避免双真相源）。
+- **单上游不变式**由写入期校验承担（读 `module_ports.fan_in`），`uk_edge` 只防完全重复的边
+  ——MySQL 唯一键无法条件化，硬凹会牺牲可读性。
+- 保存链路时与本表**同一事务**重建（插删阶段后 `position` 随数组下标重排）。
+- 迁移：`web_lab/migrate_stage_inputs.py`（`--dry-run` / `--only <PIPE号>`，幂等；
+  旧 `module_id` 键遇多实例时返回 1 并跳过，要求人工确认，不静默猜）。
+
+### 5.6 表：`module_ports`（端口能力目录，图编排 P2-1）
+
+```sql
+CREATE TABLE IF NOT EXISTS module_ports (
+  module_id   VARCHAR(32) NOT NULL,
+  direction   ENUM('in','out') NOT NULL,
+  port_name   VARCHAR(32) NOT NULL,
+  io_type     VARCHAR(16) NOT NULL,          -- Image | Images | Records
+  fan_in      TINYINT(1) NOT NULL DEFAULT 0, -- 1=允许多条入边（过渡节点用）
+  resolved_by ENUM('pipe','driver') NOT NULL DEFAULT 'pipe',
+  PRIMARY KEY (module_id, direction, port_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+```
+
+- **真相源仍是代码**（模块类 `INPUTS`/`OUTPUTS` + `composer.ARTIFACT_TYPES`）；本表是
+  启动时 `db.upsert_module_ports(server.module_ports_catalog())` 幂等 upsert 的**可查询副本**，
+  与代码不一致即启动告警并以代码为准收敛。
+- 当前 **21 行**（普通模块入端口 `fan_in=0`）；`resolved_by='driver'` 仅 `vlm.dets`
+  （`vlm.image` 走 `image_source`，P2-4 才归零）。
+- `fan_in` / `Images` / `resolved_by` 为 P2-3/P2-4 预置，本期建好不用。
 
 ## 6. 每模块一张参数表（`preset_params_<module_id>`，列式存储）
 
@@ -259,8 +322,10 @@ CREATE TABLE `pipeline_steps` (
 - **隐藏运行器不注册**：chain / face_monitor / frame_yolo（另有 no-params 的 pipeline_run）
   是 web 端运行入口而非产品模块，不建参数表、其参数 preset 不落库（保存时报
   "schema 未注册"）。
-- **schema 双向收敛**：表与列由 `init_db()` 按 `configure_modules()` 注册的 schema 自动管理——
-  模块加参数自动 `ALTER TABLE ... ADD COLUMN` 补列；参数删除或标记 `test_only` 后其历史列
+- **schema 双向收敛（加参数自动补列）**：`init_db()` 对每个已注册模块调 `_ensure_module_table`——
+  建表（`CREATE TABLE IF NOT EXISTS`）后用 `SHOW COLUMNS` 比对现有列，缺列自动
+  `ALTER TABLE ... ADD COLUMN ... NULL` 补上（如 2026-10-16 新增的 `vlm.image_pick` 列，
+  重启 / 换机拉代码即自动补）；参数删除或标记 `test_only` 后其历史列
   自动 `DROP COLUMN`（`_prune_stale_columns`，2026-09-20 起，原"删参数不删列"约定作废）。
 - **test_only 测试参数不落库**：测试图片 / 演示回填字段 / 事件脚本等仅存在于 web 模块
   测试页（PARAMS 里标 `"test_only": true`，前端单独分区展示），不注册 schema、不建列；

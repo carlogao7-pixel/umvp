@@ -92,7 +92,10 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
 ## 四、协作规约（多代理）
 
 - **收件箱**：任何代理完成改动 / 发现新坑 / 产生需归档内容 → **先追加**到
-  `.opencode/memory/inbox.md`（只追加，格式见文件头）；**不直接改** `CLAUDE.md` / `DEPLOYMENT.md`。
+  `.opencode/memory/inbox.md`（只追加，格式见文件头；写入可直接 `ledger.py append`）；
+  **不直接改** `CLAUDE.md` / `DEPLOYMENT.md`。**记录不重复**：回报全文只落 inbox 一处，
+  工单备注 / 台账只写结论 + 编号引用；取记录用 `ledger.py get INB-xxxx`（单条），
+  勿读整个 inbox.md。
 - **工单（任务流）**：`.opencode/memory/tickets.md` ＋ 工具 `.opencode/tool/ticket.py`
   （`new/set/list/show/check`，零依赖，改完必跑 `check`）。用户需求经 orchestrator 审核澄清后
   开**主单**（`WO-xxxx`）再派发；各代理开工前建**子单**（`WO-xxxx.n`，发起人=自己，可
@@ -102,8 +105,10 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
   `DEPLOYMENT.md`；**涉及 `doc/` 项目文档或新建文档时，必须先列出建议征求用户同意再写入**。
   已处理条目移入「已同步」（注明去向）。
 - **代理互调**：会话内用 `@<agent>` 派遣其他板块代理；被派发代理的返回即同步回当前会话。
-- **模型配置**：各代理 `model` 写在对应 `.opencode/agent/<name>.md` frontmatter
-  （省略则沿用默认主模型）；改完 agent/config 需**重启 opencode** 生效。
+- **模型配置**：五代理 frontmatter **不设** `model`，默认 = 项目 `.opencode/opencode.json`
+  的 `model`。会话内 `/model` 切换**即时生效且子代理跟随**（子代理继承父会话模型，
+  零重启）；差异化/持久切换 = 在对应 agent frontmatter 写 `model:`（新会话生效）。
+  改 agent/config 文件本身需重启 opencode 加载。
 - **部署台账**：影响部署的改动（依赖 / 模型 / 环境变量 / DB / 标定 / 入口 / 结构 / 配置）
   验证后向 `DEPLOYMENT.md`「记录」顶部追加一条（格式与判断清单见该文件）。
 - **git（多机同步）**：仓库 GitHub `carlogao7-pixel/umvp`，分支 `main`，远端 SSH 已认证。
@@ -141,13 +146,22 @@ $PY tests/test_police_uav_video.py        # 警用链路端到端（真实 YOLO 
 $PY tests/test_face_extract_pipeline.py   # 人脸提取链路
 $PY tests/test_face_capture_pipeline.py   # 人脸截取链路（PIPE0003）
 $PY tests/test_plate_recog_pipeline.py    # 车牌识别链路
+$PY tests/test_image_source.py            # 送审图像源 + 图集契约（image_of/image_set_of）
+$PY tests/test_port_inputs.py             # 端口连线（stage_inputs）端到端
+$PY tests/test_validate_chain.py          # spec 校验器（含 inputs DAG）
+$PY tests/test_video_transcode.py         # 视频转码
+$PY tests/test_yolo_standalone.py         # YOLO 单模块跑图（探索性，无断言计数）
 $PY tests/test_agent_runtime.py           # 挂载 agent 运行时（离线）
 $PY tests/test_yolo_params.py             # YOLO 参数对比（真实推理，较慢）
 $PY umvp/face_embed/test_face_embed.py --register-dir umvp/face_detect/test_imgs/ --self-check --db out/face_db.npz
 $PY umvp/resources.py                     # 资源估算自检（读 out/fingerprints.json 若存在）
 $PY web_lab/calibrate.py                  # 实测标定 → out/fingerprints.json（换机必跑）
 $PY web_lab/validate_chain.py <spec.json> # 链路 stages spec 校验
+$PY web_lab/selfcheck_vlm_env.py          # 真实 VLM 端点 env 注入自检（不打网络，34 断言）
 $PY umvp/plate_recog/fetch_models.py      # 拉取车牌模型（换机 / 新克隆必跑）
+python3 .opencode/tool/ticket.py check    # 工单表结构校验（改工单后必跑）
+python3 .opencode/tool/ledger.py get <编号>  # 按编号取记录单条（INB/WO/DEP；代理取记录用，勿读全文件）
+bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂等，见 doc/guides/ticketd_service.md）
 ```
 
 ## 七、注意事项
