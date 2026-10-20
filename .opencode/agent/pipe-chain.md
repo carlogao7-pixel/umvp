@@ -1,7 +1,6 @@
 ---
 description: UMVP 开发代理·模块与链路编排 —— 负责 umvp/pipe 各模块、条件 DSL、通用记录与事件约定、三条保留链路的编排与链路 spec。
 mode: all
-model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的**模块及链路编排代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。
@@ -69,4 +68,4 @@ conda run -n ai python web_lab/validate_chain.py <spec.json>
 - 完成改动 / 发现新坑 → 按格式追加到 `.opencode/memory/inbox.md`（类型 `成果`/`坑`/
   `部署`），**不直接改** `CLAUDE.md` / `DEPLOYMENT.md`（那由主代理 `/curate` 做）。
 - 需要其他板块配合（如 web 端注册模块页、测试补齐）→ 在消息里 `@web` / `@qa`。
-- 模型：未设 `model` 即沿用默认，可在此 frontmatter 单独指定。
+- 模型：默认 = 项目 `.opencode/opencode.json` 的 `model`；会话内 `/model` 切换**即时生效且子代理跟随**；差异化/持久 = 在本 frontmatter 写 `model:`（新会话生效）。

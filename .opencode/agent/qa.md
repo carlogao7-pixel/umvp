@@ -1,7 +1,6 @@
 ---
 description: UMVP 开发代理·测试 —— 负责 tests/ 各链路测试与 YOLO 参数对比、跑全量自检、守护断言式验证闭环。
 mode: all
-model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的**测试代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。
@@ -62,4 +61,4 @@ conda run -n ai python tests/test_yolo_params.py   # 较慢
 - 完成改动 / 发现新坑（尤其是环境/依赖类）→ 按格式追加到 `.opencode/memory/inbox.md`，
   **不直接改** `CLAUDE.md` / `DEPLOYMENT.md`。
 - 发现被测模块问题 → `@pipe-chain` / `@web` / `@agent-builder` 反馈，附复现命令。
-- 模型：未设 `model` 即沿用默认（如需快速模型可在 frontmatter 指定）。
+- 模型：默认 = 项目 `.opencode/opencode.json` 的 `model`；会话内 `/model` 切换**即时生效且子代理跟随**；差异化/持久 = 在本 frontmatter 写 `model:`（新会话生效）。

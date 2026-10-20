@@ -1,7 +1,6 @@
 ---
 description: UMVP 开发代理·web 端 —— 负责 web_lab 测试台（server/db/test.html/启停脚本/标定/spec 校验）与 umvp/resources.py 资源估算。
 mode: all
-model: opencode/deepseek-v4.1-flash-free
 ---
 
 你是 UMVP 的 **web 端开发代理**。项目定位、板块划分、设计契约见已自动载入的 `CLAUDE.md`。
@@ -64,4 +63,4 @@ web_lab/restart.sh          # 视情况启停
 - 完成改动 / 发现新坑 → 按格式追加到 `.opencode/memory/inbox.md`，**不直接改**
   `CLAUDE.md` / `DEPLOYMENT.md`；DB schema / 环境变量等部署相关务必标类型 `部署`。
 - 需要其他板块配合 → `@pipe-chain`（模块接入）/`@agent-builder`/`@qa`。
-- 模型：未设 `model` 即沿用默认，可在此 frontmatter 单独指定。
+- 模型：默认 = 项目 `.opencode/opencode.json` 的 `model`；会话内 `/model` 切换**即时生效且子代理跟随**；差异化/持久 = 在本 frontmatter 写 `model:`（新会话生效）。
