@@ -819,17 +819,14 @@ function renderStagePresetSel(q, sel, mid){
 
 function addStage(mid, params, presetId, inputs){
   const m = SCHEMA.modules[mid];
-  // 每个模块在一条链路中最多一个阶段：重复点击调色板不会新增重复阶段（防止误加）
-  if (STAGES.some(s => s.module === mid)){
-    alert("「" + (m ? m.name : mid) + "」已在链路中；每个模块只能有一个阶段，请直接修改该阶段参数。");
-    return null;
-  }
+  // 同模块多实例（P2-0 节点实例身份）：允许重复添加；标题标注该模块在本链路的实例序号（#1 起）。
+  const nth = STAGES.filter(s => s.module === mid).length + 1;
   const el = document.createElement("div");
   el.className = "stage";
   const head = document.createElement("div");
   head.className = "stage-head";
   const title = document.createElement("b");
-  title.textContent = m ? m.name : mid;
+  title.textContent = (m ? m.name : mid) + " #" + nth;
   const btns = document.createElement("span");
   btns.className = "stage-btns";
   btns.innerHTML = '<button data-a="fold" title="收起/展开">▾</button>' +
@@ -882,8 +879,11 @@ function upstreamArtifacts(stageIndex){
     const mid = STAGES[i].module;
     const mod = SCHEMA.modules[mid];
     for (const [oname, otype] of Object.entries((mod && mod.outputs) || {})){
-      const name = mid + "." + oname;
-      if (name in arts) out.push({name, type: arts[name] || otype});
+      const short = mid + "." + oname;
+      if (short in arts){
+        // 产物全名（P2-0）：{module}#{position}.{artifact}，position = 本阶段数组下标。
+        out.push({name: mid + "#" + i + "." + oname, short, type: arts[short] || otype});
+      }
     }
   }
   return out;
@@ -932,11 +932,20 @@ function renderWiring(stageEl){
     for (const a of ups){
       if (wantType && a.type !== wantType) continue;  // 只列类型匹配的上游产物
       const op = document.createElement("option");
-      op.value = a.name;
+      op.value = a.name;                 // 全名 {module}#{position}.{artifact}
+      op.dataset.short = a.short;        // 兼容旧数据中的短名连线
       op.textContent = a.name + "（" + a.type + "）";
       sel.appendChild(op);
     }
-    sel.value = inputs[port] || "";
+    // 回填：既有连线可能是全名或短名（旧数据）——按全名精确匹配，退而按短名匹配。
+    const cur = inputs[port];
+    if (cur){
+      const hit = Array.from(sel.options).find(o => o.value === cur)
+        || Array.from(sel.options).find(o => o.dataset.short === cur);
+      sel.value = hit ? hit.value : "";
+    } else {
+      sel.value = "";
+    }
     // 选择回写 stage.inputs（随保存/运行流程走；空=删除该连线，回落默认）
     sel.addEventListener("change", () => {
       const i = STAGES.findIndex(s => s.el === stageEl);
@@ -1094,13 +1103,8 @@ async function savePipelinePreset(){
   // 每个阶段：有绑定 id → 更新该 preset（id 稳定不新建）；无绑定 → 新建并记下 id。
   // 命名统一为「链路名 · 模块名」，仅在新建时落库；既有 preset 若名字不一致也顺带归一。
   // 注意：直接用 STAGES（保有 el / presetId），snapshot() 只返回 {module, params} 会丢失二者。
-  // 防御性去重：同一模块只保留首个阶段（后端亦拒绝重复模块，双保险）。
-  const seenMods = new Set();
-  const stages = STAGES.filter(s => {
-    if (seenMods.has(s.module)) return false;
-    seenMods.add(s.module);
-    return true;
-  });
+  // 同模块多实例（P2-0）：不再去重——节点身份 = stages 数组下标，重复模块各自成阶段。
+  const stages = STAGES;
   const steps = [];
   for (const stage of stages){
     const moduleId = stage.module;
@@ -1126,13 +1130,13 @@ async function savePipelinePreset(){
   }
 
   // 保存链路（steps 重建引用，不复制参数）
-  // 端口连线（inputs）随链路存于 meta.stage_inputs（{module_id: {端口: 上游产物名}}），
-  // 不改 pipeline_steps 表结构；载入时由后端回填到各阶段（见 db.load_pipeline）。
+  // 端口连线（inputs）随链路存于 meta.stage_inputs，键 = 位置串 "#<position>"
+  // （position = STAGES 数组下标，即节点身份）；后端据此写 pipeline_edges 并回填各阶段。
   const stage_inputs = {};
-  for (const stage of stages){
+  stages.forEach((stage, i) => {
     const ins = stage.inputs || {};
-    if (Object.keys(ins).length) stage_inputs[stage.module] = ins;
-  }
+    if (Object.keys(ins).length) stage_inputs["#" + i] = ins;
+  });
   const data = await apiPost("/api/pipelines/save", {
     name: name,
     steps: steps,

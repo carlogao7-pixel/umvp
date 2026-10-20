@@ -319,8 +319,17 @@ def _apply_vlm_inputs(pipe, subs):
       seq_filter.dets=门控后），按 cls_id 分组复用 Pipeline._submits（gran=class 语义）；
     - 产物本帧未登记（如上游无产出）→ 返回默认 submits（不抛错，行为与现状一致）。
     Detection 对象与统一记录 dict（含 cls_id/bbox）均可消费；无 cls_id 的项跳过。
+
+    P2-0：stage_inputs 键为位置串（"#<position>"），取该链路中 **vlm 阶段的位置** 对应项
+    （多实例时取第一个声明了 dets 的 vlm 实例）。
     """
-    art = (getattr(pipe, "stage_inputs", None) or {}).get("vlm", {}).get("dets")
+    si = getattr(pipe, "stage_inputs", None) or {}
+    art = None
+    for pos in ((getattr(pipe, "module_positions", None) or {}).get("vlm") or []):
+        d = si.get(f"#{pos}") or {}
+        if isinstance(d, dict) and d.get("dets"):
+            art = d["dets"]
+            break
     if not art:
         return subs
     items = (getattr(pipe, "artifacts", None) or {}).get(art)
@@ -349,19 +358,55 @@ def _as_detections(items):
 
 
 def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
-    """快速探测端点是否可连（TCP 连接），避免 requests 长超时把整轮测试拖住。"""
+    """快速探测端点是否可连（TCP 连接），避免 requests 长超时把整轮测试拖住。
+
+    https 端点默认端口 443、http 默认 80（与 requests 一致）；无 scheme/host 视为不可达。
+    """
     import socket
     from urllib.parse import urlparse
     try:
         u = urlparse(url)
         host = u.hostname
-        port = u.port or (443 if u.scheme == "https" else 80)
         if not host:
             return False
+        if u.port is not None:
+            port = u.port
+        else:
+            port = 443 if u.scheme == "https" else 80
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except Exception:
         return False
+
+
+# VLM 端点/模型/key 解析：环境变量（部署级强制覆盖）→ 链路阶段参数 → 内置默认。
+# 导出 env 即全链路切到该端点、无需改 DB；不设任何 env 时逐字回落到改动前行为（零回归）。
+VLM_DEFAULT_ENDPOINT = "http://117.42.21.253:8000/v1/chat/completions"
+VLM_DEFAULT_MODEL = "qwen3-vl-32b"
+
+
+class VlmHttpError(RuntimeError):
+    """VLM 端点 HTTP 错误（携带可读中文提示 hint，供上层每轮最多提示一次）。"""
+
+    def __init__(self, status: int, message: str, hint: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.hint = hint
+
+
+def _resolve_vlm_cfg(p: dict) -> tuple:
+    """解析 (url, model, key)：环境变量优先 → spec 阶段参数 → 内置默认。
+
+    env：VLM_ENDPOINT / VLM_MODEL / VLM_API_KEY（key 兼容别名 GLM_API_KEY，
+    两者都设时 VLM_API_KEY 优先）。env 为部署级强制覆盖；未设的项回落 spec、再回落默认。
+    """
+    url = (os.environ.get("VLM_ENDPOINT") or "").strip() \
+        or str(p.get("vlm_endpoint") or "").strip() or VLM_DEFAULT_ENDPOINT
+    model = (os.environ.get("VLM_MODEL") or "").strip() \
+        or str(p.get("vlm_model") or "").strip() or VLM_DEFAULT_MODEL
+    key = ((os.environ.get("VLM_API_KEY") or os.environ.get("GLM_API_KEY") or "").strip()
+           or str(p.get("vlm_key") or "").strip())
+    return url, model, key
 
 
 def _vlm_real(p: dict, payload: dict, frame) -> tuple:
@@ -369,13 +414,14 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
 
     frame：单张 ndarray（现状，单图消息）或图集列表（image_pick=all，OpenAI 兼容
     **多图**消息：多个 image_url content 项 + 末尾 text）。单图路径与改动前**逐字等价**。
+    端点/模型/key 三项经 _resolve_vlm_cfg：env 优先 → spec → 默认。
     timeout=(连接, 读取)：连接阶段最多 5s（端点不可达时快速失败），读取按 vlm_timeout（默认 20s）。
-    注：端点对多图 content 的支持离线无法验证，**待真实端点联调**。
+    4xx（401/403 鉴权、429 限额）抛 VlmHttpError（携带可读中文提示）。
+    注：多图 content 已用智谱 glm-4v-flash 的 OpenAI 兼容 /chat/completions 实证支持
+    （多个 image_url 项 + 末尾 text，按序返回；见 INB-0040）；端点为第三方实现时仍建议自查多图支持。
     """
     import requests
-    url = str(p.get("vlm_endpoint") or "").strip() or "http://117.42.21.253:8000/v1/chat/completions"
-    model = str(p.get("vlm_model") or "").strip() or "qwen3-vl-32b"
-    key = str(p.get("vlm_key") or "").strip()
+    url, model, key = _resolve_vlm_cfg(p)
     read_timeout = int(p.get("vlm_timeout", 20) or 20)
     mr = tuple(payload.get("max_resolution") or (1280, 720))
     frames = list(frame) if isinstance(frame, (list, tuple)) else [frame]
@@ -404,6 +450,13 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
     }
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     resp = requests.post(url, json=body, headers=headers, timeout=(5, read_timeout))
+    status = getattr(resp, "status_code", None)
+    if status in (401, 403):
+        raise VlmHttpError(status, f"VLM 端点需鉴权(HTTP {status})",
+                           "VLM 端点需鉴权：请导出 VLM_API_KEY（或 GLM_API_KEY）")
+    if status == 429:
+        raise VlmHttpError(status, "VLM 端点限额/过载(HTTP 429)",
+                           "VLM 端点限额/过载：429（请稍后重试或更换端点/模型）")
     resp.raise_for_status()
     content_text = resp.json()["choices"][0]["message"]["content"]
     action, description = _parse_vlm_result(content_text)
@@ -1116,14 +1169,16 @@ def h_pipeline_run(p: dict) -> dict:
     if image_source not in VLM_IMAGE_SOURCES:
         image_source = "annotated"
     # 送审张数（image_pick）：first=只送首张（默认，与改动前逐字等价）/ all=送图集全部
-    # （仅 crops 源可能多张；端点多图支持待真实联调）。非法值回落默认 first。
+    # （仅 crops 源可能多张；多图 payload 已由 glm-4v-flash 实证支持，见 INB-0040）。
+    # 非法值回落默认 first。
     image_pick = _str_param(vlm_cfg, "image_pick", "first").lower()
     if image_pick not in VLM_IMAGE_PICKS:
         image_pick = "first"
     vlm_fail = 0  # 真实调用失败次数（网络等），累计供结果提示
+    vlm_hint_shown = False  # 4xx 可读提示每轮最多一条（避免逐帧刷屏）
     # 真实 VLM 端点预探测：不可达则本轮直接跳过真实调用，避免每帧长超时把测试拖住
-    _vlm_url = str(vlm_cfg.get("vlm_endpoint") or "").strip() \
-        or "http://117.42.21.253:8000/v1/chat/completions"
+    # （URL 经 _resolve_vlm_cfg：env VLM_ENDPOINT 优先，与 _vlm_real 保持一致）
+    _vlm_url = _resolve_vlm_cfg(vlm_cfg)[0]
     vlm_unreachable = False
     if feedback and use_real_vlm and not _endpoint_reachable(_vlm_url):
         vlm_unreachable = True
@@ -1197,7 +1252,7 @@ def h_pipeline_run(p: dict) -> dict:
     def _step_out(frame_no, ts, tag, dets, subs, al, frame=None):
         """逐模块展示本帧各自处理的内容（不管是否向下传递），每条带帧序数。"""
         nonlocal detection_count, vlm_fail, plate_count, vlm_unreachable, event_count
-        nonlocal face_count, face_dup
+        nonlocal face_count, face_dup, vlm_hint_shown
         plates = getattr(pipe, "last_plates", [])
         plate_in = getattr(pipe, "last_plate_input", [])
         detection_count += len(dets or [])
@@ -1287,6 +1342,11 @@ def h_pipeline_run(p: dict) -> dict:
                             vlm_fail += 1
                             _emit("fail", f"调用失败({vlm_fail}): {e}", ts, stage="vlm",
                                   frame_no=frame_no, log_line=True, prefix="    ")
+                            hint = getattr(e, "hint", "")
+                            if hint and not vlm_hint_shown:
+                                vlm_hint_shown = True
+                                _emit("info", hint, ts, stage="vlm",
+                                      frame_no=frame_no, log_line=True, prefix="    ")
                             if vlm_fail >= 3 and not vlm_unreachable:
                                 vlm_unreachable = True
                                 _emit("info", "真实 VLM 连续失败≥3，本轮后续改用素材包", ts,
@@ -1622,12 +1682,173 @@ CHAIN_UNRESOLVED_INPUT_MODULES: tuple = tuple(sorted(
     if d.get("inputs") and m not in CHAIN_RESOLVED_PORTS))
 
 
+# ---- 节点实例身份（图编排 P2-0，设计稿 doc/design/graph_chain.md §3.1）----
+# 产物名解析（短名 → 全名、多实例歧义报错）**单一实现**在 pipe.composer（WO-0008.1）；
+# 本处 re-export 同一实现，供 validate_chain / db 复用，避免各写一份。
+from pipe.composer import PortResolutionError as PortResolutionError  # noqa: E402, F401
+
+try:  # pragma: no cover - 取决于 composer 是否已提供（WO-0008.1）
+    from pipe.composer import resolve_artifact as resolve_artifact  # noqa: E402
+    _RESOLVE_ARTIFACT_FROM_COMPOSER = True
+except ImportError:  # composer 未提供时的过渡兜底：语义与契约一致，落地后自动改用 composer
+    _RESOLVE_ARTIFACT_FROM_COMPOSER = False
+
+    def resolve_artifact(name, positions_by_module):  # type: ignore[misc]
+        """产物名 → 全名 ``{module}#{position}.{artifact}``（短名单实例兼容、多实例报错）。
+
+        与 pipe.composer.resolve_artifact 契约一致（WO-0008.1）：已是全名原样返回；
+        短名唯一实例才允许；多实例歧义 / 未知模块 / 空名抛 PortResolutionError。
+        """
+        name = (name or "").strip()
+        if not name:
+            raise PortResolutionError("产物名为空")
+        head, _sep, _tail = name.partition(".")
+        if "#" in head:
+            mod, _h, pos = head.partition("#")
+            if not mod or not pos.isdigit() or not _tail:
+                raise PortResolutionError(f"非法产物全名: {name!r}")
+            return name
+        if "." not in name or not head:
+            raise PortResolutionError(f"非法产物名: {name!r}")
+        poss = list(positions_by_module.get(head) or [])
+        if not poss:
+            raise PortResolutionError(f"未知模块 {head!r}（产物 {name!r}）")
+        if len(poss) > 1:
+            raise PortResolutionError(
+                f"产物短名 {name!r} 有歧义：模块 {head!r} 在本链路有 {len(poss)} 个实例"
+                f"（位置 {poss}），请写全名（如 {head}#{poss[0]}.{_tail}）")
+        return f"{head}#{poss[0]}.{_tail}"
+
+
+def _positions_by_module(module_ids) -> dict:
+    """module_id → 该模块在链路中的位置（数组下标）列表。"""
+    out: dict = {}
+    for i, mid in enumerate(module_ids):
+        out.setdefault(mid, []).append(i)
+    return out
+
+
+# 本期普通模块端口 fan_in 均为 0（fan-in 端口留 P2-3 过渡节点）；新增 fan-in 端口在此登记。
+PORT_FAN_IN: dict = {}
+
+
+def port_fan_in(module_id: str, port: str) -> int:
+    """入端口是否允许多条入边（0=单上游，1=fan-in）。"""
+    return int(PORT_FAN_IN.get((module_id, port), 0))
+
+
+def module_ports_catalog() -> list:
+    """**代码声明**的端口能力目录（module_ports 表唯一真相源）。
+
+    返回 (module_id, direction, port_name, io_type, fan_in, resolved_by) 列表：
+      - 入端口取自模块 INPUTS；resolved_by='pipe' 若该端口在 Pipeline.step 解析
+        （composer.RESOLVED_PORTS），否则 'driver'（如 vlm 的 driver 层解析端口）；
+      - 出端口取自模块 OUTPUTS，resolved_by='pipe'。
+    """
+    from pipe.composer import RESOLVED_PORTS as _RP
+    rows = []
+    for mid, d in module_port_decls().items():
+        pipe_ports = set(_RP.get(mid, ()))
+        for port, io_type in (d.get("inputs") or {}).items():
+            rows.append((mid, "in", port, str(io_type), port_fan_in(mid, port),
+                         "pipe" if port in pipe_ports else "driver"))
+        for port, io_type in (d.get("outputs") or {}).items():
+            rows.append((mid, "out", port, str(io_type), 0, "pipe"))
+    return rows
+
+
+def _build_face_stage(p: dict):
+    """构造人脸检测阶段（FaceStage）；参数取自本阶段（兼容旧 extract_faces 字段）。"""
+    from face_detect.face_detector import FaceDetector
+    from face_detect.face_pipeline import FaceStage
+    from pipe.cropper import Cropper
+    fdet = FaceDetector(
+        device=_str_param(p, "device", "auto"),
+        det_thresh=(_float(p, "det_thresh", 0.0) or _float(p, "face_thresh", 0.4)),
+        det_size=tuple(_int_tuple(p, "det_size", 2) or (640, 640)),
+        use_crop=_bool(p, "use_crop"))
+    margin = _float(p, "margin", 0.0) or 0.15
+    dedup_iou = _float(p, "dedup_iou", 0.0) or 0.6
+    return FaceStage(fdet, Cropper(upscale=1.0, margin=margin), dedup_iou=dedup_iou)
+
+
+def _build_stage_instance(mid: str, p: dict):
+    """按模块类型构造**单个**阶段实例（按位置；同模块多实例各自构造，不再"取第一个"）。
+
+    未知 / 非装配模块返回 None（validate_chain「声明即执行」会报错）。
+    """
+    if mid == "frame_manager":
+        from pipe.composer import FrameManager, SAMPLING_ANALYSIS, backpressure_params
+        return FrameManager(
+            sampling=_str_param(p, "sampling", SAMPLING_ANALYSIS),
+            frame_skip=_int(p, "frame_skip", 3),
+            interval_sec=_float(p, "interval_sec", 3.0),
+            interval_frames=_int(p, "interval_frames", 30),
+            **backpressure_params(_str_param(p, "backpressure", "standard")))
+    if mid == "yolo":
+        from pipe.composer import YOLODetector
+        model = _find_file(_str_param(p, "model_path"), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
+        return YOLODetector(
+            model_path=str(model), conf=_float(p, "conf", 0.35),
+            iou=_float(p, "iou", 0.7), imgsz=_int(p, "imgsz", 640),
+            max_det=_int(p, "max_det", 300), classes=_int_list(p, "classes", None),
+            device=(_str_param(p, "device") or None))
+    if mid == "vlm":
+        from pipe.composer import VLMAnalyzer
+        return VLMAnalyzer(
+            max_resolution=tuple(_int_tuple(p, "max_resolution", 2) or (1280, 720)),
+            prompt=_str_param(p, "prompt"))
+    if mid == "det_filter":
+        return _det_filter_of(p)
+    if mid == "seq_filter":
+        return _seq_filter_of(p, what="gates")
+    if mid == "target_crop":
+        from pipe.target_crop import TargetCrop
+        return TargetCrop(margin=_float(p, "margin", 0.0),
+                          classes=_int_list(p, "classes", None),
+                          filter=_str_param(p, "filter"),
+                          out_size=_str_param(p, "out_size"))
+    if mid == "annotate":
+        from pipe.annotate import Annotator
+        return Annotator(thickness=_int(p, "thickness", 2),
+                         show_label=_bool(p, "show_label"),
+                         classes=_int_list(p, "classes", None),
+                         filter=_str_param(p, "filter"))
+    if mid in ("face_detect", "extract_faces"):
+        return _build_face_stage(p)
+    if mid == "plate_recog":
+        from plate_recog.plate_recognizer import PlateRecognizer
+        from plate_recog.plate_pipeline import PlateStage
+        from pipe.cropper import Cropper
+        tool = Cropper(upscale=1.0, margin=_float(p, "margin", 0.1))
+        td = p.get("track_dedup")
+        return PlateStage(
+            PlateRecognizer(detect_level=_str_param(p, "detect_level", "high")),
+            tool, mode=_str_param(p, "mode", "crop"),
+            dedup_iou=_float(p, "dedup_iou", 0.6),
+            track_dedup=(True if td in (None, "") else _bool(p, "track_dedup")),
+            track_cooldown=_float(p, "track_cooldown", 5.0))
+    if mid == "face_embed":
+        from face_embed.face_embedder import FaceEmbedder
+        return FaceEmbedder(device=_str_param(p, "device", "auto"))
+    return None
+
+
 def _chain_from_spec(spec: dict):
     """按链路 spec 的 stages 组装 Pipeline（模块链路的装配器）。
 
+    节点实例身份（P2-0，设计稿 §3.1）：position = **stages 数组下标**；同模块多实例各自
+    构造（不再"取第一个"静默丢弃），装入 Pipeline（容器 key=位置）。本函数面向真实执行路径，
+    不依赖 DB —— 必须能只凭 stages 数组装配，故装配能力声明在此由代码给出、
+    而非从 DB 读取。
+
+    端口连线：stage 的 "inputs"（端口→上游产物名）解析为 `Pipeline.stage_inputs`，键为
+    位置串 "#<position>"、值为**产物全名** `{module}#{position}.{artifact}`
+    （短名若唯一实例经 resolve_artifact 归一，多实例歧义报错）。spec 声明的每个阶段都必须
+    在此被装配进执行路径（validate_chain 的「声明即执行」断言依据 CHAIN_ASSEMBLED_MODULES）。
+
     YOLO 惰性不加载；含 face_detect / face_embed 阶段时会构造人脸阶段
-    （FaceDetector/FaceEmbedder 构造即加载模型）。spec 声明的每个阶段都必须在此被
-    装配进执行路径（validate_chain 的「声明即执行」断言依据 CHAIN_ASSEMBLED_MODULES）。
+    （FaceDetector/FaceEmbedder 构造即加载模型）。
     """
     from pipe.composer import (
         FrameManager, YOLODetector, VLMAnalyzer, Pipeline,
@@ -1635,111 +1856,61 @@ def _chain_from_spec(spec: dict):
         backpressure_params,
     )
     stages = spec.get("stages") or []
-    by_mod: dict = {}
-    for s in stages:
-        mid = s.get("module_id")
-        if mid:
-            by_mod.setdefault(mid, []).append(s.get("params") or {})
+    module_ids = [s.get("module_id") for s in stages]
+    ids = {m for m in module_ids if m}
+    positions_by_module = _positions_by_module(module_ids)
 
-    def _one(mid: str) -> dict:
-        return (by_mod.get(mid) or [{}])[0]
+    def _params_at(mid: str) -> dict:
+        return next((s.get("params") or {} for s in stages
+                     if s.get("module_id") == mid), {})
 
-    # 端口连线：解析各 stage 的可选字段 "inputs": {端口: 上游产物名} → Pipeline.stage_inputs。
-    # 缺失/空/非对象 → 不传（Pipeline 默认 {} = 现状规则，零回归）。值只收字符串
-    # （每端口单一上游；非字符串交给 validate_chain 报错，这里防御性跳过）。
-    stage_inputs: dict = {}
-    for s in stages:
-        mid = s.get("module_id")
-        ins = s.get("inputs")
-        if not mid or not isinstance(ins, dict) or not ins:
-            continue
-        clean = {str(port): art for port, art in ins.items()
-                 if isinstance(port, str) and isinstance(art, str) and art.strip()}
-        if clean:
-            stage_inputs[mid] = clean
-
-    if "frame_manager" not in by_mod:
+    if "frame_manager" not in ids:
         raise ValueError("链路缺少必需阶段: frame_manager")
-    if not any(k in by_mod for k in ("face_embed", "face_detect", "plate_recog",
-                                      "det_filter", "seq_filter")):
+    if not any(k in ids for k in ("face_embed", "face_detect", "plate_recog",
+                                  "det_filter", "seq_filter")):
         raise ValueError("链路缺少必需阶段: 终段需为 det_filter / seq_filter / "
                          "face_embed / face_detect / plate_recog 之一")
 
-    # 字符串参数统一走模块级 _str_param（None/空白 → 默认值）
+    # ---- 每阶段按位置构造实例（同模块多实例各自构造，装配进 Pipeline 容器）----
+    instances: dict = {}
+    for i, s in enumerate(stages):
+        mid = s.get("module_id")
+        if not mid:
+            continue
+        obj = _build_stage_instance(mid, s.get("params") or {})
+        if obj is not None:
+            instances[i] = obj
 
-    fp = _one("frame_manager")
-    fm = FrameManager(
-        sampling=_str_param(fp, "sampling", SAMPLING_ANALYSIS),
-        frame_skip=_int(fp, "frame_skip", 3),
-        interval_sec=_float(fp, "interval_sec", 3.0),
-        interval_frames=_int(fp, "interval_frames", 30),
-        **backpressure_params(_str_param(fp, "backpressure", "standard")))
-    yolo = None
-    det_filter = None
-    if "det_filter" in by_mod:
-        # 检测筛选阶段（有效性过滤的唯一来源；group_limits 空=不判定）
-        det_filter = _det_filter_of(_one("det_filter"))
-    if "yolo" in by_mod:
-        yp = _one("yolo")
-        model = _find_file(_str_param(yp, "model_path"), [MODELS_DIR]) or MODELS_DIR / "yolov8n.pt"
-        # YOLO 纯推理；节流/track 抑制在 Pipeline 编排
-        yolo = YOLODetector(
-            model_path=str(model), conf=_float(yp, "conf", 0.35),
-            iou=_float(yp, "iou", 0.7), imgsz=_int(yp, "imgsz", 640),
-            max_det=_int(yp, "max_det", 300), classes=_int_list(yp, "classes", None),
-            device=(_str_param(yp, "device") or None))
-    vlm = None
-    if "vlm" in by_mod:
-        vp = _one("vlm")
-        vlm = VLMAnalyzer(
-            max_resolution=tuple(_int_tuple(vp, "max_resolution", 2) or (1280, 720)),
-            prompt=_str_param(vp, "prompt"))
-    crop = None
-    if "target_crop" in by_mod:
-        from pipe.target_crop import TargetCrop
-        cp = _one("target_crop")
-        crop = TargetCrop(margin=_float(cp, "margin", 0.0),
-                          classes=_int_list(cp, "classes", None),
-                          filter=_str_param(cp, "filter"),
-                          out_size=_str_param(cp, "out_size"))
-    annotate = None
-    if "annotate" in by_mod:
-        from pipe.annotate import Annotator
-        anp = _one("annotate")
-        annotate = Annotator(thickness=_int(anp, "thickness", 2),
-                             show_label=_bool(anp, "show_label"),
-                             classes=_int_list(anp, "classes", None),
-                             filter=_str_param(anp, "filter"))
-    # 人脸阶段（face_detect / 兼容旧 extract_faces）：构造 FaceStage 注入 Pipeline.face
-    # （run(frame, crops, ts) -> list[FaceResult]，与 plate 对称）；face_embed 阶段构造
-    # FaceEmbedder（身份去重在驱动层读 last_faces 后处理，落盘/计数同样留驱动层）。
-    face = None
-    face_embedder = None
-    face_dedup_thresh = 0.55
-    if "face_detect" in by_mod or "extract_faces" in by_mod:
-        from face_detect.face_detector import FaceDetector
-        from face_detect.face_pipeline import FaceStage
-        from pipe.cropper import Cropper
-        edp = _one("extract_faces") if "extract_faces" in by_mod else {}  # 兼容旧形态
-        fdp = _one("face_detect") if "face_detect" in by_mod else {}
-        # 检测器参数：有 face_detect 阶段用它的；否则用 extract_faces 的 face_thresh
-        det_src = fdp if "face_detect" in by_mod else edp
-        fdet = FaceDetector(
-            device=_str_param(det_src, "device", "auto"),
-            det_thresh=(_float(det_src, "det_thresh", 0.0)
-                        or _float(det_src, "face_thresh", 0.4)),
-            det_size=tuple(_int_tuple(det_src, "det_size", 2) or (640, 640)),
-            use_crop=_bool(det_src, "use_crop"))
-        # 人脸检测阶段：出脸 margin / 去重 IoU（新形态在 face_detect；兼容旧 extract_faces）
-        f_margin = _float(fdp, "margin", 0.0) or _float(edp, "margin", 0.15)
-        f_dedup_iou = _float(fdp, "dedup_iou", 0.0) or _float(edp, "dedup_iou", 0.6) or 0.6
-        face = FaceStage(fdet, Cropper(upscale=1.0, margin=f_margin), dedup_iou=f_dedup_iou)
-        if "face_embed" in by_mod:
-            from face_embed.face_embedder import FaceEmbedder
-            fep = _one("face_embed")
-            face_embedder = FaceEmbedder(device=_str_param(fep, "device", "auto"))
-            face_dedup_thresh = _float(fep, "thresh", 0.55) or 0.55
-        # 兼容旧 extract_faces 形态：链路未配「目标裁剪」/「YOLO」阶段时按 extract_faces 参数补齐
+    def _first(mid: str):
+        """该模块**第一个**实例（兼容 Pipeline 单槽字段；多实例时另有容器键）。"""
+        return next((instances[i] for i, m in enumerate(module_ids) if m == mid), None)
+
+    fm = _first("frame_manager")
+    yolo = _first("yolo")
+    vlm = _first("vlm")
+    det_filter = _first("det_filter")
+    crop = _first("target_crop")
+    annotate = _first("annotate")
+    plate = _first("plate_recog")
+    face = _first("face_detect") or _first("extract_faces")
+
+    # 时序判定阶段（一个 module_id）：参数按用途拆两个实例——
+    # gates（throttle/change）→ 检测流门控 Pipeline.seq_filter；
+    # rules（SeqRule 规格）→ 事件尾 Pipeline.event_filter（VLM/车牌记录经 publish 走它出事件）。
+    seq_filter = None
+    event_filter = None
+    if "seq_filter" in ids:
+        sp = _params_at("seq_filter")
+        seq_filter = _seq_filter_of(sp, what="gates")
+        event_filter = _seq_filter_of(sp, what="rules")
+
+    # face_embed 身份去重（驱动层读 last_faces 后处理）；人脸去重阈值同源。
+    face_embedder = _first("face_embed")
+    face_dedup_thresh = _float(_params_at("face_embed"), "thresh", 0.55) or 0.55
+
+    # 兼容旧 extract_faces 形态：链路未配「目标裁剪」/「YOLO」阶段时按 extract_faces 参数补齐
+    if face is not None and "extract_faces" in ids:
+        edp = _params_at("extract_faces")
         if crop is None:
             from pipe.target_crop import TargetCrop
             crop = TargetCrop(scale=_float(edp, "upscale", 1.0) or 1.0, margin=0.0,
@@ -1752,36 +1923,57 @@ def _chain_from_spec(spec: dict):
                 iou=_float(edp, "yolo_iou", 0.7), imgsz=_int(edp, "yolo_imgsz", 640),
                 max_det=_int(edp, "yolo_max_det", 300),
                 classes=_int_list(edp, "yolo_classes", [0]))
-    plate = None
-    if "plate_recog" in by_mod:
-        from plate_recog.plate_recognizer import PlateRecognizer
-        from plate_recog.plate_pipeline import PlateStage
-        from pipe.cropper import Cropper
-        pp = _one("plate_recog")
-        tool = Cropper(upscale=1.0, margin=_float(pp, "margin", 0.1))
-        td = pp.get("track_dedup")
-        plate = PlateStage(
-            PlateRecognizer(detect_level=_str_param(pp, "detect_level", "high")),
-            tool, mode=_str_param(pp, "mode", "crop"),
-            dedup_iou=_float(pp, "dedup_iou", 0.6),
-            track_dedup=(True if td in (None, "") else _bool(pp, "track_dedup")),
-            track_cooldown=_float(pp, "track_cooldown", 5.0))
-    # 时序判定阶段（一个 module_id）：参数按用途拆两个实例——
-    # gates（throttle/change）→ 检测流门控 Pipeline.seq_filter；
-    # rules（SeqRule 规格）→ 事件尾 Pipeline.event_filter（VLM/车牌记录经 publish 走它出事件）。
-    seq_filter = None
-    event_filter = None
-    if "seq_filter" in by_mod:
-        sp = _one("seq_filter")
-        seq_filter = _seq_filter_of(sp, what="gates")
-        event_filter = _seq_filter_of(sp, what="rules")
-    pipe = Pipeline(frame=fm, yolo=yolo, vlm=vlm,
-                    crop=crop, annotate=annotate, plate=plate, face=face,
-                    det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter,
-                    stage_inputs=stage_inputs)
+
+    # ---- 端口连线：inputs 内联在各 stage；键 = 该阶段下标 → stage_inputs 键 = "#<position>" ----
+    # 值归一为产物全名（短名唯一实例兼容、多实例歧义报错）。非字符串/空防御性跳过；
+    # 非法连线由 validate_chain 报错。
+    stage_inputs: dict = {}
+    for i, s in enumerate(stages):
+        ins = s.get("inputs")
+        if not isinstance(ins, dict) or not ins:
+            continue
+        clean: dict = {}
+        for port, art in ins.items():
+            if not isinstance(port, str) or not isinstance(art, str) or not art.strip():
+                continue
+            clean[port] = resolve_artifact(art, positions_by_module)
+        if clean:
+            stage_inputs[f"#{i}"] = clean
+
+    # ---- 按位置装配同模块多实例（P2-0）：多实例列表 [(position, obj), ...] ----
+    # composer.Pipeline.step() 按这些列表**位置升序链式**执行各模块实例；单插槽字段保留
+    # （取第一实例）兼容旧读法与仅支持单实例的模块（yolo/vlm）。
+    _PLURAL = {"det_filter": [], "seq_filter": [], "target_crop": [],
+               "annotate": [], "plate_recog": [], "face_detect": []}
+    for i, s in enumerate(stages):
+        mid = s.get("module_id")
+        obj = instances.get(i)
+        if obj is not None and mid in _PLURAL:
+            _PLURAL[mid].append((i, obj))
+
+    # stage_positions：{module_id: 位置(int)}——单插槽实例的位置声明（step 据此登记全名/解析
+    # "#<position>" 连线）；多实例模块的位置由其多实例列表承载。
+    stage_positions = {mid: poss[0] for mid, poss in positions_by_module.items()}
+
+    pipe_kwargs = dict(
+        frame=fm, yolo=yolo, vlm=vlm,
+        crop=crop, annotate=annotate, plate=plate, face=face,
+        det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter,
+        det_filters=_PLURAL["det_filter"], seq_filters=_PLURAL["seq_filter"],
+        target_crops=_PLURAL["target_crop"], annotators=_PLURAL["annotate"],
+        plate_stages=_PLURAL["plate_recog"], face_stages=_PLURAL["face_detect"],
+        stage_positions=stage_positions, stage_inputs=stage_inputs,
+    )
+    if Pipeline.__dataclass_fields__ and "stages" in Pipeline.__dataclass_fields__:
+        # 按位置装配的实例容器（key=stage 位置下标），声明式携带（step 现由多实例列表驱动）。
+        pipe_kwargs["stages"] = instances
+    pipe = Pipeline(**{k: v for k, v in pipe_kwargs.items()
+                       if k in Pipeline.__dataclass_fields__})
     # face_embed 身份去重所需（驱动层读 pipe.last_faces 后处理）：非 dataclass 字段，装配层附挂
     pipe.face_embedder = face_embedder
     pipe.face_dedup_thresh = face_dedup_thresh
+    # 完整位置映射（供驱动层按位置读 stage_inputs，如 _apply_vlm_inputs；调试同样有用）
+    pipe.module_positions = positions_by_module
     return pipe
 
 
@@ -2149,7 +2341,8 @@ PARAMS = {
                        "options": ["first", "all"],
                        "help": "image_source=crops 且该类命中多个目标时：first=只送首张"
                                "（默认，与改动前一致）；all=送该类全部对象的裁剪子图"
-                               "（OpenAI 兼容多图消息；端点支持待联调）"},
+                               "（OpenAI 兼容多图消息，已由 glm-4v-flash 实证支持；"
+                               "第三方端点建议自查多图支持）"},
         "image": {"label": "测试图片（真实调用用）", "type": "file", "src": "img",
                   "test_only": True,
                   "help": "勾选真实大模型时，从这张图取素材发请求"},
@@ -2172,11 +2365,12 @@ PARAMS = {
                          "help": "勾选才真发请求；不勾只演示生成素材包"},
         "vlm_endpoint": {"label": "VLM 端点（留空用默认）", "type": "str",
                          "default": "http://117.42.21.253:8000/v1/chat/completions",
-                         "help": "大模型接口地址"},
+                         "help": "大模型接口地址；环境变量 VLM_ENDPOINT 优先（导出即全链路切换）"},
         "vlm_model": {"label": "VLM 模型名", "type": "str", "default": "qwen3-vl-32b",
-                      "help": "调用的模型名称"},
+                      "help": "调用的模型名称；环境变量 VLM_MODEL 优先"},
         "vlm_key": {"label": "API Key（无 key 留空）", "type": "str", "default": "",
-                    "help": "接口密钥，免鉴权可留空"},
+                    "help": "接口密钥，免鉴权可留空；环境变量 VLM_API_KEY（兼容 GLM_API_KEY）优先，"
+                            "此处填写的 key 会入库，建议改用环境变量"},
     },
     "chain": {
         # 模块链路的通用运行器（runner=chain）：运行表单=「视频输入 + 各阶段参数」，
@@ -3343,6 +3537,13 @@ def main() -> None:
                        if not spec.get("test_only")}
                  for mid, m in MODULES.items() if not m.get("hidden")})
             db.init_db()
+            # 端口能力目录（图编排 P2-1）：代码声明为真相源，启动时幂等 upsert 到
+            # module_ports；陈旧端口行删除、声明与库不一致告警。端口表问题不阻塞启动。
+            try:
+                db.upsert_module_ports(module_ports_catalog(),
+                                       warn=lambda msg: print(f"[db] {msg}"))
+            except Exception as e:
+                print(f"[db] module_ports 同步告警（不阻塞启动）: {e}")
             _seed_pipeline()  # 幂等：播种唯一保留链路（警用无人机链路）
             print("[db] MySQL 配置暂存已就绪（presets 注册表 + 模块参数表就绪）")
         except Exception as e:

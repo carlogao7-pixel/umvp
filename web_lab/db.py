@@ -203,6 +203,37 @@ _DDLS = [
   CONSTRAINT fk_step_pipeline FOREIGN KEY (pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE,
   CONSTRAINT fk_step_preset FOREIGN KEY (preset_id) REFERENCES presets(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    # 端口能力目录（图编排 P2-1，设计稿 doc/design/graph_chain.md §3.2）：
+    # 真相源仍是代码（模块 INPUTS/OUTPUTS + composer.ARTIFACT_TYPES），本表是启动时
+    # upsert 的可查询副本；与代码不一致即启动告警（避免双真相源漂移）。
+    # 本期 fan_in / Images / resolved_by 建好但不用（普通模块 fan_in=0），避免 P2-3 二次改表。
+    """CREATE TABLE IF NOT EXISTS module_ports (
+  module_id   VARCHAR(32) NOT NULL,
+  direction   ENUM('in','out') NOT NULL,
+  port_name   VARCHAR(32) NOT NULL,
+  io_type     VARCHAR(16) NOT NULL,
+  fan_in      TINYINT(1) NOT NULL DEFAULT 0,
+  resolved_by ENUM('pipe','driver') NOT NULL DEFAULT 'pipe',
+  PRIMARY KEY (module_id, direction, port_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    # 连线表（图编排 P2-1，设计稿 doc/design/graph_chain.md §3.3）：连线成为一等公民。
+    # 与 pipeline_steps 在同一事务内按提交的 stages 数组重建（position = 数组下标）。
+    # uk_edge 只防「完全重复的边」（幂等保存）；「每端口单一上游」由写入期校验
+    # （读 module_ports.fan_in）承担，不硬凹唯一键。只存显式声明，默认取数仍属代码契约。
+    """CREATE TABLE IF NOT EXISTS pipeline_edges (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  pipeline_id   VARCHAR(24) NOT NULL,
+  dst_position  INT NOT NULL,
+  dst_module_id VARCHAR(32) NOT NULL,
+  dst_port      VARCHAR(32) NOT NULL,
+  src_position  INT NULL,
+  artifact      VARCHAR(96) NOT NULL,
+  edge_seq      INT NOT NULL DEFAULT 0,
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_edge (pipeline_id, dst_position, dst_port, src_position, artifact),
+  KEY idx_pipe (pipeline_id),
+  CONSTRAINT fk_edge_pipe FOREIGN KEY (pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
 ]
 
 
@@ -215,15 +246,22 @@ def _legacy_id_schema(cur) -> bool:
 
 
 def _drop_legacy_tables(cur) -> None:
-    """DROP 全部配置相关表（presets/pipelines/pipeline_steps/preset_params_*）。
+    """DROP 全部配置相关表（presets/pipelines/pipeline_steps/pipeline_edges/
+    module_ports/preset_params_*）。
 
     仅在检测到旧整数 ID schema 时调用：表内均为播种/测试数据（服务器启动会重新
     播种唯一保留链路），重建后即迁移到前缀编号 schema。幂等。
+    pipeline_edges 对 pipelines 有外键，DROP 期间临时关闭外键检查以消除顺序依赖。
     """
-    cur.execute("SHOW TABLES")
-    for (t,) in cur.fetchall():
-        if t in ("presets", "pipelines", "pipeline_steps") or str(t).startswith("preset_params_"):
-            cur.execute(f"DROP TABLE `{t}`")
+    cur.execute("SET FOREIGN_KEY_CHECKS=0")
+    try:
+        cur.execute("SHOW TABLES")
+        for (t,) in cur.fetchall():
+            if t in ("presets", "pipelines", "pipeline_steps", "pipeline_edges",
+                     "module_ports") or str(t).startswith("preset_params_"):
+                cur.execute(f"DROP TABLE `{t}`")
+    finally:
+        cur.execute("SET FOREIGN_KEY_CHECKS=1")
 
 
 def configure_modules(schemas: dict[str, dict[str, str]] | None) -> None:
@@ -341,6 +379,152 @@ def _prune_removed_modules(cur) -> None:
                     " WHERE p.kind='module' AND p.module_id=%s", (mid,))
         cur.execute("DELETE FROM presets WHERE kind='module' AND module_id=%s", (mid,))
         cur.execute(f"DROP TABLE IF EXISTS `{_module_table(mid)}`")
+
+
+# ---------------- 端口能力目录（module_ports，图编排 P2-1） ----------------
+
+def upsert_module_ports(ports, warn=None) -> None:
+    """把**代码声明**的端口目录 upsert 进 module_ports（启动时调用一次，幂等）。
+
+    ports: 可迭代的 (module_id, direction, port_name, io_type, fan_in, resolved_by)。
+    真相源始终是代码（模块 INPUTS/OUTPUTS + composer.ARTIFACT_TYPES）；本表是可查询副本。
+    与库内现有副本不一致时经 warn(msg) 告警（默认 print），随后**以代码为准收敛**
+    （upsert 缺失/变更行 + 删除陈旧行）——避免双真相源漂移。
+    """
+    desired: dict = {}
+    for row in ports or ():
+        mid, direction, port, io_type, fan_in, resolved_by = row
+        desired[(mid, direction, port)] = (str(io_type), int(fan_in), str(resolved_by))
+    with _cursor() as cur:
+        cur.execute("SELECT module_id, direction, port_name, io_type, fan_in, resolved_by"
+                    " FROM module_ports")
+        existing = {(r[0], r[1], r[2]): (str(r[3]), int(r[4]), str(r[5]))
+                    for r in cur.fetchall()}
+        if existing != desired:
+            (warn or print)(
+                f"[db] module_ports 目录与代码声明不一致（库 {len(existing)} 行 vs 代码 "
+                f"{len(desired)} 行）——以代码为唯一真相源收敛")
+        for key in set(existing) - set(desired):
+            cur.execute("DELETE FROM module_ports WHERE module_id=%s AND direction=%s"
+                        " AND port_name=%s", key)
+        for (mid, direction, port), (io_type, fan_in, resolved_by) in desired.items():
+            cur.execute(
+                "INSERT INTO module_ports (module_id, direction, port_name, io_type, fan_in,"
+                " resolved_by) VALUES (%s,%s,%s,%s,%s,%s)"
+                " ON DUPLICATE KEY UPDATE io_type=VALUES(io_type), fan_in=VALUES(fan_in),"
+                " resolved_by=VALUES(resolved_by)",
+                (mid, direction, port, io_type, fan_in, resolved_by))
+
+
+def _module_port_fan_in(cur) -> dict:
+    """读 module_ports 的入端口 fan_in：{(module_id, port_name): int}。缺行按 0 兜底。"""
+    cur.execute("SELECT module_id, port_name, fan_in FROM module_ports WHERE direction='in'")
+    return {(r[0], r[1]): int(r[2]) for r in cur.fetchall()}
+
+
+# ---------------- 链路连线（pipeline_edges，图编排 P2-1） ----------------
+# position = stages 数组下标（可移植，不用 pipeline_steps.id）；产物名规范形态为全名
+# {module}#{position}.{artifact}（短名 {module}.{artifact} 在唯一实例时亦可，按位置解析）。
+
+def _positions_by_module(module_ids) -> dict:
+    """module_id → 该模块在链路中的位置列表（数组下标升序）。"""
+    out: dict = {}
+    for i, mid in enumerate(module_ids):
+        out.setdefault(mid, []).append(i)
+    return out
+
+
+def _parse_artifact_pos(art, positions_by_module) -> tuple:
+    """产物名 → (module_id, position)。
+
+    - 全名 ``{module}#{position}.{artifact}`` → 取解析位（module 部分原样）；
+    - 短名 ``{module}.{artifact}`` → 该模块在本链路**唯一实例**时取该位置；
+      多实例歧义 / 未知模块 / 非法名 → 抛 ValueError（**不猜**，与 composer 短名规则一致）。
+    """
+    if not isinstance(art, str) or "." not in art:
+        raise ValueError(f"非法产物名: {art!r}")
+    head, _sep, _tail = art.partition(".")
+    mod, hashsep, pos = head.partition("#")
+    if hashsep:
+        if not mod or not pos.isdigit():
+            raise ValueError(f"非法产物全名: {art!r}（应为 {{module}}#{{position}}.{{artifact}}）")
+        return mod, int(pos)
+    if not mod:
+        raise ValueError(f"非法产物名: {art!r}")
+    poss = positions_by_module.get(mod) or []
+    if not poss:
+        raise ValueError(f"未知模块 {mod!r}（产物 {art!r}）")
+    if len(poss) > 1:
+        raise ValueError(
+            f"产物短名 {art!r} 有歧义：模块 {mod!r} 在本链路有 {len(poss)} 个实例"
+            f"（位置 {poss}）；多实例须写全名 {mod}#{poss[0]}.{_tail}")
+    return mod, poss[0]
+
+
+def canonical_stage_inputs(stage_inputs, positions_by_module) -> dict:
+    """把 stage_inputs 规范为 ``{"#<position>": {端口: 产物名 | [产物名...]}}``。
+
+    键容忍旧式 ``module_id``（该模块唯一实例时映射到其位置；多实例报错不猜）；
+    产物名**原样保留**（不解析短/全名）——保证 ``save → load`` 往返逐字节一致。
+    非对象 / 空对象 / 非字符串产物名（含空串）跳过。
+    """
+    if not isinstance(stage_inputs, dict):
+        return {}
+    out: dict = {}
+    for key, ports in stage_inputs.items():
+        if not isinstance(ports, dict) or not ports:
+            continue
+        if isinstance(key, str) and key.startswith("#") and key[1:].isdigit():
+            pos = int(key[1:])
+        else:
+            poss = positions_by_module.get(key) or []
+            if len(poss) > 1:
+                raise ValueError(
+                    f"stage_inputs 键 {key!r} 指向多实例模块（位置 {poss}），"
+                    f"须改用位置串 '#<position>'")
+            if not poss:
+                continue
+            pos = poss[0]
+        clean: dict = {}
+        for p, a in ports.items():
+            if not isinstance(p, str):
+                continue
+            if isinstance(a, str) and a.strip():
+                clean[p] = a
+            elif isinstance(a, list):
+                vals = [x for x in a if isinstance(x, str) and x.strip()]
+                if vals:
+                    clean[p] = vals
+        if clean:
+            out[f"#{pos}"] = clean
+    return out
+
+
+def _edges_from_inputs(canonical, module_ids, fan_in) -> list:
+    """规范后的 stage_inputs → pipeline_edges 行。
+
+    写入期校验「单上游端口是否被接了第二条」：端口 fan_in=0 时只许单条入边（值须字符串），
+    fan_in=1 才允许多条（本期无此类端口）。返回 [(dst_position, dst_module_id, dst_port,
+    src_position, artifact, edge_seq)]。
+    """
+    positions_by_module = _positions_by_module(module_ids)
+    n = len(module_ids)
+    edges: list = []
+    for key, ports in canonical.items():
+        dst_position = int(key[1:])
+        if dst_position < 0 or dst_position >= n:
+            raise ValueError(f"连线目标位置 {dst_position} 超出链路阶段范围（0..{n - 1}）")
+        dst_module_id = module_ids[dst_position]
+        for port, art in ports.items():
+            arts = art if isinstance(art, list) else [art]
+            if len(arts) > 1 and not fan_in.get((dst_module_id, port), 0):
+                raise ValueError(
+                    f"端口 {dst_module_id}.{port} 为单一上游（fan_in=0），不接受 "
+                    f"{len(arts)} 条入边: {arts}；如需多上游请改用支持 fan-in 的过渡节点")
+            for seq, a in enumerate(arts):
+                _mod, src_position = _parse_artifact_pos(a, positions_by_module)
+                edges.append((dst_position, dst_module_id, port, src_position, a, seq))
+    return edges
 
 
 # ---------------- 值转换（保存强转 / 读取还原） ----------------
@@ -611,8 +795,11 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
                   budget: dict | None = None, meta: dict | None = None) -> tuple[str, bool]:
     """保存链路（步骤引用模块 preset）；同名覆盖。返回 (业务 id 如 PIPE0001, 是否新建)。
 
-    preset_ids 的顺序即链路步骤顺序（position 0..n-1）；事务内重建 steps，
-    保证 pipelines 与 pipeline_steps 原子一致。步骤只能引用 kind='module' 的配置。
+    preset_ids 的顺序即链路步骤顺序（position 0..n-1，= stages 数组下标）；事务内**同时重建**
+    pipeline_steps 与 pipeline_edges（图编排 P2-1），保证两者位置一致、原子提交。
+    步骤只能引用 kind='module' 的配置；**允许同模块多实例**（每模块不再限制一个阶段）。
+    连线（meta.stage_inputs）双写：规范为位置键落 pipeline_edges，同时回写 meta_json。
+    写入期按 module_ports.fan_in 校验「单上游端口是否被接了第二条」（fan_in=0 拒多入边）。
     新建时按 PIPE 前缀自动编号。
     """
     name = (name or "").strip()
@@ -623,13 +810,12 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
     if not preset_ids:
         raise ValueError("链路至少需要一个模块步骤")
     budget_json = json.dumps(budget or {}, ensure_ascii=False)
-    meta_json = json.dumps(meta or {}, ensure_ascii=False)
     with _LOCK:
         conn = _get_conn()
         cur = conn.cursor()
         try:
             conn.ping(reconnect=True)
-            # 校验步骤引用的 preset 存在、为 module 类型、且模块不重复（一条链路每个模块最多一个阶段）
+            # 校验步骤引用的 preset 存在、为 module 类型（重复模块已放行，按位置装配）
             placeholders = ",".join(["%s"] * len(preset_ids))
             cur.execute(f"SELECT id, kind, module_id FROM presets WHERE id IN ({placeholders})",
                         tuple(preset_ids))
@@ -639,14 +825,14 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
                     raise ValueError(f"步骤引用的配置不存在: id={rid}")
                 if found[rid][0] != "module":
                     raise ValueError(f"步骤只能引用模块配置（kind='module'），id={rid} 是 {found[rid][0]}")
-            seen: dict = {}
-            for rid in preset_ids:
-                mid = found[rid][1]
-                if mid in seen:
-                    raise ValueError(
-                        f"链路包含重复模块阶段: {mid}（{seen[mid]} 与 {rid}）；"
-                        f"每个模块在一条链路中最多出现一次")
-                seen[mid] = rid
+            module_ids = [found[rid][1] for rid in preset_ids]
+            positions_by_module = _positions_by_module(module_ids)
+            # 连线：规范为位置键（产物名原样保留 → save/load 往返逐字节一致），双写 meta + edges
+            meta = {**(meta or {})}
+            canonical = canonical_stage_inputs(meta.get("stage_inputs"), positions_by_module)
+            if canonical or "stage_inputs" in meta:
+                meta["stage_inputs"] = canonical
+            meta_json = json.dumps(meta, ensure_ascii=False)
             conn.begin()
             cur.execute("SELECT id FROM pipelines WHERE name=%s", (name,))
             row = cur.fetchone()
@@ -665,6 +851,16 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
             for position, preset_id in enumerate(preset_ids):
                 cur.execute("INSERT INTO pipeline_steps (pipeline_id, position, preset_id)"
                             " VALUES (%s, %s, %s)", (pid, position, preset_id))
+            # 连线随 steps 在同一事务内重建；写入期 fan_in 校验在此触发（DB 唯一键只防重复边）
+            fan_in = _module_port_fan_in(cur)
+            edges = _edges_from_inputs(canonical, module_ids, fan_in)
+            cur.execute("DELETE FROM pipeline_edges WHERE pipeline_id=%s", (pid,))
+            for dst_position, dst_module_id, dst_port, src_position, artifact, edge_seq in edges:
+                cur.execute(
+                    "INSERT INTO pipeline_edges (pipeline_id, dst_position, dst_module_id,"
+                    " dst_port, src_position, artifact, edge_seq)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (pid, dst_position, dst_module_id, dst_port, src_position, artifact, edge_seq))
             conn.commit()
             return pid, created
         except Exception:
@@ -675,18 +871,34 @@ def save_pipeline(name: str, preset_ids: list[str], streams: int = 1,
 
 
 def _attach_stage_inputs(stages: list[dict], stage_inputs) -> list[dict]:
-    """把 meta.stage_inputs（{module_id: {端口: 上游产物名}}）回填到各 stage 的 inputs。
+    """把位置键 stage_inputs（{"#<position>": {端口: 上游产物名}}）回填到各 stage 的 inputs。
 
-    纯函数（无 DB 依赖，便于单测）：只对已有 stage 且连线非空的模块注入；旧链路
-    （meta 无 stage_inputs）保持原样 → 零回归。返回同一 stages 列表（就地更新）。
+    纯函数（无 DB 依赖，便于单测）：按 stages 数组下标取对应位置串；只对连线非空的阶段注入；
+    旧链路（无 stage_inputs）保持原样 → 零回归。返回同一 stages 列表（就地更新）。
     """
     if not isinstance(stage_inputs, dict):
         return stages
-    for st in stages:
-        ins = stage_inputs.get(st.get("module_id"))
+    for i, st in enumerate(stages):
+        ins = stage_inputs.get(f"#{i}")
         if isinstance(ins, dict) and ins:
             st["inputs"] = ins
     return stages
+
+
+def _edges_to_stage_inputs(edge_rows) -> dict:
+    """pipeline_edges 行 → {"#<dst_position>": {dst_port: artifact | [artifact...]}}。
+
+    同端口多条入边（fan_in=1 端口，本期无）→ 值为列表，保序（edge_seq）。
+    """
+    out: dict = {}
+    for dst_position, dst_port, artifact, _seq in edge_rows:
+        ports = out.setdefault(f"#{dst_position}", {})
+        if dst_port in ports:
+            prev = ports[dst_port]
+            ports[dst_port] = (prev if isinstance(prev, list) else [prev]) + [artifact]
+        else:
+            ports[dst_port] = artifact
+    return out
 
 
 def load_pipeline(pipeline_id: str) -> dict:
@@ -694,6 +906,8 @@ def load_pipeline(pipeline_id: str) -> dict:
 
     stages 为有序步骤 [{position, preset_id, module_id, params}]，可直接生成
     P2 pipeline spec 的 stages=[{module, params}]。params 从模块参数表取回。
+    连线读取优先级（图编排 P2-1）：pipeline_edges > meta.stage_inputs > 代码默认；
+    取回后按位置回填到各 stage 的 inputs → 形状与只读 meta 时逐字节一致。
     """
     with _cursor() as cur:
         cur.execute("SELECT id, name, streams, budget_json, meta_json"
@@ -724,14 +938,22 @@ def load_pipeline(pipeline_id: str) -> dict:
             for prow in cur.fetchall():
                 params_map[prow[0]] = _restore_params(
                     dict(zip(schema.keys(), prow[1:])), schema)
+        cur.execute("SELECT dst_position, dst_port, artifact, edge_seq FROM pipeline_edges"
+                    " WHERE pipeline_id=%s ORDER BY dst_position, dst_port, edge_seq", (pid,))
+        edge_rows = cur.fetchall()
     stages = [{"position": position, "preset_id": preset_id, "module_id": module_id,
                "params": params_map.get(preset_id, {})}
               for position, preset_id, module_id in steps]
     meta = _loads(meta_json)
-    # 端口连线（P5 第 2 步）随链路保存：设计器把各阶段 inputs 存于 meta.stage_inputs
-    # （{module_id: {端口: 上游产物名}}，免费 meta JSON，不改 pipeline_steps 表结构），
-    # 取回时回填到对应 stage 的 inputs 字段 → 直接生成带连线的 P2 spec。
-    _attach_stage_inputs(stages, meta.get("stage_inputs") if isinstance(meta, dict) else None)
+    # 端口连线（P5 第 2 步 + 图编排 P2-1）：优先读 pipeline_edges；无连线时回退 meta.stage_inputs
+    # （均规范为位置键）；再回填到对应 stage 的 inputs → 直接生成带连线的 P2 spec。
+    if edge_rows:
+        stage_inputs = _edges_to_stage_inputs(edge_rows)
+    else:
+        stage_inputs = canonical_stage_inputs(
+            meta.get("stage_inputs") if isinstance(meta, dict) else None,
+            _positions_by_module([s["module_id"] for s in stages]))
+    _attach_stage_inputs(stages, stage_inputs)
     return {"id": pid, "name": name, "streams": streams,
             "budget": _loads(budget_json), "meta": meta,
             "stages": stages}
