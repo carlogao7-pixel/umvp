@@ -1,0 +1,894 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工单看板</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --panel:#fff; --ink:#1f2733; --muted:#6b7686; --line:#e2e7ef;
+    --accent:#3b6ef6; --accent-soft:#e8efff;
+    --doing:#3b6ef6; --testing:#e08a00; --done:#22a06b; --cancel:#94a0b0;
+    --shadow:0 1px 3px rgba(20,30,60,.08),0 8px 24px rgba(20,30,60,.06);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--ink)}
+  header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line);
+         padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px}
+  header .spacer{flex:1}
+  .badge{font-size:12px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted);background:#fafbfe}
+  .badge.ok{color:var(--done);border-color:#bfe6d4;background:#eefaf4}
+  .badge.bad{color:#c0392b;border-color:#f0c3bd;background:#fdf0ee;cursor:help}
+  nav.tabs{display:flex;gap:4px;background:#eef1f7;border-radius:10px;padding:3px}
+  nav.tabs button{border:none;background:transparent;color:var(--muted);border-radius:8px;
+                  padding:5px 14px;font-weight:600}
+  nav.tabs button.on{background:#fff;color:var(--accent);box-shadow:0 1px 2px rgba(20,30,60,.1)}
+  nav.tabs button:hover{color:var(--ink)}
+  .lookup{display:flex;gap:6px;align-items:center}
+  .lookup input{border:1px solid var(--line);border-radius:8px;padding:6px 10px;width:190px;font:inherit;font-size:13px}
+  .lookup input:focus{outline:none;border-color:#b9cdff;box-shadow:0 0 0 3px var(--accent-soft)}
+  button{font:inherit;cursor:pointer;border:1px solid var(--line);background:#fff;color:var(--ink);
+         border-radius:8px;padding:6px 12px;transition:.15s}
+  button:hover{border-color:#c6d0e0;background:#f8faff}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(1.06)}
+  button.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+  button.ghost:hover{background:#f0f3f9;color:var(--ink)}
+  button.sm{padding:3px 9px;font-size:12.5px}
+  .filters{display:flex;gap:16px;flex-wrap:wrap;align-items:center;padding:10px 16px;background:var(--panel);
+           border-bottom:1px solid var(--line);position:sticky;top:52px;z-index:19}
+  .filters .grp{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .filters .lbl{font-size:12px;color:var(--muted)}
+  .chip{font-size:12.5px;padding:3px 10px;border-radius:20px;border:1px solid var(--line);background:#fff;
+        color:var(--muted);cursor:pointer;user-select:none}
+  .chip.on{background:var(--accent-soft);border-color:#b9cdff;color:var(--accent);font-weight:600}
+  .search{border:1px solid var(--line);border-radius:8px;padding:6px 10px;min-width:220px;font:inherit}
+  .search:focus{outline:none;border-color:#b9cdff;box-shadow:0 0 0 3px var(--accent-soft)}
+  main{padding:16px;display:grid;grid-template-columns:repeat(4,minmax(230px,1fr));gap:14px;align-items:start}
+  @media(max-width:1100px){main{grid-template-columns:repeat(2,minmax(230px,1fr))}}
+  @media(max-width:640px){main{grid-template-columns:1fr}}
+  .col{background:#eef1f7;border-radius:12px;padding:10px;min-height:120px}
+  .col h2{font-size:13px;margin:2px 4px 10px;display:flex;align-items:center;gap:8px;font-weight:700}
+  .col h2 .n{font-weight:600;color:var(--muted);font-size:12px}
+  .col .dot{width:9px;height:9px;border-radius:50%}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 11px;margin-bottom:8px;
+        box-shadow:var(--shadow);cursor:pointer;transition:.12s}
+  .card:hover{border-color:#b9cdff;transform:translateY(-1px)}
+  .card .row1{display:flex;align-items:baseline;gap:8px}
+  .card .tid{font-weight:700;font-size:13.5px;color:var(--accent)}
+  .card .date{font-size:11.5px;color:var(--muted);margin-left:auto}
+  .card .route{font-size:12px;color:var(--muted);margin:3px 0 5px}
+  .card .desc{font-size:13px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .card .mini{font-size:12px;color:var(--muted);margin-top:5px;display:-webkit-box;-webkit-line-clamp:2;
+              -webkit-box-orient:vertical;overflow:hidden}
+  .card .mini b{color:#8a93a3;font-weight:600}
+  .card.sub{margin-left:16px;border-left:3px solid #cfd8e6;background:#fbfcff}
+  .card .orphan{font-size:11px;color:var(--testing);margin-bottom:2px}
+  .kids{margin:0}
+  .kids.hidden{display:none}
+  .toggle{display:inline-block;width:16px;color:var(--muted);font-size:11px;text-align:center}
+  .empty{color:var(--muted);font-size:12.5px;padding:6px 4px}
+  /* 收件箱 / 台账卡片流 */
+  .stream{max-width:1000px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .stream .card{cursor:default}
+  .stream .card .head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .stream .card .idtag{font-weight:700;color:var(--accent);font-size:13.5px}
+  .stream .card .date{margin-left:auto}
+  .tag{font-size:11px;padding:1px 8px;border-radius:12px;border:1px solid var(--line);color:var(--muted);background:#fafbfe}
+  .tag.warn{color:#a05a00;border-color:#ecd2a8;background:#fdf6ea}
+  .tag.ok{color:var(--done);border-color:#bfe6d4;background:#eefaf4}
+  .tag.wo{color:var(--accent);border-color:#b9cdff;background:var(--accent-soft);font-weight:600}
+  .stream .card .body{font-size:13px;margin-top:6px;white-space:pre-wrap;word-break:break-word;
+                      display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+  .stream .card .fu{font-size:12px;color:var(--muted);margin-top:5px;white-space:pre-wrap;word-break:break-word}
+  .stream .card .acts{margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .stream .card .acts input{border:1px solid var(--line);border-radius:8px;padding:4px 8px;font:inherit;font-size:12.5px;
+                            min-width:180px}
+  .impact-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+  .impact-tags .tag{background:#f2f0fb;border-color:#d8d2f0;color:#6a5cf6}
+  /* drawer */
+  .scrim{position:fixed;inset:0;background:rgba(20,30,60,.35);opacity:0;pointer-events:none;transition:.2s;z-index:30}
+  .scrim.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;height:100%;width:min(560px,96vw);background:var(--panel);z-index:31;
+          transform:translateX(100%);transition:.22s;display:flex;flex-direction:column;box-shadow:-8px 0 30px rgba(20,30,60,.15)}
+  .drawer.on{transform:none}
+  .drawer .dh{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .drawer .dh .tid{font-size:17px;font-weight:700;color:var(--accent)}
+  .drawer .db{padding:14px 16px;overflow:auto;flex:1}
+  .field{margin-bottom:16px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:600}
+  .field .cur{white-space:pre-wrap;word-break:break-word;background:#f7f9fd;border:1px solid var(--line);
+              border-radius:8px;padding:8px 10px;font-size:13px;max-height:170px;overflow:auto}
+  .field .cur.collapsed{max-height:64px;overflow:hidden;position:relative}
+  .field input,.field textarea,.field select{width:100%;font:inherit;border:1px solid var(--line);border-radius:8px;
+              padding:7px 9px;background:#fff}
+  .field textarea{min-height:64px;resize:vertical}
+  .field input:focus,.field textarea:focus,.field select:focus{outline:none;border-color:#b9cdff;box-shadow:0 0 0 3px var(--accent-soft)}
+  .field .act{display:flex;gap:8px;align-items:center;margin-top:6px}
+  .ro{font-size:12.5px;color:var(--muted)}
+  .modal{position:fixed;inset:0;display:none;align-items:flex-start;justify-content:center;z-index:40;
+         background:rgba(20,30,60,.35);padding:48px 16px;overflow:auto}
+  .modal.on{display:flex}
+  .sheet{background:var(--panel);border-radius:14px;width:min(620px,100%);box-shadow:var(--shadow);overflow:hidden}
+  .sheet .sh{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:700}
+  .sheet .sb{padding:16px;max-height:70vh;overflow:auto}
+  .sheet .sf{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .checks{display:flex;gap:10px;flex-wrap:wrap;border:1px dashed var(--line);border-radius:8px;padding:9px 10px;background:#fafbfe}
+  .checks label{display:flex;gap:5px;align-items:center;font-size:13px;color:var(--ink);margin:0;font-weight:400;cursor:pointer}
+  .hint{font-size:12px;color:var(--muted);margin-top:4px}
+  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:60;display:flex;flex-direction:column;gap:8px;align-items:center}
+  .toast{background:#222b3a;color:#fff;padding:9px 16px;border-radius:22px;font-size:13px;box-shadow:var(--shadow);
+         max-width:80vw;animation:pop .2s}
+  .toast.err{background:#c0392b}
+  @keyframes pop{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
+  .err-note{color:#c0392b;font-size:12px;margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="appTitle">工单看板</h1>
+  <span id="checkBadge" class="badge">检查中…</span>
+  <nav class="tabs" id="tabs" style="display:none">
+    <button data-tab="tickets" class="on">工单</button>
+    <button data-tab="inbox" id="tabInbox" style="display:none">收件箱</button>
+    <button data-tab="deployment" id="tabDep" style="display:none">部署台账</button>
+    <button data-tab="models" id="tabModels" style="display:none">模型</button>
+  </nav>
+  <span class="spacer"></span>
+  <div class="lookup" id="lookupBox" style="display:none">
+    <input id="lookupId" placeholder="编号直达：INB-0049 / WO-0009 / DEP-0001">
+    <button id="btnLookup" class="sm">查询</button>
+  </div>
+  <button id="btnRefresh" class="ghost">刷新</button>
+  <button id="btnNew" class="primary">＋ 新建工单</button>
+</header>
+
+<section id="viewTickets">
+  <div class="filters">
+    <div class="grp" id="statusChips"><span class="lbl">状态</span></div>
+    <div class="grp" id="agentChips"><span class="lbl">承接</span></div>
+    <div class="grp"><span class="lbl">搜索</span><input id="q" class="search" placeholder="编号 / 描述 / 备注 / 代理…"></div>
+    <button id="btnClear" class="ghost sm">清除筛选</button>
+  </div>
+  <main id="board"></main>
+</section>
+
+<section id="viewInbox" class="view" hidden>
+  <div class="filters">
+    <div class="grp" id="inbStatusChips"><span class="lbl">状态</span></div>
+    <div class="grp" id="inbTypeChips"><span class="lbl">类型</span></div>
+    <div class="grp" id="inbSourceChips"><span class="lbl">来源</span></div>
+    <div class="grp"><span class="lbl">搜索</span><input id="iq" class="search" placeholder="编号 / 结论 / 去向…"></div>
+    <button id="inbClear" class="ghost sm">清除筛选</button>
+    <span class="spacer" style="flex:1"></span>
+    <span class="ro" id="inbCounts"></span>
+    <button id="btnInbAppend" class="primary sm" style="display:none">＋ 追加条目</button>
+  </div>
+  <div class="stream" id="inboxList"></div>
+</section>
+
+<section id="viewDeployment" class="view" hidden>
+  <div class="filters">
+    <div class="grp" id="depImpactChips"><span class="lbl">影响面</span></div>
+    <div class="grp"><span class="lbl">搜索</span><input id="dq" class="search" placeholder="标题 / WO 号 / 内容…"></div>
+    <button id="depClear" class="ghost sm">清除筛选</button>
+    <span class="spacer" style="flex:1"></span>
+    <span class="ro" id="depCounts"></span>
+    <button id="btnDepNew" class="primary sm" style="display:none">＋ 登记台账</button>
+  </div>
+  <div class="stream" id="depList"></div>
+</section>
+
+<section id="viewModels" class="view" hidden>
+  <div class="filters">
+    <span class="hint" id="modelsHint"></span>
+    <span class="spacer" style="flex:1"></span>
+    <span class="ro" id="modelsDefault"></span>
+  </div>
+  <div class="stream" id="modelsList"></div>
+</section>
+
+<div id="scrim" class="scrim"></div>
+<aside id="drawer" class="drawer"><div class="dh"></div><div class="db"></div></aside>
+
+<div id="newModal" class="modal"><div class="sheet">
+  <div class="sh">新建工单</div>
+  <div class="sb">
+    <div class="field"><label>父主单（留空=新建主单，选择=新建子单）</label><select id="nParent"></select></div>
+    <div class="field" id="nBizWrap" style="display:none"><label>业务描述 *（主单必填）</label><textarea id="nBusiness" placeholder="这个需求要解决的业务问题是什么（写给后来人看）"></textarea><div class="err-note" id="nBizErr"></div></div>
+    <div class="field" id="nAppWrap" style="display:none"><label>实现方式 *（主单必填）</label><textarea id="nApproach" placeholder="打算怎么实现（方案/路径/关键取舍）"></textarea></div>
+    <div class="field"><label>需求/改动描述 *<span id="nDescLabelExt"></span></label><textarea id="nDesc" placeholder="一句话说清要做什么"></textarea><div class="err-note" id="nDescErr"></div></div>
+    <div class="grid2">
+      <div class="field"><label>发起人 *</label><select id="nBy"></select></div>
+      <div class="field"><label>承接（可逗号分隔）</label><input id="nTo" placeholder="如 web 或 pipe-chain,web"></div>
+    </div>
+    <div class="field"><label>验证</label><textarea id="nVerify" placeholder="验证命令/方式"></textarea></div>
+    <div class="field"><label>备注</label><textarea id="nNote" placeholder="产出 / 关联 INB-xxxx / 阻塞原因"></textarea></div>
+    <div class="err-note" id="nErr"></div>
+  </div>
+  <div class="sf"><button id="nCancel" class="ghost">取消</button><button id="nSubmit" class="primary">创建</button></div>
+</div></div>
+
+<div id="inbModal" class="modal"><div class="sheet">
+  <div class="sh">追加收件箱条目（待同步顶部，编号自动递增）</div>
+  <div class="sb">
+    <div class="grid2">
+      <div class="field"><label>来源代理 *</label><select id="iSource"></select></div>
+      <div class="field"><label>类型 *</label><input id="iType" list="iTypeList" placeholder="成果 / 坑 / 待归档 / 部署">
+        <datalist id="iTypeList"><option>成果</option><option>坑</option><option>待归档</option><option>部署</option><option>成果/部署</option><option>成果/坑</option></datalist></div>
+    </div>
+    <div class="field"><label>一句话结论 *（单行；关键文件/命令）</label><textarea id="iText" placeholder="结论（关键文件/命令）——多行内容请写入续行"></textarea><div class="err-note" id="iTextErr"></div></div>
+    <div class="field"><label>续行（可选，如 → 去向：…）</label><input id="iFollowup" placeholder="→ 去向：..."></div>
+    <div class="field"><label>日期</label><input id="iDate" placeholder="YYYY-MM-DD（默认今天）"></div>
+    <div class="err-note" id="iErr"></div>
+  </div>
+  <div class="sf"><button id="iCancel" class="ghost">取消</button><button id="iSubmit" class="primary">追加</button></div>
+</div></div>
+
+<div id="depModal" class="modal"><div class="sheet">
+  <div class="sh">登记部署台账（插「## 记录」顶部，最新在前）</div>
+  <div class="sb">
+    <div class="grid2">
+      <div class="field"><label>一句话标题 *</label><input id="dTitle" placeholder="如 WO-0011：xxx（含 WO 号可按号索引）"></div>
+      <div class="field"><label>日期</label><input id="dDate" placeholder="YYYY-MM-DD（默认今天，星期自动）"></div>
+    </div>
+    <div class="field"><label>变更内容 *</label><textarea id="dChanges" placeholder="改了什么（可多行）"></textarea><div class="err-note" id="dChangesErr"></div></div>
+    <div class="field"><label>影响面 *（判断清单：以下任一命中即应登记台账）</label>
+      <div class="checks" id="dImpacts"></div>
+      <div class="hint">依赖（pip 包）/ 模型（权重文件）/ 环境变量（MYSQL_* 等）/ DB（表结构）/ 标定（指纹基线）/ 入口（脚本与端口）/ 结构（目录与包）/ 配置（默认参数）</div>
+      <div class="err-note" id="dImpactErr"></div></div>
+    <div class="field"><label>部署注意</label><textarea id="dNotes" placeholder="换机/移植/重启时需要做什么"></textarea></div>
+    <div class="field"><label>验证</label><textarea id="dVerify" placeholder="使用的命令与结果"></textarea></div>
+    <div class="err-note" id="dErr"></div>
+  </div>
+  <div class="sf"><button id="dCancel" class="ghost">取消</button><button id="dSubmit" class="primary">登记</button></div>
+</div></div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hasPipe = v => typeof v === 'string' && v.includes('|');
+let DATA = {tickets:[], statuses:[], agents:[], check:null, file:'', title:'工单看板', name:'', readonly:false};
+let META = {inbox_file:null, deployment_file:null};
+const PALETTE = ['#3b6ef6','#e08a00','#22a06b','#94a0b0','#8a5cf6','#0ea5b7','#d64545'];
+function statusColor(s){ const i = (DATA.statuses||[]).indexOf(s); return PALETTE[(i<0?0:i) % PALETTE.length]; }
+const filter = {agents:new Set(), statuses:new Set(), q:''};
+let collapsed = new Set();
+let lastDetail = null;
+const today = () => new Date().toISOString().slice(0,10);
+
+/* ---------- API ---------- */
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  let body;
+  try { body = await res.json(); } catch(e){ throw new Error('响应不是合法 JSON（HTTP '+res.status+'）'); }
+  if(!res.ok || body.ok === false) throw new Error(body.error || ('HTTP '+res.status));
+  return body;
+}
+const postJSON = (path, data) => api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+
+function toast(msg, isErr){
+  const el = document.createElement('div');
+  el.className = 'toast' + (isErr?' err':''); el.textContent = msg;
+  $('#toast').appendChild(el);
+  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='.3s'; setTimeout(()=>el.remove(),300); }, isErr?4200:2200);
+}
+
+/* ---------- 页签 ---------- */
+let TAB = 'tickets';
+let INBOX = null;   // /api/inbox 数据
+let DEP = null;     // /api/deployment 数据
+const inbFilter = {status:new Set(), type:new Set(), source:new Set(), q:''};
+const depFilter = {impact:new Set(), q:''};
+
+function applyChrome(){
+  const title = DATA.title || '工单看板';
+  document.title = title;
+  $('#appTitle').textContent = title;
+  const ro = !!DATA.readonly;
+  document.body.classList.toggle('readonly', ro);
+  $('#btnNew').style.display = (ro || TAB!=='tickets') ? 'none' : '';
+}
+
+async function loadMeta(){
+  META = await api('/api/meta');
+  const hasInb = !!META.inbox_file, hasDep = !!META.deployment_file;
+  const hasModels = !!META.models_tab;
+  $('#tabInbox').style.display = hasInb?'':'none';
+  $('#tabDep').style.display = hasDep?'':'none';
+  $('#tabModels').style.display = hasModels?'':'none';
+  $('#lookupBox').style.display = (hasInb||hasDep)?'flex':'none';
+  $('#tabs').style.display = (hasInb||hasDep||hasModels)?'flex':'none';
+}
+
+function switchTab(name){
+  TAB = name;
+  document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on', b.dataset.tab===name));
+  $('#viewTickets').hidden = name!=='tickets';
+  $('#viewInbox').hidden = name!=='inbox';
+  $('#viewDeployment').hidden = name!=='deployment';
+  $('#viewModels').hidden = name!=='models';
+  applyChrome();
+  if(name==='inbox') loadInbox();
+  if(name==='deployment') loadDep();
+  if(name==='models') loadModels();
+}
+
+/* ---------- 加载（工单） ---------- */
+async function load(){
+  try{
+    await loadMeta();
+    DATA = await api('/api/tickets');
+    DATA.readonly = !!META.readonly;
+    applyChrome();
+    renderChips();
+    renderBoard();
+    renderBadge();
+    if(TAB==='inbox') loadInbox();
+    if(TAB==='deployment') loadDep();
+    if(TAB==='models') loadModels();
+  }catch(e){
+    toast('加载失败：'+e.message, true);
+    $('#checkBadge').textContent = '加载失败'; $('#checkBadge').className = 'badge bad';
+  }
+}
+
+function renderBadge(){
+  const c = DATA.check || {};
+  const b = $('#checkBadge');
+  b.textContent = (c.ok?'✓ 结构合法 · ':'✗ ')+(c.count||0)+' 条工单';
+  b.className = 'badge ' + (c.ok?'ok':'bad');
+  if(!c.ok && c.errors && c.errors.length){ b.title = c.errors.join('\n'); b.onclick = ()=>toast(c.errors[0], true); }
+  else b.onclick = null;
+}
+
+function renderChips(){
+  const sc = $('#statusChips'); sc.querySelectorAll('.chip').forEach(x=>x.remove());
+  (DATA.statuses||[]).forEach(s=>{
+    const el = document.createElement('span');
+    el.className = 'chip' + (filter.statuses.has(s)?' on':''); el.textContent = s; el.dataset.s = s;
+    el.onclick = ()=>{ filter.statuses.has(s)?filter.statuses.delete(s):filter.statuses.add(s); renderChips(); renderBoard(); };
+    sc.appendChild(el);
+  });
+  const ac = $('#agentChips'); ac.querySelectorAll('.chip').forEach(x=>x.remove());
+  (DATA.agents||[]).forEach(a=>{
+    const el = document.createElement('span');
+    el.className = 'chip' + (filter.agents.has(a)?' on':''); el.textContent = a; el.dataset.a = a;
+    el.onclick = ()=>{ filter.agents.has(a)?filter.agents.delete(a):filter.agents.add(a); renderChips(); renderBoard(); };
+    ac.appendChild(el);
+  });
+}
+
+function matches(t){
+  if(filter.statuses.size && !filter.statuses.has(t.section)) return false;
+  if(filter.agents.size){
+    const toks = String(t.to||'').split(',').map(x=>x.trim()).filter(Boolean);
+    if(!toks.some(x=>filter.agents.has(x))) return false;
+  }
+  if(filter.q){
+    const q = filter.q.toLowerCase();
+    const hay = [t.id,t.date,t.by,t.to,t.desc,t.verify,t.note].join(' ').toLowerCase();
+    if(!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function cardHTML(t, orphan){
+  return `<div class="card ${t.sub?'sub':''}" data-id="${esc(t.id)}">
+    ${orphan?`<div class="orphan">↳ ${esc(t.parent)} 的子单</div>`:''}
+    <div class="row1"><span class="tid">${esc(t.id)}</span><span class="date">${esc(t.date)}</span></div>
+    <div class="route">发起 ${esc(t.by)} → 承接 ${esc(t.to)||'—'}</div>
+    <div class="desc">${esc(t.desc)}</div>
+    ${t.verify?`<div class="mini"><b>验证</b> ${esc(t.verify)}</div>`:''}
+    ${t.note?`<div class="mini"><b>备注</b> ${esc(t.note)}</div>`:''}
+  </div>`;
+}
+
+function renderBoard(){
+  const board = $('#board'); board.innerHTML='';
+  const vis = DATA.tickets.filter(matches);
+  const byId = Object.fromEntries(DATA.tickets.map(t=>[t.id,t]));
+  const statuses = DATA.statuses||[];
+  statuses.forEach(s=>{
+    const col = document.createElement('section'); col.className='col'; col.dataset.s=s;
+    const items = vis.filter(t=>t.section===s);
+    const mains = items.filter(t=>!t.sub);
+    const orphans = items.filter(t=>t.sub && (!byId[t.parent] || byId[t.parent].section!==s || !vis.includes(byId[t.parent])));
+    col.innerHTML = `<h2><span class="dot" style="background:${statusColor(s)}"></span>${esc(s)} <span class="n">${items.length}</span></h2>`;
+    if(!mains.length && !orphans.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='—'; col.appendChild(e); }
+    mains.forEach(m=>{
+      const kids = items.filter(c=>c.sub && c.parent===m.id);
+      col.insertAdjacentHTML('beforeend', cardHTML(m,false));
+      if(kids.length){
+        const wrap = document.createElement('div');
+        wrap.className='kids'+(collapsed.has(m.id)?' hidden':'');
+        wrap.dataset.kids = m.id;
+        wrap.innerHTML = `<div style="font-size:12px;color:var(--muted);margin:0 0 6px 18px;cursor:pointer" data-fold="${esc(m.id)}">${collapsed.has(m.id)?'▸':'▾'} ${kids.length} 个子单</div>` + kids.map(k=>cardHTML(k,false)).join('');
+        col.appendChild(wrap);
+      }
+    });
+    orphans.forEach(o=>col.insertAdjacentHTML('beforeend', cardHTML(o,true)));
+    board.appendChild(col);
+  });
+}
+
+/* ---------- 收件箱 ---------- */
+async function loadInbox(){
+  if(!META.inbox_file){ $('#inboxList').innerHTML = '<div class="empty">实例未配置 inbox_file</div>'; return; }
+  try{
+    INBOX = await api('/api/inbox');
+    $('#btnInbAppend').style.display = DATA.readonly?'none':'';
+    renderInboxChips();
+    renderInbox();
+  }catch(e){ toast('收件箱加载失败：'+e.message, true); }
+}
+
+function renderInboxChips(){
+  const mk = (host, set, val) => {
+    const el = document.createElement('span');
+    el.className = 'chip' + (set.has(val)?' on':''); el.textContent = val;
+    el.onclick = ()=>{ set.has(val)?set.delete(val):set.add(val); renderInboxChips(); renderInbox(); };
+    host.appendChild(el);
+  };
+  const sc = $('#inbStatusChips'); sc.querySelectorAll('.chip').forEach(x=>x.remove());
+  ['待同步','已同步'].forEach(v=>mk(sc, inbFilter.status, v));
+  const tc = $('#inbTypeChips'); tc.querySelectorAll('.chip').forEach(x=>x.remove());
+  (INBOX.types||[]).forEach(v=>mk(tc, inbFilter.type, v));
+  const hc = $('#inbSourceChips'); hc.querySelectorAll('.chip').forEach(x=>x.remove());
+  (INBOX.sources||[]).forEach(v=>mk(hc, inbFilter.source, v));
+}
+
+function inbMatches(e){
+  if(inbFilter.status.size && !inbFilter.status.has(e.section)) return false;
+  if(inbFilter.type.size && !inbFilter.type.has(e.type)) return false;
+  if(inbFilter.source.size && !inbFilter.source.has(e.source)) return false;
+  if(inbFilter.q){
+    const hay = [e.id,e.date,e.source,e.type,e.text,(e.followups||[]).join(' ')].join(' ').toLowerCase();
+    if(!hay.includes(inbFilter.q.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function inbCardHTML(e){
+  const pending = e.section === '待同步';
+  return `<div class="card" data-inb="${esc(e.id)}">
+    <div class="head">
+      <span class="idtag">${esc(e.id)}</span>
+      <span class="tag ${pending?'warn':'ok'}">${esc(e.section)}</span>
+      <span class="tag">${esc(e.type)}</span>
+      <span class="tag">${esc(e.source)}</span>
+      <span class="date">${esc(e.date)}</span>
+    </div>
+    <div class="body">${esc(e.text)}</div>
+    ${(e.followups||[]).map(f=>`<div class="fu">${esc(f.trim())}</div>`).join('')}
+    ${pending && !DATA.readonly?`<div class="acts">
+      <input placeholder="去向说明（可选）" data-dest="${esc(e.id)}">
+      <button class="sm primary" data-move="${esc(e.id)}">流转到已同步</button>
+    </div>`:''}
+  </div>`;
+}
+
+function renderInbox(){
+  const host = $('#inboxList');
+  const vis = (INBOX.entries||[]).filter(inbMatches);
+  $('#inbCounts').textContent = `待同步 ${INBOX.counts['待同步']} · 已同步 ${INBOX.counts['已同步']} · 显示 ${vis.length}`;
+  host.innerHTML = vis.length ? vis.map(inbCardHTML).join('')
+    : '<div class="empty">（无匹配条目）</div>';
+}
+
+async function inbMove(id){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  const dest = document.querySelector(`[data-dest="${CSS.escape(id)}"]`)?.value.trim() || '';
+  try{
+    const r = await postJSON('/api/inbox/move', {id, destination: dest||undefined});
+    toast(r.id + ' 已流转到已同步' + (dest?('（去向：'+dest+'）'):''));
+    await loadInbox();
+  }catch(e){ toast('流转失败：'+e.message, true); }
+}
+
+function openInbAppend(){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  ['iText','iFollowup','iErr','iTextErr'].forEach(id=>$('#'+id).value='');
+  $('#iDate').value = '';
+  $('#iSource').innerHTML = (DATA.agents||[]).map(a=>`<option>${esc(a)}</option>`).join('');
+  $('#inbModal').classList.add('on'); $('#iText').focus();
+}
+
+async function inbSubmit(){
+  const text = $('#iText').value.replace(/\s*\n\s*/g,' ').trim();
+  const type = $('#iType').value.trim(), source = $('#iSource').value;
+  let bad = false;
+  if(!text){ $('#iTextErr').textContent='结论不能为空（多行内容写入续行）'; bad=true; } else $('#iTextErr').textContent='';
+  if(!type){ $('#iErr').textContent='类型不能为空'; bad=true; }
+  if(text.length>4000){ $('#iTextErr').textContent='结论过长'; bad=true; }
+  const pipeField = [['类型',type],['续行',$('#iFollowup').value]].find(([k,v])=>hasPipe(v));
+  if(pipeField){ $('#iErr').textContent = `字段「${pipeField[0]}」内建议不用竖线`; }
+  if(bad) return;
+  const payload = {source, type, text};
+  const fu = $('#iFollowup').value.trim(); if(fu) payload.followup = fu;
+  const dt = $('#iDate').value.trim(); if(dt) payload.date = dt;
+  try{
+    const r = await postJSON('/api/inbox/append', payload);
+    toast('已追加 ' + r.id + '（待同步顶部）');
+    $('#inbModal').classList.remove('on');
+    await loadInbox();
+  }catch(e){ $('#iErr').textContent = e.message; toast('追加失败：'+e.message, true); }
+}
+
+/* ---------- 部署台账 ---------- */
+async function loadDep(){
+  if(!META.deployment_file){ $('#depList').innerHTML = '<div class="empty">实例未配置 deployment_file</div>'; return; }
+  try{
+    DEP = await api('/api/deployment');
+    $('#btnDepNew').style.display = DATA.readonly?'none':'';
+    renderDepChips();
+    renderDep();
+  }catch(e){ toast('台账加载失败：'+e.message, true); }
+}
+
+function renderDepChips(){
+  const host = $('#depImpactChips'); host.querySelectorAll('.chip').forEach(x=>x.remove());
+  (DEP.impacts||[]).forEach(v=>{
+    const el = document.createElement('span');
+    el.className = 'chip' + (depFilter.impact.has(v)?' on':''); el.textContent = v;
+    el.onclick = ()=>{ depFilter.impact.has(v)?depFilter.impact.delete(v):depFilter.impact.add(v); renderDepChips(); renderDep(); };
+    host.appendChild(el);
+  });
+}
+
+function depMatches(e){
+  if(depFilter.impact.size && ![...depFilter.impact].every(i=>e.impact.includes(i))) return false;
+  if(depFilter.q){
+    const hay = [e.id,e.date,e.title,e.wo,Object.values(e.values||{}).join(' ')].join(' ').toLowerCase();
+    if(!hay.includes(depFilter.q.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function depCardHTML(e){
+  const wd = e.weekday?`(${e.weekday})`:'';
+  return `<div class="card" data-dep="${esc(e.id)}">
+    <div class="head">
+      <span class="idtag">${esc(e.id)}</span>
+      ${e.wo?`<span class="tag wo">${esc(e.wo)}</span>`:''}
+      <span class="date">${esc(e.date)}${esc(wd)}</span>
+    </div>
+    <div class="body" style="-webkit-line-clamp:2">${esc(e.title)}</div>
+    <div class="impact-tags">${(e.impact||[]).map(i=>`<span class="tag">${esc(i)}</span>`).join('')}</div>
+    ${e.values&&e.values['变更内容']?`<div class="fu">${esc(e.values['变更内容'].slice(0,220))}${(e.values['变更内容'].length>220?'…':'')}</div>`:''}
+  </div>`;
+}
+
+function renderDep(){
+  const host = $('#depList');
+  const vis = (DEP.entries||[]).filter(depMatches);
+  $('#depCounts').textContent = `共 ${DEP.total} 条 · 显示 ${vis.length}`;
+  host.innerHTML = vis.length ? vis.map(depCardHTML).join('')
+    : '<div class="empty">（无匹配条目）</div>';
+}
+
+function openDepNew(){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  ['dTitle','dChanges','dNotes','dVerify','dErr','dChangesErr','dImpactErr'].forEach(id=>$('#'+id).value='');
+  $('#dDate').value = today();
+  const host = $('#dImpacts');
+  host.innerHTML = (DEP.categories||['依赖','模型','环境变量','DB','标定','入口','结构','配置'])
+    .map(c=>`<label><input type="checkbox" value="${esc(c)}"> ${esc(c)}</label>`).join('');
+  $('#depModal').classList.add('on'); $('#dTitle').focus();
+}
+
+async function depSubmit(){
+  const title = $('#dTitle').value.trim();
+  const changes = $('#dChanges').value.trim();
+  const impact = [...document.querySelectorAll('#dImpacts input:checked')].map(x=>x.value);
+  let bad = false;
+  if(!title || hasPipe(title)){ $('#dErr').textContent = title?'标题内禁用竖线 |':'标题不能为空'; bad=true; }
+  if(!changes){ $('#dChangesErr').textContent='变更内容不能为空'; bad=true; } else $('#dChangesErr').textContent='';
+  if(!impact.length){ $('#dImpactErr').textContent='至少勾选一项影响面'; bad=true; } else $('#dImpactErr').textContent='';
+  if(bad) return;
+  const payload = {title, changes, impact};
+  const notes = $('#dNotes').value.trim(); if(notes) payload.notes = notes;
+  const verify = $('#dVerify').value.trim(); if(verify) payload.verify = verify;
+  const dt = $('#dDate').value.trim(); if(dt) payload.date = dt;
+  try{
+    const r = await postJSON('/api/deployment/new', payload);
+    toast('已登记 ' + r.id + '（台账顶部）');
+    $('#depModal').classList.remove('on');
+    await loadDep();
+  }catch(e){ $('#dErr').textContent = e.message; toast('登记失败：'+e.message, true); }
+}
+
+/* ---------- 详情抽屉（工单，原有） ---------- */
+async function openDetail(id){
+  lastDetail = id;
+  let d;
+  try{ d = await api('/api/ticket?id='+encodeURIComponent(id)); }
+  catch(e){ toast('打开详情失败：'+e.message, true); return; }
+  const t = d.ticket;
+  const stOpts = (DATA.statuses||[])
+      .map(s=>`<option ${s===t.section?'selected':''}>${esc(s)}</option>`).join('');
+  const longNote = (t.note||'').length > 120;
+  $('#drawer .dh').innerHTML = `<span class="tid">${esc(t.id)}</span>
+      <span class="ro">${esc(t.date)} · 发起 ${esc(t.by)}</span>
+      <span style="margin-left:auto"></span><button class="ghost" id="dClose">关闭</button>`;
+  $('#drawer .db').innerHTML = `
+    <div class="field"><label>需求/改动描述</label><div class="cur">${esc(t.desc)}</div></div>
+    <div class="field"><label>状态</label>
+      <select id="dStatus">${stOpts}</select>
+      <div class="act"><button class="primary sm" id="dStatusSave">保存状态</button></div>
+    </div>
+    <div class="field"><label>承接（逗号分隔）</label>
+      <input id="dTo" value="${esc(t.to)}">
+      <div class="act"><button class="primary sm" id="dToSave">保存承接</button></div>
+    </div>
+    <div class="field"><label>验证（整字段覆盖）</label>
+      <textarea id="dVerify">${esc(t.verify)}</textarea>
+      <div class="act"><button class="primary sm" id="dVerifySave">保存验证</button></div>
+    </div>
+    <div class="field"><label>备注（当前）</label>
+      <div class="cur ${longNote?'collapsed':''}" id="dNoteCur">${esc(t.note)||'<span class="ro">（无）</span>'}</div>
+      ${longNote?'<div class="act"><button class="ghost sm" id="dNoteMore">展开全部</button></div>':''}
+    </div>
+    <div class="field"><label>追加备注（不覆盖，追加到末尾；引用记录请挂编号如 INB-0049，勿复制全文）</label>
+      <textarea id="dAppend" placeholder="用「；」自动衔接，留空无效"></textarea>
+      <div class="act"><button class="primary sm" id="dAppendSave">追加备注</button></div>
+    </div>
+    ${d.children&&d.children.length?`<div class="field"><label>子单</label>${d.children.map(c=>`<div class="cur" style="margin-bottom:6px;cursor:pointer" data-open="${esc(c.id)}">[${esc(c.section)}] ${esc(c.id)} — ${esc(c.desc)}</div>`).join('')}</div>`:''}
+  `;
+
+  $('#dClose').onclick = closeDetail;
+  $('#dStatusSave').onclick = ()=>doUpdate('/api/status', {id:t.id, status:$('#dStatus').value}, '状态已更新');
+  $('#dToSave').onclick = ()=>doUpdate('/api/to', {id:t.id, to:$('#dTo').value}, '承接已更新');
+  $('#dVerifySave').onclick = ()=>doUpdate('/api/verify', {id:t.id, verify:$('#dVerify').value}, '验证已更新');
+  $('#dAppendSave').onclick = ()=>{
+    const v = $('#dAppend').value.trim();
+    if(!v){ toast('追加备注为空', true); return; }
+    doUpdate('/api/note', {id:t.id, note:v}, '备注已追加');
+  };
+  const more = $('#dNoteMore');
+  if(more) more.onclick = ()=>{ const el=$('#dNoteCur'); el.classList.toggle('collapsed'); more.textContent = el.classList.contains('collapsed')?'展开全部':'收起'; };
+  $('#drawer .db').querySelectorAll('[data-open]').forEach(el=>el.onclick=()=>openDetail(el.dataset.open));
+
+  if(DATA.readonly){
+    $('#drawer .db').querySelectorAll('.act').forEach(el=>el.remove());
+    $('#drawer .db').querySelectorAll('input,textarea,select').forEach(el=>el.disabled=true);
+  }
+
+  $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
+}
+function closeDetail(){ $('#drawer').classList.remove('on'); $('#scrim').classList.remove('on'); lastDetail=null; }
+
+async function doUpdate(path, data, okMsg){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  if(hasPipe(data.note)||hasPipe(data.verify)||hasPipe(data.to)||hasPipe(data.desc)){ toast('字段内禁用竖线 |', true); return; }
+  try{
+    const r = await postJSON(path, data);
+    toast(okMsg + (r.warning?('（⚠ '+r.warning.replace(/^⚠\s*/,'')+'）'):''));
+    await load();
+    await openDetail(data.id).catch(()=>{});
+    if(!r.check.ok) toast('写后校验异常：'+r.check.errors.join('；'), true);
+  }catch(e){ toast('操作失败：'+e.message, true); }
+}
+
+/* ---------- 条目详情（收件箱 / 台账，通用抽屉） ---------- */
+async function openEntryDetail(kind, ident){
+  let html = '', head = ident;
+  try{
+    if(kind === 'inbox'){
+      const e = (INBOX.entries||[]).find(x=>x.id===ident)
+        || (await api('/api/entry?id='+encodeURIComponent(ident))).entry;
+      head = e.id;
+      html = `
+        <div class="field"><label>条目</label><div class="cur">[${esc(e.section)}] ${esc(e.id)} · ${esc(e.date)} · ${esc(e.source)} · ${esc(e.type)}</div></div>
+        <div class="field"><label>结论</label><div class="cur">${esc(e.text)}</div></div>
+        ${(e.followups||[]).length?`<div class="field"><label>续行</label><div class="cur">${esc(e.followups.join('\n'))}</div></div>`:''}`;
+    } else if(kind === 'deployment'){
+      const e = (DEP.entries||[]).find(x=>x.id===ident)
+        || (await api('/api/entry?id='+encodeURIComponent(ident))).entry;
+      const wd = e.weekday?`(${e.weekday})`:'';
+      head = e.id;
+      html = `
+        <div class="field"><label>条目</label><div class="cur">${esc(e.date+wd)} · ${esc(e.title)}${e.wo?('　'+esc(e.wo)):''}</div></div>
+        <div class="impact-tags" style="margin:-8px 0 12px">${(e.impact||[]).map(i=>`<span class="tag">${esc(i)}</span>`).join('')}</div>
+        ${['变更内容','影响面','部署注意','验证'].map(k=>e.values&&e.values[k]?`<div class="field"><label>${k}</label><div class="cur">${esc(e.values[k])}</div></div>`:'').join('')}`;
+    } else {
+      const r = await api('/api/entry?id='+encodeURIComponent(ident));
+      if(r.kind==='ticket'){ openDetail(ident); return; }
+      if(r.kind==='inbox'){ openEntryDetail('inbox', r.entry.id); return; }
+      openEntryDetail('deployment', r.entry.id); return;
+    }
+  }catch(e){ toast('打开详情失败：'+e.message, true); return; }
+  $('#drawer .dh').innerHTML = `<span class="tid">${esc(head)}</span>
+      <span style="margin-left:auto"></span><button class="ghost" id="dClose">关闭</button>`;
+  $('#drawer .db').innerHTML = html;
+  $('#dClose').onclick = closeDetail;
+  $('#drawer').classList.add('on'); $('#scrim').classList.add('on');
+}
+
+async function lookupId(){
+  const v = $('#lookupId').value.trim();
+  if(!v){ toast('请输入编号（INB/WO/DEP 或台账模糊串）', true); return; }
+  try{
+    const r = await api('/api/entry?id='+encodeURIComponent(v));
+    if(r.kind==='ticket'){
+      switchTab('tickets');
+      openDetail(r.ticket.id);
+    } else if(r.kind==='inbox'){
+      switchTab('inbox');
+      openEntryDetail('inbox', r.entry.id);
+    } else {
+      switchTab('deployment');
+      openEntryDetail('deployment', r.entry.id);
+    }
+  }catch(e){ toast('查询失败：'+e.message, true); }
+}
+
+/* ---------- 新建（工单） ---------- */
+function fillNewSelects(){
+  const by = $('#nBy'); by.innerHTML = (DATA.agents||[]).map(a=>`<option>${esc(a)}</option>`).join('');
+  const mains = DATA.tickets.filter(t=>!t.sub);
+  const p = $('#nParent');
+  p.innerHTML = `<option value="">（无 · 新建主单）</option>` +
+      mains.map(m=>`<option value="${esc(m.id)}">${esc(m.id)} — ${esc(m.desc.slice(0,32))}</option>`).join('');
+  updateNewFormMode();
+}
+function updateNewFormMode(){
+  const isMain = !$('#nParent').value;
+  $('#nBizWrap').style.display = isMain?'':'none';
+  $('#nAppWrap').style.display = isMain?'':'none';
+  $('#nDescLabelExt').textContent = isMain?'（作为「补充：」段落并入描述）':'';
+}
+function openNew(){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  ['nDesc','nTo','nVerify','nNote','nBusiness','nApproach'].forEach(id=>$('#'+id).value='');
+  ['nDescErr','nErr','nBizErr'].forEach(id=>$('#'+id).textContent='');
+  fillNewSelects(); $('#newModal').classList.add('on'); $('#nDesc').focus();
+}
+function closeNew(){ $('#newModal').classList.remove('on'); }
+async function submitNew(){
+  if(DATA.readonly){ toast('只读实例：已禁用写操作', true); return; }
+  const isMain = !$('#nParent').value;
+  const business = $('#nBusiness').value.trim();
+  const approach = $('#nApproach').value.trim();
+  const desc = $('#nDesc').value.trim();
+  let bad = false;
+  if(isMain && !business){ $('#nBizErr').textContent='主单必须填写业务描述'; bad=true; } else $('#nBizErr').textContent='';
+  if(isMain && !approach){ $('#nErr').textContent='主单必须填写实现方式'; bad=true; }
+  if(!desc){ $('#nDescErr').textContent='描述不能为空'; bad=true; } else $('#nDescErr').textContent='';
+  const vals = {desc, to:$('#nTo').value, verify:$('#nVerify').value, note:$('#nNote').value};
+  if(isMain){ vals.business = business; vals.approach = approach; }
+  const pipeField = Object.entries(vals).find(([k,v])=>hasPipe(v));
+  if(pipeField){ $('#nErr').textContent = `字段「${pipeField[0]}」内禁用竖线 |`; bad=true; } else if(!bad) $('#nErr').textContent='';
+  if(bad) return;
+  const payload = {desc, by:$('#nBy').value, to:vals.to||undefined,
+                   parent:$('#nParent').value||undefined, verify:vals.verify||undefined, note:vals.note||undefined};
+  if(isMain){ payload.business = business; payload.approach = approach; }
+  try{
+    const r = await postJSON('/api/new', payload);
+    toast('已创建 '+r.id);
+    closeNew(); await load();
+    if(!r.check.ok) toast('写后校验异常：'+r.check.errors.join('；'), true);
+  }catch(e){ $('#nErr').textContent = e.message; toast('创建失败：'+e.message, true); }
+}
+
+/* ---------- 事件绑定 ---------- */
+$('#btnRefresh').onclick = ()=>{ if(TAB==='inbox') loadInbox(); else if(TAB==='deployment') loadDep(); else load(); };
+$('#btnNew').onclick = openNew;
+$('#nCancel').onclick = closeNew;
+$('#nSubmit').onclick = submitNew;
+$('#nParent').onchange = updateNewFormMode;
+$('#scrim').onclick = closeDetail;
+$('#btnClear').onclick = ()=>{ filter.agents.clear(); filter.statuses.clear(); filter.q=''; $('#q').value=''; renderChips(); renderBoard(); };
+$('#q').oninput = e => { filter.q = e.target.value.trim(); renderBoard(); };
+$('#newModal').addEventListener('click', e=>{ if(e.target.id==='newModal') closeNew(); });
+
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick = ()=>switchTab(b.dataset.tab));
+$('#iq').oninput = e => { inbFilter.q = e.target.value.trim(); renderInbox(); };
+$('#inbClear').onclick = ()=>{ inbFilter.status.clear(); inbFilter.type.clear(); inbFilter.source.clear(); inbFilter.q=''; $('#iq').value=''; renderInboxChips(); renderInbox(); };
+$('#btnInbAppend').onclick = openInbAppend;
+$('#iCancel').onclick = ()=>$('#inbModal').classList.remove('on');
+$('#iSubmit').onclick = inbSubmit;
+$('#inbModal').addEventListener('click', e=>{ if(e.target.id==='inbModal') e.target.classList.remove('on'); });
+
+$('#dq').oninput = e => { depFilter.q = e.target.value.trim(); renderDep(); };
+$('#depClear').onclick = ()=>{ depFilter.impact.clear(); depFilter.q=''; $('#dq').value=''; renderDepChips(); renderDep(); };
+$('#btnDepNew').onclick = openDepNew;
+$('#dCancel').onclick = ()=>$('#depModal').classList.remove('on');
+$('#dSubmit').onclick = depSubmit;
+$('#depModal').addEventListener('click', e=>{ if(e.target.id==='depModal') e.target.classList.remove('on'); });
+
+/* ---------- 模型页签 ---------- */
+let MODELS = null;
+async function loadModels(){
+  try{ MODELS = await api('/api/models'); renderModels(); }
+  catch(e){ toast('加载模型失败：'+e.message, true); }
+}
+
+function renderModels(){
+  const ro = !!DATA.readonly || !!MODELS.readonly;
+  const d = MODELS.default || {};
+  $('#modelsHint').textContent = MODELS.hint || '';
+  $('#modelsDefault').innerHTML =
+    `项目默认：<b>${esc(d.model||'（未设置）')}</b> <span class="ro">${esc(d.file||'')}</span>`;
+  const wrap = $('#modelsList'); wrap.innerHTML = '';
+  (MODELS.agents||[]).forEach(a=>{
+    const el = document.createElement('div'); el.className = 'card';
+    const cur = a.model ? `${esc(a.model)}（独立设置）`
+                        : `${esc(d.model||'（未设置）')}（随项目默认）`;
+    el.innerHTML = `<div class="row1"><span class="tid">${esc(a.name)}</span><span class="date">${cur}</span></div>
+      ${a.exists?'':`<div class="err-note">文件缺失：${esc(a.file)}</div>`}
+      ${a.error?`<div class="err-note">${esc(a.error)}</div>`:''}
+      <div class="row1" style="margin-top:8px;gap:6px">
+        <input class="search" data-model-input="${esc(a.name)}" placeholder="provider/model-id" ${ro?'disabled':''}>
+        <button class="sm primary" data-model-set="${esc(a.name)}" ${ro?'disabled':''}>设置</button>
+        <button class="sm ghost" data-model-clear="${esc(a.name)}" ${ro?'disabled':''}>回默认</button>
+      </div>`;
+    wrap.appendChild(el);
+  });
+  const el = document.createElement('div'); el.className = 'card';
+  el.innerHTML = `<div class="row1"><span class="tid">项目默认</span><span class="date">${esc(d.model||'（未设置）')}</span></div>
+    <div class="row1" style="margin-top:8px;gap:6px">
+      <input class="search" id="defaultModelInput" placeholder="provider/model-id" ${ro?'disabled':''}>
+      <button class="sm primary" id="btnDefaultModel" ${ro?'disabled':''}>设为项目默认</button>
+    </div>
+    <div class="hint">此处改动只影响新会话；会话内即时切换请用 /model（被派发的子代理跟随）。</div>`;
+  wrap.appendChild(el);
+
+  wrap.querySelectorAll('[data-model-set]').forEach(b=>b.onclick = async ()=>{
+    const agent = b.dataset.modelSet;
+    const inp = wrap.querySelector(`[data-model-input="${agent}"]`);
+    try{
+      const r = await postJSON('/api/models/set', {agent, model: inp.value.trim()});
+      toast(`${agent} → ${r.model}（新会话生效）`);
+      await loadModels();
+    }catch(e){ toast(e.message, true); }
+  });
+  wrap.querySelectorAll('[data-model-clear]').forEach(b=>b.onclick = async ()=>{
+    try{
+      const r = await postJSON('/api/models/clear', {agent: b.dataset.modelClear});
+      toast(`${r.agent} 已回项目默认（新会话生效）`);
+      await loadModels();
+    }catch(e){ toast(e.message, true); }
+  });
+  const db = $('#btnDefaultModel');
+  if(db) db.onclick = async ()=>{
+    try{
+      const r = await postJSON('/api/models/default', {model: $('#defaultModelInput').value.trim()});
+      toast(`项目默认 → ${r.model}（新会话生效）`);
+      await loadModels();
+    }catch(e){ toast(e.message, true); }
+  };
+}
+
+$('#btnLookup').onclick = lookupId;
+$('#lookupId').onkeydown = e => { if(e.key==='Enter') lookupId(); };
+
+$('#board').addEventListener('click', e=>{
+  const fold = e.target.closest('[data-fold]');
+  if(fold){ const id = fold.dataset.fold; collapsed.has(id)?collapsed.delete(id):collapsed.add(id); renderBoard(); return; }
+  const card = e.target.closest('.card');
+  if(card) openDetail(card.dataset.id);
+});
+$('#inboxList').addEventListener('click', e=>{
+  const mv = e.target.closest('[data-move]');
+  if(mv){ inbMove(mv.dataset.move); return; }
+  const card = e.target.closest('[data-inb]');
+  if(card && !e.target.closest('input,button')) openEntryDetail('inbox', card.dataset.inb);
+});
+$('#depList').addEventListener('click', e=>{
+  const card = e.target.closest('[data-dep]');
+  if(card) openEntryDetail('deployment', card.dataset.dep);
+});
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape'){ ['newModal','inbModal','depModal'].forEach(id=>$('#'+id).classList.remove('on')); closeDetail(); }
+});
+
+load();
+</script>
+</body>
+</html>
