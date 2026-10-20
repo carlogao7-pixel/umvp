@@ -12,7 +12,10 @@
   7. FrameManager 三种取图节奏 —— analysis / wall_clock / frame_count
   8. IntervalGate 传递门控
   9. 时序门控（seq_filter 整类节流，原 Pipeline 编排迁入）
+  10. 端口协议 —— 产物表 / 模块 INPUTS-OUTPUTS 声明 / stage_inputs 连线解析
   11. infer 纯推理 + 检测筛选 + 事件尾（last_events / publish）
+  12. 产物全名 / 短名解析（P2-0：resolve_artifact / artifact_at / artifact_short / artifact_type）
+  13. 同模块多实例（P2-0 解除单插槽：det_filter 独立生效 + 位置键 inputs + 全名产物不覆盖）
 
 运行: ai 环境 python pipe/test_composer.py
 """
@@ -43,7 +46,11 @@ from pipe.composer import (
     SAMPLING_FRAME_COUNT,
     SAMPLING_WALL_CLOCK,
     YOLODetector,
+    artifact_at,
+    artifact_short,
+    artifact_type,
     compose,
+    resolve_artifact,
 )
 from pipe.det_filter import DetFilter
 from pipe.records import image_of, image_set_of, to_record
@@ -527,5 +534,107 @@ check("RESOLVED_PORTS：plate_recog/face_detect 的 frame+crops 已纳入解析"
 check("RESOLVED_PORTS：既有端口保持（yolo/target_crop/annotate）",
       RESOLVED_PORTS.get("yolo") == ("image",) and RESOLVED_PORTS.get("target_crop") == ("frame", "dets")
       and RESOLVED_PORTS.get("annotate") == ("image", "dets"))
+
+# ============ 19. 产物全名 / 短名解析（P2-0 节点实例身份，设计稿 §3.1/§3.4） ============
+print("== 19. 产物全名 / 短名解析 ==")
+_pos = {"yolo": [1], "det_filter": [2, 5], "target_crop": [3]}
+check("resolve_artifact: 短名 + 单实例 → 全名",
+      resolve_artifact("yolo.dets", _pos) == "yolo#1.dets")
+check("resolve_artifact: 已是全名 → 原样返回",
+      resolve_artifact("target_crop#3.crops", _pos) == "target_crop#3.crops")
+check("resolve_artifact: 多实例写全名可解析",
+      resolve_artifact("det_filter#5.dets", _pos) == "det_filter#5.dets")
+
+
+def _ra_err(name: str):
+    try:
+        resolve_artifact(name, _pos)
+        return None
+    except PortResolutionError as e:
+        return str(e)
+
+
+_e_amb = _ra_err("det_filter.dets")
+check("resolve_artifact: 多实例短名歧义 → 报错（要求写全名，不猜）",
+      bool(_e_amb) and "歧义" in _e_amb and "det_filter" in _e_amb and "全名" in _e_amb, str(_e_amb))
+_e_unk = _ra_err("nope.dets")
+check("resolve_artifact: 未知模块 → 报错", bool(_e_unk) and "nope" in _e_unk, str(_e_unk))
+_e_emp = _ra_err("   ")
+check("resolve_artifact: 空名 → 报错", bool(_e_emp), str(_e_emp))
+_e_pos = _ra_err("yolo#9.dets")
+check("resolve_artifact: 全名位置不在本链路 → 报错",
+      bool(_e_pos) and "yolo#9.dets" in _e_pos, str(_e_pos))
+# ARTIFACT_* 常量体系的实例化 + 短名/全名互转 + 产物名 → 类型（唯一解析实现）
+check("artifact_at: 常量 + position → 全名", artifact_at(ARTIFACT_CROPS, 3) == "target_crop#3.crops")
+check("artifact_at: 全名幂等（替换位置）", artifact_at("target_crop#3.crops", 7) == "target_crop#7.crops")
+check("artifact_short: 全名 → 短名", artifact_short("det_filter#5.dets") == "det_filter.dets")
+check("artifact_short: 短名幂等", artifact_short("det_filter.dets") == "det_filter.dets")
+check("artifact_type: 短名 → 类型",
+      artifact_type(ARTIFACT_DETS) == "Records" and artifact_type(ARTIFACT_FRAME) == "Image")
+check("artifact_type: 全名 → 类型（剥位置）",
+      artifact_type("target_crop#3.crops") == "Records"
+      and artifact_type("annotate#4.annotated") == "Image")
+try:
+    artifact_type("nope.dets")
+    _e_at = None
+except PortResolutionError as e:
+    _e_at = str(e)
+check("artifact_type: 未知产物 → 报错", bool(_e_at) and "nope.dets" in _e_at, str(_e_at))
+
+# ============ 20. 同模块多实例（P2-0 解除单插槽） ============
+print("== 20. 同模块多实例 det_filter ==")
+
+
+class _DFSpy:
+    """包装 DetFilter，记录收到的 dets（断言位置键 inputs 各自生效）。"""
+    INPUTS = {"dets": "Records"}
+    OUTPUTS = {"dets": "Records"}
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.got = None
+
+    def run(self, dets, ts=0.0, frame_idx=0):
+        self.got = list(dets)
+        return self.inner.run(self.got, ts=ts, frame_idx=frame_idx)
+
+
+# 两个 det_filter（位置 2 / 5）各自 filter 独立生效：都取 yolo#1.dets（原始 3 条）
+_a_spy = _DFSpy(DetFilter(filter="score >= 0.5"))
+_b_spy = _DFSpy(DetFilter(filter="long >= 50"))
+_pma = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(),
+                det_filters=[(2, _a_spy), (5, _b_spy)], stage_positions={"yolo": 1},
+                stage_inputs={"#2": {"dets": "yolo#1.dets"},
+                              "#5": {"dets": "yolo#1.dets"}})
+_pma.step(0, 0.0, frame=object(), force=True)
+check("多实例: 实例 a 收到 yolo#1.dets 原始 3 条（位置键）",
+      _a_spy.got is not None and len(_a_spy.got) == 3)
+check("多实例: 实例 b 收到 yolo#1.dets 原始 3 条（各自独立）",
+      _b_spy.got is not None and len(_b_spy.got) == 3)
+check("多实例: #2 filter(score>=0.5) → 2 条（b1,b2）",
+      [d.bbox for d in _pma.artifacts.get("det_filter#2.dets", [])]
+      == [(0, 0, 10, 10), (0, 0, 100, 60)])
+check("多实例: #5 filter(long>=50) → 2 条（b2,b3，与 #2 不同）",
+      [d.bbox for d in _pma.artifacts.get("det_filter#5.dets", [])]
+      == [(0, 0, 100, 60), (0, 0, 200, 80)])
+check("多实例: 短名 det_filter.dets 不登记（避免歧义覆盖）",
+      ARTIFACT_DET_FILTER_DETS not in _pma.artifacts)
+check("多实例: yolo#1.dets 全名登记（过滤器上游）", len(_pma.artifacts.get("yolo#1.dets", [])) == 3)
+
+# 位置键 inputs 接不同上游互不覆盖：b 取 a 的输出 det_filter#2.dets（升序执行保证已登记）
+_a2 = _DFSpy(DetFilter(filter="score >= 0.5"))
+_b2 = _DFSpy(DetFilter(filter="long >= 50"))
+_pmb = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(),
+                det_filters=[(2, _a2), (5, _b2)], stage_positions={"yolo": 1},
+                stage_inputs={"#2": {"dets": "yolo#1.dets"},
+                              "#5": {"dets": "det_filter#2.dets"}})
+_pmb.step(0, 0.0, frame=object(), force=True)
+check("多实例: 实例 b 的 inputs.dets 指向实例 a 的输出（2 条，位置键互不覆盖）",
+      _b2.got is not None and len(_b2.got) == 2)
+check("多实例: #2 放行 2 条 / #5 在 #2 基础上再筛 → 1 条（b2）",
+      [d.bbox for d in _pmb.artifacts.get("det_filter#2.dets", [])] == [(0, 0, 10, 10), (0, 0, 100, 60)]
+      and [d.bbox for d in _pmb.artifacts.get("det_filter#5.dets", [])] == [(0, 0, 100, 60)])
+check("多实例: 按位置升序执行，last_filter=首次进入 3 / 最终放行 1",
+      _pmb.last_filter == (3, 1), str(_pmb.last_filter))
 
 print(f"\n全部通过: {PASS} 项断言")

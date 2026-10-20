@@ -26,7 +26,7 @@ YOLO 输出粒度（2026-10 编排上移到 Pipeline）:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pipe.det_filter import DetFilter
 from pipe.records import collect_events, to_record
@@ -76,7 +76,109 @@ RESOLVED_PORTS: Dict[str, Tuple[str, ...]] = {
 
 
 class PortResolutionError(ValueError):
-    """端口连线解析失败（产物不存在 / 类型不符 / 端口未声明）——fail fast，含可读上下文。"""
+    """端口连线解析失败（产物不存在 / 类型不符 / 端口未声明 / 产物名歧义）——fail fast，含可读上下文。"""
+
+
+# ---------------- 产物全名 / 短名解析（P2-0 节点实例身份，设计稿 doc/design/graph_chain.md §3.1/§3.4） ----------------
+# 产物全名 = {module_id}#{position}.{artifact}（例 target_crop#3.crops、yolo#1.dets）；
+# 上列 ARTIFACT_* 常量即"短名"（省略 #position），与旧约定同族、迁移直觉自然。
+# 短名在本链路该模块只有单实例时等效；多实例必须写全名（**不猜**）。
+# 解析逻辑集中在本节（唯一实现）——web 段 validate_chain / server 都复用，不各写一份。
+_POSITION_SEP = "#"
+
+
+def artifact_short(name: str) -> str:
+    """全名 {module}#{position}.{artifact} → 短名 {module}.{artifact}（短名幂等返回）。"""
+    module_id, sep, tail = name.partition(_POSITION_SEP)
+    if not sep:
+        return name
+    _, _, artifact = tail.partition(".")
+    return f"{module_id}.{artifact}"
+
+
+def artifact_at(artifact: str, position: int) -> str:
+    """短名（或全名）+ position → 全名：ARTIFACT_* 常量体系的实例化。
+
+    例：artifact_at(ARTIFACT_CROPS, 3) == "target_crop#3.crops"。
+    """
+    base = artifact_short(artifact)
+    module_id, sep, art = base.partition(".")
+    if not module_id or not sep or not art:
+        raise PortResolutionError(
+            f"非法产物名 {artifact!r}（形如 {{module}}.{{artifact}}）")
+    return f"{module_id}{_POSITION_SEP}{int(position)}.{art}"
+
+
+def artifact_type(name: str) -> str:
+    """产物名（短名或全名）→ 类型（Image / Records / …）；未知 → PortResolutionError。
+
+    这是"产物名 → 类型"的唯一解析实现：全名先剥 #position 再查 ARTIFACT_TYPES。
+    """
+    base = artifact_short(name)
+    if base not in ARTIFACT_TYPES:
+        raise PortResolutionError(
+            f"未知产物 {name!r}（可用产物: {sorted(ARTIFACT_TYPES)}）")
+    return ARTIFACT_TYPES[base]
+
+
+def resolve_artifact(name: str, positions_by_module: Mapping[str, Sequence[int]]) -> str:
+    """短名 {module}.{artifact} → 全名 {module}#{position}.{artifact}。
+
+    - 已是全名 → 原样返回（校验其存在：模块与位置须在 positions_by_module 中）
+    - 该模块在本链路只有一个实例 → 返回其全名
+    - 多实例（歧义）→ 抛 PortResolutionError（要求写全名，不猜）
+    - 未知模块 / 空名 / 非法名 → 抛 PortResolutionError
+
+    positions_by_module 形如 {"yolo": [1], "det_filter": [2, 5]}（spec.stages 下标）。
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise PortResolutionError("产物名为空，无法解析")
+    name = name.strip()
+    if _POSITION_SEP in name:
+        module_id, _, tail = name.partition(_POSITION_SEP)
+        pos_str, dot, artifact = tail.partition(".")
+        if not module_id or not pos_str.isdigit() or not dot or not artifact:
+            raise PortResolutionError(
+                f"非法全名产物 {name!r}（形如 {{module}}#{{position}}.{{artifact}}）")
+        position = int(pos_str)
+        positions = positions_by_module.get(module_id) or ()
+        if position not in positions:
+            raise PortResolutionError(
+                f"全名产物 {name!r} 的模块/位置不在本链路"
+                f"（已知: { {m: list(p) for m, p in positions_by_module.items()} }）")
+        return name
+    module_id, dot, artifact = name.partition(".")
+    if not module_id or not dot or not artifact:
+        raise PortResolutionError(
+            f"非法产物名 {name!r}（短名形如 {{module}}.{{artifact}}）")
+    positions = positions_by_module.get(module_id)
+    if not positions:
+        raise PortResolutionError(
+            f"未知模块 {module_id!r}（本链路模块: {sorted(positions_by_module)}）")
+    if len(positions) > 1:
+        raise PortResolutionError(
+            f"模块 {module_id!r} 在本链路有多个实例 {list(positions)}，"
+            f"短名 {name!r} 有歧义，请写全名 {{module}}#{{position}}.{{artifact}}")
+    return f"{module_id}{_POSITION_SEP}{positions[0]}.{artifact}"
+
+
+# 阶段实例 → 模块 id（供按位置装配的 `stages` 容器归类实例；仅真实产品模块类）。
+_CLASS_TO_MODULE: Dict[str, str] = {
+    "FrameManager": "frame_manager",
+    "YOLODetector": "yolo",
+    "VLMAnalyzer": "vlm",
+    "DetFilter": "det_filter",
+    "SeqFilter": "seq_filter",
+    "TargetCrop": "target_crop",
+    "Annotator": "annotate",
+    "FaceStage": "face_detect",
+    "PlateStage": "plate_recog",
+}
+
+
+def _module_of(obj) -> Optional[str]:
+    """阶段实例 → 模块 id（按类名；非产品模块实例如 FaceEmbedder 返回 None）。"""
+    return _CLASS_TO_MODULE.get(type(obj).__name__)
 
 # ---------------- 通用数据 ----------------
 @dataclass
@@ -421,6 +523,21 @@ class Pipeline:
     det_filter: Optional[DetFilter] = None  # 检测筛选阶段（有效性：逐条+成组，2026-10 自 YOLO 迁入）
     seq_filter: Optional[object] = None  # 时序判定阶段（节流/变化门控 + 事件，2026-10 自 Pipeline 迁入）
     event_filter: Optional[object] = None  # 事件尾（VLM/车牌等外部记录经 publish 走它出事件，可作链路尾）
+    # ---- 同模块多实例（P2-0 节点实例身份，设计稿 §3.1）：list[(position, obj)]，按 position 升序执行 ----
+    # 每类同模块阶段可多实例并存、各自独立生效（产物全名 {module}#{position}.{artifact} 互不覆盖）。
+    # 旧单插槽字段（yolo/crop/...）保留读取兼容：单插槽实例 position 取 stage_positions（未声明=None）。
+    det_filters: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, DetFilter), ...]
+    seq_filters: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, SeqFilter), ...]
+    target_crops: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, TargetCrop), ...]
+    annotators: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, Annotator), ...]
+    plate_stages: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, PlateStage), ...]
+    face_stages: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, FaceStage), ...]
+    # stage_positions: {module_id: position（或位置列表）}——实例位置声明（供 stage_inputs 的
+    #           "#<position>" 键与短名解析；缺省空 = 单插槽仅按旧 module_id 键解析，零回归）。
+    stage_positions: Dict[str, Any] = field(default_factory=dict)
+    # stages: 按位置装配的实例容器 {position: 阶段实例}（web 段 `_chain_from_spec` 用；
+    #           实例优先级：多实例列表 > stages > 单插槽字段，按位置升序驱动执行）。
+    stages: Dict[int, Any] = field(default_factory=dict)
     last_plates: List = field(default_factory=list)  # 最近一帧识别到的车牌（供驱动层读取）
     last_faces: List = field(default_factory=list)  # 最近一帧检测到的人脸（供驱动层读取）
     last_crops: List = field(default_factory=list)  # 最近一帧目标裁剪产物（供驱动层读取）
@@ -429,13 +546,88 @@ class Pipeline:
     last_face_input: List = field(default_factory=list)  # 最近一帧传给人脸阶段的子图（门控后）
     last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
     last_events: List = field(default_factory=list)  # 最近一帧末段记录携带的事件（链路尾通用输出，见 records.events）
-    # ---- 产物端口协议（P5 第 2 步） ----
+    # ---- 产物端口协议（P5 第 2 步；P2-0 扩展节点实例身份） ----
     # artifacts: 逐帧产物表 {产物名: 值}，step() 每帧开始时重建、各阶段执行后登记；
-    #           命名 {阶段标识}.{产物名}，见模块级 ARTIFACT_* 常量。
-    # stage_inputs: 拼接层注入的连线映射 {module_id: {端口名: 上游产物名}}；
+    #           有位置实例 → 全名 {module_id}#{position}.{artifact}；单实例另登记短名别名（兼容旧读法）。
+    # stage_inputs: 拼接层注入的连线映射 {位置串 "#<position>" 或 module_id(兼容): {端口名: 上游产物名}}；
     #           缺省空 = 完全按现状规则（零回归）；声明则按产物名解析该端口的值。
     artifacts: Dict[str, Any] = field(default_factory=dict)
     stage_inputs: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    # ---------------- 多实例辅助 ----------------
+    def _pos_of(self, module_id: str) -> Optional[int]:
+        """单插槽实例的声明位置：stage_positions 值兼容 int 与位置序列（多实例取首个）。"""
+        v = (self.stage_positions or {}).get(module_id)
+        if v is None:
+            return None
+        if isinstance(v, (list, tuple)):
+            return int(v[0]) if v else None
+        return int(v)
+
+    def _instances(self, module_id: str, single, plural) -> List[Tuple[Optional[int], Any]]:
+        """产出某模块的 (position, obj) 序列（位置升序）。
+
+        基础序：显式多实例列表 `plural` → 位置容器 `stages`（按类名归类）→ 旧单插槽 `single`。
+        **显式单插槽覆盖**：若基础序非空且 `single` 已设（含装配后被替换的实例，如测试间谍
+        `pipe.annotate = spy`），用 `single` 替换其声明位置的实例，其余位置保留——既支持多实例，
+        又兼容装配后替换单槽字段的既有用法。
+        """
+        base: List[Tuple[int, Any]] = []
+        if plural:
+            base = [(int(pos), obj) for pos, obj in sorted(plural, key=lambda t: t[0])]
+        elif self.stages:
+            base = [(int(pos), obj) for pos, obj in sorted(self.stages.items())
+                    if obj is not None and _module_of(obj) == module_id]
+        if base:
+            if single is not None:
+                pos = self._pos_of(module_id)
+                if pos is None:
+                    pos = base[0][0]
+                base = [(p, single if p == pos else obj) for p, obj in base]
+            return base
+        if single is not None:
+            return [(self._pos_of(module_id), single)]
+        return []
+
+    def _stage_instances(self, module_id: str) -> List[Tuple[Optional[int], Any]]:
+        """按模块 id 取实例序列（统一入口，供 step() / 位置表使用）。"""
+        pairs = {
+            "frame_manager": (self.frame, None),
+            "yolo": (self.yolo, None),
+            "vlm": (self.vlm, None),
+            "det_filter": (self.det_filter, self.det_filters),
+            "seq_filter": (self.seq_filter, self.seq_filters),
+            "target_crop": (self.crop, self.target_crops),
+            "annotate": (self.annotate, self.annotators),
+            "plate_recog": (self.plate, self.plate_stages),
+            "face_detect": (self.face, self.face_stages),
+        }
+        single, plural = pairs[module_id]
+        return self._instances(module_id, single, plural)
+
+    def _register(self, module_id: str, position: Optional[int], artifact: str,
+                  value, count: int) -> None:
+        """登记产物：有 position → 全名；本模块仅一个实例时另登记短名别名（兼容旧读法）。
+
+        count = 本模块本链路实例数（>1 时不登记短名，避免歧义覆盖）。
+        """
+        if position is not None:
+            self.artifacts[f"{module_id}{_POSITION_SEP}{position}.{artifact}"] = value
+        if count <= 1:
+            self.artifacts[f"{module_id}.{artifact}"] = value
+
+    def _positions_by_module(self) -> Dict[str, List[int]]:
+        """{module_id: [position, ...]}——本链路**已知位置**的实例（供短名解析 / 歧义判定）。
+
+        只有位置已知的实例（stages 容器 / 多实例列表 / 单插槽 + stage_positions）才登记；
+        位置未知的旧单插槽实例不进表（其产物以短名别名存在 artifacts，短名可直接命中）。
+        """
+        out: Dict[str, List[int]] = {}
+        for mid in _CLASS_TO_MODULE.values():
+            positions = [p for p, _ in self._stage_instances(mid) if p is not None]
+            if positions:
+                out[mid] = positions
+        return out
 
     def _submits(self, dets: List[Detection]) -> List[SubmitRequest]:
         """按识别类型（类别）构造报送请求（有效性/门控已由 det_filter/seq_filter 完成）。
@@ -462,19 +654,32 @@ class Pipeline:
         return collect_events(items)
 
     def _port(self, module_id: str, module, port: str, default):
+        """旧签名兼容：等价 `_port_at(位置未知, module_id, module, port, default)`。"""
+        return self._port_at(self._pos_of(module_id), module_id, module, port, default)
+
+    def _port_at(self, position: Optional[int], module_id: str, module,
+                 port: str, default):
         """解析一个输入端口的值：stage_inputs 未声明该端口 → 返回 default（现状规则，零回归）。
 
-        声明了则取 artifacts[上游产物名]，并做三项 fail fast 校验（抛 PortResolutionError）：
-          ① 产物名不在 ARTIFACT_TYPES（未知产物）；② 端口不在模块 INPUTS 声明中（非法端口）；
+        连线声明键优先位置串 `"#<position>"`（P2-0），回退旧 `module_id` 键（兼容）。
+        声明了则取 artifacts[上游产物名]，并做四项 fail fast 校验（抛 PortResolutionError）：
+          ① 产物名（短名/全名）不在 ARTIFACT_TYPES（未知产物）；② 端口不在模块 INPUTS 声明中；
           ③ 产物类型与端口声明类型不符；④ 产物本帧未登记（不在 artifacts，如上游阶段缺失）。
+        产物名解析：全名直取；短名先命名单实例别名，否则按位置解析（多实例歧义 → 报错要求写全名）。
         端口单一上游（用户决策 2）；同一产物可被多个下游引用（分支留路）。
         """
-        mapping = (self.stage_inputs or {}).get(module_id) or {}
-        if port not in mapping:
+        si = self.stage_inputs or {}
+        mapping = None
+        if position is not None:
+            mapping = si.get(f"{_POSITION_SEP}{position}")
+        if not mapping:
+            mapping = si.get(module_id)
+        if not mapping or port not in mapping:
             return default
         art_name = mapping[port]
+        base = artifact_short(art_name)
         decl = getattr(module, "INPUTS", None) or {}
-        if art_name not in ARTIFACT_TYPES:
+        if base not in ARTIFACT_TYPES:
             raise PortResolutionError(
                 f"阶段 {module_id!r} 端口 {port!r} 引用了未知产物 {art_name!r}"
                 f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
@@ -483,15 +688,21 @@ class Pipeline:
                 f"阶段 {module_id!r} 端口 {port!r} 未在其 INPUTS 声明中"
                 f"（该模块已声明端口: {sorted(decl)}）")
         want = decl.get(port)
-        if want and ARTIFACT_TYPES[art_name] != want:
+        if want and ARTIFACT_TYPES[base] != want:
             raise PortResolutionError(
                 f"阶段 {module_id!r} 端口 {port!r} 类型不符：上游产物 {art_name!r} 为 "
-                f"{ARTIFACT_TYPES[art_name]}，端口声明为 {want}")
-        if art_name not in self.artifacts:
+                f"{ARTIFACT_TYPES[base]}，端口声明为 {want}")
+        full = art_name
+        if full not in self.artifacts and _POSITION_SEP not in art_name:
+            # 短名未命中别名（多实例 / 未知模块）→ 尝试按位置解析（歧义在此报错）
+            positions = self._positions_by_module()
+            if art_name.split(".", 1)[0] in positions:
+                full = resolve_artifact(art_name, positions)
+        if full not in self.artifacts:
             raise PortResolutionError(
                 f"阶段 {module_id!r} 端口 {port!r} 请求的产物 {art_name!r} 不在本帧产物表中"
                 f"（可用产物: {sorted(self.artifacts)}）")
-        return self.artifacts[art_name]
+        return self.artifacts[full]
 
     def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
              frame=None, force: bool = False):
@@ -507,61 +718,93 @@ class Pipeline:
         self.artifacts = {}
         if not force and not self.frame.wants_frame(frame_idx, ts):
             return submits, []
+        fm_pos = next((p for p, _ in self._stage_instances("frame_manager")), None)
         if frame is not None:
-            self.artifacts[ARTIFACT_FRAME] = frame  # frame_manager.frame
-        if dets is None and self.yolo is not None:
-            yolo_img = self._port("yolo", self.yolo, "image", frame)
+            # frame_manager.frame（本帧原图）；有声明位置时登记全名 + 短名别名
+            self._register("frame_manager", fm_pos, "frame", frame, 1)
+        yolo_insts = self._stage_instances("yolo")
+        yolo_pos, yolo = (yolo_insts[0] if yolo_insts else (None, None))
+        if dets is None and yolo is not None:
+            yolo_img = self._port_at(yolo_pos, "yolo", yolo, "image", frame)
             if yolo_img is not None:
-                dets = self.yolo.infer(yolo_img, track=self.track_needed())
-        if self.yolo is not None and dets is not None:
-            self.artifacts[ARTIFACT_DETS] = dets  # yolo.dets（纯推理原始检出，过滤前）
+                dets = yolo.infer(yolo_img, track=self.track_needed())
+        if yolo is not None and dets is not None:
+            # yolo.dets（纯推理原始检出，过滤前）
+            self._register("yolo", yolo_pos, "dets", dets, len(yolo_insts))
 
         # 检测筛选阶段：有效性判定（逐条条件 + 成组数量；原 YOLO 输出过滤链）——
         # 不达标的检测视为"未识别"，对**所有**下游（裁剪/标注/报送/事件）一致生效。
+        # 多实例按位置升序执行、链式传递 dets（各自产物全名路径互不覆盖）。
         self.last_filter = None
-        if dets and self.det_filter is not None:
-            df_in = self._port("det_filter", self.det_filter, "dets", dets)
-            n_in = len(df_in)
-            dets = self.det_filter.run(df_in, ts=ts, frame_idx=frame_idx)
-            self.last_filter = (n_in, len(dets))
-        if self.det_filter is not None:
-            self.artifacts[ARTIFACT_DET_FILTER_DETS] = dets if dets is not None else []
+        df_insts = self._stage_instances("det_filter")
+        if df_insts:
+            cur = dets if dets is not None else []
+            ran = bool(dets)
+            first_in = None
+            for pos, df in df_insts:
+                if ran:
+                    df_in = self._port_at(pos, "det_filter", df, "dets", cur)
+                    if first_in is None:
+                        first_in = len(df_in)
+                    cur = df.run(df_in, ts=ts, frame_idx=frame_idx)
+                self._register("det_filter", pos, "dets", cur, len(df_insts))
+            if ran:
+                dets = cur
+                self.last_filter = (first_in, len(cur))
 
         # 时序判定阶段：节流/变化门控（原 Pipeline check_interval/track_change_only）——
-        # 门控下游可见的检测集。
-        if dets and self.seq_filter is not None:
-            sf_in = self._port("seq_filter", self.seq_filter, "dets", dets)
-            dets = self.seq_filter.run(sf_in, ts=ts, frame_idx=frame_idx)
-        if self.seq_filter is not None:
-            self.artifacts[ARTIFACT_SEQ_FILTER_DETS] = dets if dets is not None else []
+        # 门控下游可见的检测集；多实例按位置升序链式执行。
+        sf_insts = self._stage_instances("seq_filter")
+        if sf_insts:
+            cur = dets if dets is not None else []
+            ran = bool(dets)
+            for pos, sf in sf_insts:
+                if ran:
+                    sf_in = self._port_at(pos, "seq_filter", sf, "dets", cur)
+                    cur = sf.run(sf_in, ts=ts, frame_idx=frame_idx)
+                self._register("seq_filter", pos, "dets", cur, len(sf_insts))
+            if ran:
+                dets = cur
 
         # 目标裁剪阶段：按上游检测框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
         self.last_crops = []
-        if self.crop is not None and frame is not None and dets is not None:
-            crop_frame = self._port("target_crop", self.crop, "frame", frame)
-            crop_dets = self._port("target_crop", self.crop, "dets", dets)
-            self.last_crops = list(self.crop.run(crop_frame, crop_dets, ts))
-        if self.crop is not None:
-            # 裁剪记录列表：转记录后元素含统一旁路键 image（旧名 img 保留为兼容别名）
-            self.artifacts[ARTIFACT_CROPS] = [to_record(c) for c in self.last_crops]
+        crop_insts = self._stage_instances("target_crop")
+        if crop_insts:
+            cur_crops = []
+            for pos, cr in crop_insts:
+                if frame is not None and dets is not None:
+                    crop_frame = self._port_at(pos, "target_crop", cr, "frame", frame)
+                    crop_dets = self._port_at(pos, "target_crop", cr, "dets", dets)
+                    cur_crops = list(cr.run(crop_frame, crop_dets, ts))
+                # 裁剪记录列表：转记录后元素含统一旁路键 image（旧名 img 保留为兼容别名）
+                self._register("target_crop", pos, "crops",
+                               [to_record(c) for c in cur_crops], len(crop_insts))
+            self.last_crops = cur_crops
 
-        # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）
+        # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）。多实例链式：下一实例
+        # 默认 image 取上一实例标注图（单实例默认仍为本帧原图，零回归）。
         self.last_annotated = None
-        if self.annotate is not None and frame is not None and dets is not None:
-            anno_img = self._port("annotate", self.annotate, "image", frame)
-            anno_dets = self._port("annotate", self.annotate, "dets", dets)
-            self.last_annotated = self.annotate.run(anno_img, anno_dets, ts)
-        if self.annotate is not None and self.last_annotated is not None:
-            self.artifacts[ARTIFACT_ANNOTATED] = self.last_annotated
+        anno_insts = self._stage_instances("annotate")
+        if anno_insts and frame is not None and dets is not None:
+            cur_img = frame
+            for pos, an in anno_insts:
+                anno_img = self._port_at(pos, "annotate", an, "image", cur_img)
+                anno_dets = self._port_at(pos, "annotate", an, "dets", dets)
+                cur_img = an.run(anno_img, anno_dets, ts)
+                if cur_img is not None:
+                    self._register("annotate", pos, "annotated", cur_img, len(anno_insts))
+            self.last_annotated = cur_img
 
-        if self.yolo is not None:
-            if dets is not None and self.vlm is not None:
+        vlm_insts = self._stage_instances("vlm")
+        vlm = vlm_insts[0][1] if vlm_insts else None
+        if yolo is not None:
+            if dets is not None and vlm is not None:
                 # 报送请求的唯一消费者是 VLM 阶段（门控已在上游 det_filter/seq_filter 生效）。
                 # 目标裁剪阶段（crop）与 VLM 可共存：crops 供下游阶段/驱动层取裁剪子图
                 # （image_source=crops），同时仍按检测按类报送 VLM（_submits 语义与门控不变）；
                 # 仅有 crop、无 vlm 时不产生 submits（车牌/人脸链路既有行为不变）。
                 submits = self._submits(dets)
-        elif self.vlm is not None:
+        elif vlm is not None:
             # large_only: 帧决策即送整帧
             submits = [SubmitRequest(-1, GRAN_SCENE, "full:global")]
 
@@ -569,11 +812,15 @@ class Pipeline:
         self.last_plates = []
         self.last_plate_input = []
         plate_events: List[dict] = []
-        if self.plate is not None and frame is not None:
-            plate_frame = self._port("plate_recog", self.plate, "frame", frame)
-            plate_crops = self._port("plate_recog", self.plate, "crops", self.last_crops)
+        plate_insts = self._stage_instances("plate_recog")
+        for pos, pl in plate_insts:
+            if frame is None:
+                continue
+            plate_frame = self._port_at(pos, "plate_recog", pl, "frame", frame)
+            plate_crops = self._port_at(pos, "plate_recog", pl, "crops", self.last_crops)
             self.last_plate_input = list(plate_crops)
-            self.last_plates = list(self.plate.run(plate_frame, plate_crops, ts))
+            self.last_plates = list(pl.run(plate_frame, plate_crops, ts))
+            self._register("plate_recog", pos, "plates", self.last_plates, len(plate_insts))
             for p in self.last_plates:
                 if not p.plate_no:
                     continue
@@ -581,18 +828,18 @@ class Pipeline:
                        "content": {"plate_no": p.plate_no, "type_name": p.type_name,
                                    "color": p.color, "bbox": list(p.bbox)}}
                 plate_events += self.publish([rec], ts, frame_idx)
-        if self.plate is not None and frame is not None:
-            self.artifacts[ARTIFACT_PLATES] = self.last_plates
         # 人脸识别阶段：检测 → 人脸产物（同源于 crop 产物）；落盘/计数/事件尾留驱动层。
         self.last_faces = []
         self.last_face_input = []
-        if self.face is not None and frame is not None:
-            face_frame = self._port("face_detect", self.face, "frame", frame)
-            face_crops = self._port("face_detect", self.face, "crops", self.last_crops)
+        face_insts = self._stage_instances("face_detect")
+        for pos, fc in face_insts:
+            if frame is None:
+                continue
+            face_frame = self._port_at(pos, "face_detect", fc, "frame", frame)
+            face_crops = self._port_at(pos, "face_detect", fc, "crops", self.last_crops)
             self.last_face_input = list(face_crops)
-            self.last_faces = list(self.face.run(face_frame, face_crops, ts))
-        if self.face is not None and frame is not None:
-            self.artifacts[ARTIFACT_FACES] = self.last_faces
+            self.last_faces = list(fc.run(face_frame, face_crops, ts))
+            self._register("face_detect", pos, "faces", self.last_faces, len(face_insts))
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
         # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
         self.last_events = (collect_events(dets) if dets else []) + plate_events
@@ -600,6 +847,8 @@ class Pipeline:
 
     def track_needed(self) -> bool:
         """是否需要 YOLO 跟踪（车牌阶段按 track 去重时需要）。"""
+        if any(getattr(p, "use_track", False) for _, p in self._stage_instances("plate_recog")):
+            return True
         return bool(getattr(self.plate, "use_track", False))
 
 
