@@ -8,19 +8,15 @@ ROOT="$(dirname "$SELF")"                  # 项目根（.mysql 数据目录在�
 PY="${PY:-$(conda run -n ai which python 2>/dev/null || command -v python)}"
 
 # 除非显式 --no-db，否则确保项目自含 MySQL 实例已启动（端口 3307，仅绑定本机）
+# 判活/启动逻辑与 restart.sh 共用 mysql_lib.sh（真实探活，残留 socket 自动清理）
 NO_DB=0
 for a in "$@"; do [ "$a" = "--no-db" ] && NO_DB=1; done
 if [ "$NO_DB" -eq 0 ]; then
-  MYSQL_SOCK="$ROOT/.mysql/mysql.sock"
-  if [ -S "$MYSQL_SOCK" ]; then
-    echo "[run] 本地 MySQL 已在运行（127.0.0.1:3307）"
-  else
-    mkdir -p "$ROOT/.mysql"
-    mysqld --datadir="$ROOT/.mysql/data" --socket="$MYSQL_SOCK" \
-           --port=3307 --bind-address=127.0.0.1 \
-           --log-error="$ROOT/.mysql/mysql.log" --daemonize
-    echo "[run] 已拉起本地 MySQL（127.0.0.1:3307，umvp/123）"
-  fi
+  . "$SELF/mysql_lib.sh"
+  umvp_mysql_ensure "$ROOT" run || {
+    echo "[run] 本地 MySQL 未能就绪，已中止启动；日志: $ROOT/.mysql/mysql.log"
+    exit 1
+  }
 fi
 
 exec "$PY" server.py "$@"

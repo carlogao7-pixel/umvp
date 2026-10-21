@@ -37,29 +37,15 @@ else
   "$SELF/stop.sh" --keep-mysql --port "$PORT"
 fi
 
-# ---- 2) 确保自含 MySQL 运行（同 run.sh 逻辑，非 --no-db）----
+# ---- 2) 确保自含 MySQL 运行（同 run.sh 逻辑，共用 mysql_lib.sh；--no-db 跳过）----
 NO_DB=0
 for a in "$@"; do [ "$a" = "--no-db" ] && NO_DB=1; done
 if [ "$NO_DB" -eq 0 ]; then
-  MYSQL_SOCK="$ROOT/.mysql/mysql.sock"
-  if [ -S "$MYSQL_SOCK" ] && pgrep -f "\.mysql/mysql\.sock" >/dev/null; then
-    echo "[restart] 本地 MySQL 已在运行（127.0.0.1:3307）"
-  else
-    mkdir -p "$ROOT/.mysql"
-    # 进程已确认不在，清理残留 socket/pid/lock，防 mysqld 启动失败
-    rm -f "$MYSQL_SOCK" "$ROOT/.mysql/mysql.pid" "$ROOT/.mysql/mysql.sock.lock"
-    mysqld --datadir="$ROOT/.mysql/data" --socket="$MYSQL_SOCK" \
-           --port=3307 --bind-address=127.0.0.1 \
-           --log-error="$ROOT/.mysql/mysql.log" --daemonize
-    echo "[restart] 已拉起本地 MySQL（127.0.0.1:3307，umvp/123）"
-    # 等待 MySQL 就绪（最多 ~15s）；未就绪只警告不阻断（DB 不可用不影响 server 启动）
-    ready=0
-    for i in $(seq 1 30); do
-      if ss -ltn 2>/dev/null | grep -q ":3307 "; then ready=1; break; fi
-      sleep 0.5
-    done
-    [ "$ready" -eq 1 ] || echo "[restart] 警告：MySQL 15 秒内未就绪，presets 接口可能不可用"
-  fi
+  . "$SELF/mysql_lib.sh"
+  umvp_mysql_ensure "$ROOT" restart || {
+    echo "[restart] 本地 MySQL 未能就绪，已中止启动（web 未拉起）；日志: $ROOT/.mysql/mysql.log"
+    exit 1
+  }
 fi
 
 # ---- 3) 后台拉起 web server，日志落 out/web_lab.log ----

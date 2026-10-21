@@ -55,15 +55,17 @@ if [ "$KEEP_MYSQL" -eq 1 ]; then
 fi
 
 MYSQL_SOCK="$ROOT/.mysql/mysql.sock"
-if [ -S "$MYSQL_SOCK" ]; then
-  MYSQL_PID="$(pgrep -f "\.mysql/mysql\.sock" | head -1 || true)"
+. "$SELF/mysql_lib.sh"
+if umvp_mysql_alive "$ROOT"; then
+  MYSQL_PID="$(umvp_mysql_procs "$ROOT" | head -1 || true)"
   if [ -n "$MYSQL_PID" ]; then
     echo "[stop] 停止自含 MySQL（pid=$MYSQL_PID，127.0.0.1:3307）..."
-    # 优先 mysqladmin 优雅关闭；失败（无 SHUTDOWN 权限等）回退 kill -TERM
-    if command -v mysqladmin >/dev/null 2>&1; then
-      mysqladmin --socket="$MYSQL_SOCK" \
-        -u "${MYSQL_USER:-umvp}" -p"${MYSQL_PASSWORD:-123}" \
-        shutdown >/dev/null 2>&1 || echo "[stop] mysqladmin 关闭失败，改用 kill -TERM"
+    # 优先 mysqladmin 优雅关闭（root@localhost socket → umvp socket 凭据链，
+    # 见 mysql_lib.sh umvp_mysql_shutdown）；凭据均不可用才 kill -TERM 兜底
+    if umvp_mysql_shutdown "$ROOT"; then
+      echo "[stop] 已发出 mysqladmin 优雅关闭，等待退出..."
+    else
+      echo "[stop] mysqladmin 优雅关闭不可用（root/umvp 凭据连接失败或无 SHUTDOWN 权限），改用 kill -TERM（MySQL 8 下同为优雅关闭）"
     fi
     for i in $(seq 1 20); do
       kill -0 "$MYSQL_PID" 2>/dev/null || break
@@ -78,8 +80,11 @@ if [ -S "$MYSQL_SOCK" ]; then
     fi
     echo "[stop] 自含 MySQL 已停止"
   else
-    echo "[stop] 发现残留 mysql.sock 但无 mysqld 进程（忽略）"
+    # 极端：3307 有监听/握手成功但进程名不是本实例（例如别的 mysqld），不误杀
+    echo "[stop] 127.0.0.1:3307 有应答但未定位到本实例 mysqld（跳过）"
   fi
+elif [ -e "$MYSQL_SOCK" ]; then
+  echo "[stop] 发现残留 mysql.sock 但 3307 无应答（忽略，下次启动会自动清理）"
 else
   echo "[stop] 自含 MySQL 未在运行"
 fi
