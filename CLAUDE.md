@@ -100,7 +100,9 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
   （`new/set/list/show/check`，零依赖，改完必跑 `check`）。用户需求经 orchestrator 审核澄清后
   开**主单**（`WO-xxxx`）再派发；各代理开工前建**子单**（`WO-xxxx.n`，发起人=自己，可
   `--to` 跨板块指派并在回报中 @对方）；状态流转 **进行中 → 待测试（qa 验证）→ 已完成**，
-  需求受阻/变更用 **已取消**；主单在全部子单关闭前保持进行中。字段与细则见工单文件头。
+  需求受阻/变更用 **已取消**；主单在全部子单关闭前保持进行中。字段与细则见工单文件头
+  （用 `ticket.py show WO-xxxx` 取单条）。**勿整读 `tickets.md`**（同 inbox：单条一律走
+  `ticket.py show` / `ledger.py get`，全文只在工具不可用时兜底）。
 - **筛选同步 `/curate`**：用户执行时，主代理翻 inbox「待同步」条目，按需提炼进本文件 /
   `DEPLOYMENT.md`；**涉及 `doc/` 项目文档或新建文档时，必须先列出建议征求用户同意再写入**。
   已处理条目移入「已同步」（注明去向）。
@@ -181,6 +183,10 @@ bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂
 - **工单 / 记录工具的临时脚本**：`ticket.py` / `ledger.py` / `ticket_web.py` 的默认文件按**脚本自身位置**
   解析——临时脚本、差分比对、自检一律**显式** `--file`/`--deployment-file` 指向临时副本，否则会写坏真实
   工单文件（INB-0039 教训）。
+- **判活 / 诊断脚本勿用 `pgrep -f` 匹配含路径的命令行**：`pgrep -f "<路径>"` 会命中命令行里
+  出现该字符串的任意进程（父 shell、`bash -c` 诊断命令等），造成「明明没起却报在跑」的误判；
+  正确做法 `pgrep -x <进程名>` 精确取 pid 后读 `/proc/<pid>/cmdline` 核特征（INB-0055，
+  `web_lab/mysql_lib.sh` 已按此实现）。
 - **已知限制（未修，待评估）**：`face_embed` 去重阈值未进 `web_lab` PARAMS（`server.py`），驱动层恒取
   默认 0.55，需按链路配阈值时要补 `thresh`（含 DB 参数表列）；另 `_chain_from_spec` 对含
   face_detect/face_embed 的 spec 在**装配期**即构造模型（即加载权重），`h_chain` 等非链路入口同样加载。

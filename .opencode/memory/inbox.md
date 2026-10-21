@@ -28,6 +28,24 @@
 
 <!-- /curate 处理后移到这里，注明去向，例如：INB-0001 → CLAUDE.md §三 设计契约 -->
 
+- [2026-10-21][INB-0058][qa][坑] WO-0012.1 复核：mysql_lib.sh:122 注释仍写「仅本机 socket 可连（host=localhost 不匹配 TCP 登录）」，与 INB-0057 自我纠正（实测 socket+TCP loopback 均可达，勿再沿用 socket-only 表述）矛盾
+  → 去向：orchestrator 已于 WO-0012 收口时顺手修正注释（socket+loopback 表述，bash -n 过），无需再流转
+
+- [2026-10-21][INB-0057][web][成果/坑] WO-0012 修复 stop.sh 自含 MySQL 关闭凭据链（INB-0056）：关闭逻辑抽为 mysql_lib.sh umvp_mysql_shutdown（root@localhost socket 空密码优先，MYSQL_ROOT_PASSWORD 环境变量留口 → umvp socket → 均失败才 kill -TERM，兜底消息改准确点明权限/连接原因）；决策不补授 umvp SHUTDOWN——root 空密码是 initialize-insecure 出厂态，换机重建 data 目录后天然成立，补授反而要在 ensure 链路加幂等 GRANT（多一个 root 凭据依赖），收益为零且 umvp 保持 umvp.* 最小权限。坑：实测 root@localhost 经 TCP loopback 3307 也能空密码登录（MySQL 默认未开 skip_name_resolve，127.0.0.1 反解为 localhost 匹配账号）——「root 仅 socket 可连」说法不准，实为仅本机可达（socket+loopback），仍不扩大跨机暴露面；写文档时勿再沿用 socket-only 表述。改 web_lab/stop.sh + mysql_lib.sh，run.sh/restart.sh 不动。
+  → 去向：DEPLOYMENT.md DEP-0001（凭据链/不补授决策/MYSQL_ROOT_PASSWORD/loopback 纠正）+ doc/guides/runbook.md §3.2 停止说明（通俗表述）
+
+- [2026-10-21][INB-0055][web][坑] **`pgrep -f` 匹配 socket 路径会误判 MySQL 存活**：修 INB-0053 时先用 `pgrep -f "\.mysql/mysql\.sock"` 作进程兜底，结果它匹配到「命令行里出现该字符串的任意 shell」——包括调用 run.sh 的父 shell 和诊断用 bash -c，导致 3307 明明无监听却报「已在运行」后 15s 超时中止（实测复现：run.sh 输出「本地 MySQL 已在运行」紧跟「未就绪」）。正确做法：`pgrep -x mysqld` 按可执行名精确取 pid，再读 `/proc/<pid>/cmdline` 核本实例 datadir/socket（顺带天然排除系统 3306）。另：`ss` 查端口的 fallback 只在没有 mysqladmin 时用——有 mysqladmin 时若 ping 失败而 3307 有人监听（外部实例/坏 socket）会误认成本实例，实测用坏 datadir 的 ensure 曾因此漏报。
+  → 去向：CLAUDE.md §七「判活/诊断脚本勿用 pgrep -f」条款（代码侧 mysql_lib.sh 已按此实现，无需再归档）
+
+- [2026-10-21][INB-0054][web][成果] **WO-0011.1 完成：启动脚本 MySQL 判活改为真实探活**。新增 `web_lab/mysql_lib.sh`（共用片段，run.sh/restart.sh/stop.sh 统一 source）：`umvp_mysql_serving` 用 `mysqladmin --socket=... ping` 真实握手（凭据错也返回 0=服务在跑；无 mysqladmin 才退化为 ss 查 127.0.0.1:3307），`umvp_mysql_alive` 再用 `pgrep -x mysqld` + `/proc/<pid>/cmdline` 核本实例 datadir/socket 兜底启动中窗口；`umvp_mysql_ensure` 探活失败即清理残留 socket/sock.lock/mysql.pid 再 `mysqld --daemonize`，启动后 15s 内二次握手确认，失败打印 `tail -n 50 .mysql/mysql.log` 提示并中止（不再带病起 web）。端口 3307 / 数据目录 / 系统 3306 均未动。实测：残留 socket（kill -9 保 socket）后 `./web_lab/restart.sh` 自动清理并拉起 3307、8001=200、presets 接口 {"ok":true}；正常态连跑两次 restart 不重复拉起（mysqld pid 不变）且不报错；`bash -n` 四个脚本通过。详见 INB-0054。
+  → 去向：doc/guides/runbook.md §3.1（真实探活/残留文件自动清理/失败打印日志末50行，通俗表述）+ DEPLOYMENT.md DEP-0001（WO-0011/WO-0012 台账）
+
+- [2026-10-21][INB-0056][qa][坑] stop.sh 全停时必打印「mysqladmin 关闭失败，改用 kill -TERM」：umvp 账号只有 USAGE + umvp.* ALL，无全局 SHUTDOWN 权限，故 mysqladmin shutdown 恒失败走 kill -TERM 兜底（实测优雅退出正常、socket 自动清理，功能无问题）
+  → 去向：已由 WO-0012 修复闭环（umvp_mysql_shutdown root→umvp 凭据链 + 兜底消息改准确，决策不补授 SHUTDOWN，qa 复核通过）；去向建议并入 INB-0057 的 /curate 项
+
+- [2026-10-21][INB-0053][orchestrator][坑] **run.sh/restart.sh 用 socket 文件存在判断自含 MySQL 存活**：`[ -S .mysql/mysql.sock ]` 成立即跳过启动。WSL 整体重启（或 mysqld 被 OOM/关闭）会留下残留 socket 而进程已死 → 启动脚本误判「已在运行」，随后 web_lab 8001 起来但 3307 无监听，preset 读写全部连接失败（现象是页面正常但存/取配置报错）。本轮实测：socket 时间戳 10-20 15:16（最后 ready for connections 也是 10-20），10-21 复核 3307 未监听、socket 仍在。处置：启动前 `rm -f .mysql/mysql.sock` 再跑 restart.sh（实测已恢复：8001=200、3307 监听、3 条 pipeline 播种正常）。建议修法（待 web 板块评估）：liveness 改为 `mysqladmin --socket=... ping` 或 ss 查 3307，失败即先删残留 socket 再启动。
+  → 去向：已由 WO-0011 修复闭环（web_lab/mysql_lib.sh 真实探活 + 残留 socket 自动清理，qa 复核通过）；替代原始建议，探活实现细节见 INB-0054
+
 - [2026-10-16][INB-0017][web][坑] 驱动层人脸身份去重阈值读 `face_embed.thresh`，但 `face_embed` 参数表（server.py PARAMS）**无 thresh 项** → 实际恒取默认 0.55；要按链路配置阈值需给 face_embed 补 `thresh`（会新增 DB 参数表列）。另：`_chain_from_spec` 现对含 face_detect/face_embed 的 spec 在**装配期**即构造 FaceDetector/FaceEmbedder（构造即加载模型），h_chain/h_pipeline_stream 走人脸 spec 时同样会加载。
   → 去向：CLAUDE.md §七「已知限制」（未闭环技术债：face_embed 阈值未入 PARAMS，待评估）
 

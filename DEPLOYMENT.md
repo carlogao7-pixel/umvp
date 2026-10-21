@@ -34,6 +34,12 @@
 
 ## 记录
 
+### 2026-10-21(三) · web_lab 自含 MySQL 生命周期脚本改造：真实探活 + 优雅关闭凭据链（WO-0011/WO-0012）
+- 变更内容：① 新增 web_lab/mysql_lib.sh 共用片段：判活改真实探活（mysqladmin --socket ping → 无 mysqladmin 退化 ss 查 3307 → pgrep -x mysqld + /proc/<pid>/cmdline 核本实例 datadir/socket 兜底启动窗口），探活失败自动清理残留 socket/sock.lock/mysql.pid 再启动，启动后 15s 内二次握手确认，失败打印 mysql.log 末 50 行并中止；run.sh/restart.sh/stop.sh 统一 source。② stop.sh 关闭改 umvp_mysql_shutdown 凭据链：root@localhost socket（MYSQL_ROOT_PASSWORD 环境变量留口，默认空密码）→ umvp socket → 均失败 kill -TERM 兜底（MySQL 8 下同为优雅关闭），兜底消息点明权限/凭据原因；决策不补授 umvp SHUTDOWN（root 路径覆盖唯一场景 + umvp 保持最小权限 + 换机重建 data 目录后 root 路径天然成立）。背景与证据：INB-0053~0058。
+- 影响面：**入口**、**配置**
+- 部署注意：换机重建 .mysql/data（mysqld --initialize-insecure）后判活/关闭链路零配置即成立；若改过 root 密码，设 MYSQL_ROOT_PASSWORD 即恢复优雅关闭路径，不设则回落 TERM 兜底（功能不受影响）；新增环境变量 MYSQL_ROOT_PASSWORD（仅关闭链用，勿入仓）。坑：root@localhost 实为仅本机可达（socket+loopback TCP 皆可，未开 skip_name_resolve），文档勿再写 socket-only（INB-0057）。
+- 验证：qa 独立复核两轮全过（WO-0011.1/WO-0012.1）：残留 socket 场景自动清理拉起 3307、幂等连跑 restart pid 不变、全停走 root 凭据链无误导消息、wrongpass 兜底消息准确、--keep-mysql 回归、bash -n 四脚本、回归 test_image_source 73 / test_validate_chain 34 / test_agent_runtime 39
+
 ### 2026-10-20(二) · WO-0010：代理模型免重启切换（frontmatter 去 model + 项目默认配置 + 切换脚本/模型页签）
 - 变更内容：①五份 .opencode/agent/*.md 删除 frontmatter model 行；②新增项目级 .opencode/opencode.json（$schema + model=zai-coding-plan/glm-5.2）作为默认模型；③新增 .opencode/tool/agent_model.py（show/set/clear/default）；④ticketd 新增「模型」页签与 /api/models 系列端点，配置项 models_tab（默认 true）；⑤CLAUDE.md §四模型条款、各 agent 正文、doc/guides/ticketd_service.md 同步。
 - 影响面：**配置**、**入口**
@@ -1121,6 +1127,8 @@
 - 部署注意：换机后脚本自动定位解释器（`conda run -n ai which python`，可用 `PY=` 覆盖）；
   脚本只按项目 `.mysql/mysql.sock` 特征识别自含 MySQL，不会误停系统 MySQL；
   MySQL 停止优先 `mysqladmin shutdown`，无权限时自动回退 `kill -TERM`（干净落盘）。
+  〔2026-10-21 更新：关闭已改为 root→umvp 凭据链优雅关闭（`MYSQL_ROOT_PASSWORD` 留口），
+  判活改为真实探活+残留 socket 自动清理，见下方当日「web_lab 自含 MySQL 生命周期脚本改造」条〕
 - 验证：`bash -n web_lab/stop.sh web_lab/restart.sh` 通过；实机跑通五条路径——① `./web_lab/restart.sh`
   冷启动：MySQL 拉起 + server 后台启动，curl 200，8001/3307 均监听；② `./web_lab/stop.sh` 全停：
   两端口释放；③ `./web_lab/stop.sh --keep-mysql`：web 停、3307 保留；④ `./web_lab/restart.sh
