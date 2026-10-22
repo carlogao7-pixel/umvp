@@ -2590,55 +2590,55 @@ PARAMS = {
 
 MODULES = {
     "frame_manager": {
-        "name": "帧管理 FrameManager", "group": "管道四模块",
+        "name": "帧管理 FrameManager", "group": "图像（帧/带框图）",
         "desc": "复用 pipe.composer.FrameManager：三种取图节奏 + 积压/耗时背压（原 frame_scheduler 并入）。",
         "params": PARAMS["frame_manager"], "handler": h_frame_manager},
     "yolo": {
-        "name": "小模型识别 YOLODetector", "group": "管道四模块",
+        "name": "小模型识别 YOLODetector", "group": "检测记录（目标/事件）",
         "desc": "复用 pipe.composer.YOLODetector：**纯推理**（有效性过滤归「检测筛选」阶段，节流/报送编排在 Pipeline）。",
         "params": PARAMS["yolo"], "handler": h_yolo},
     "det_filter": {
-        "name": "检测筛选 DetFilter", "group": "管道四模块",
+        "name": "检测筛选 DetFilter", "group": "检测记录（目标/事件）",
         "desc": "复用 pipe.det_filter.DetFilter：有效性筛选（逐条条件 DSL：范围+与/或/非+派生尺寸量"
                 "+ 聚合 count(字段)/count(子条件)/count()；+ 成组数量判定）。"
                 "链路里插在 YOLO 之后；有效性过滤的唯一来源（空条件+空上下限=不筛选）。",
         "params": PARAMS["det_filter"], "handler": h_det_filter},
     "seq_filter": {
-        "name": "时序判定 SeqFilter", "group": "管道四模块",
+        "name": "时序判定 SeqFilter", "group": "检测记录（目标/事件）",
         "desc": "复用 pipe.seq_filter.SeqFilter：时序门控（整类节流 throttle / track 集合变化 change）"
                 "+ 窗口/单条规则确认与事件标注。链路里插在检测筛选之后；"
                 "承载原 Pipeline 的 check_interval/track_change_only 语义。",
         "params": PARAMS["seq_filter"], "handler": h_seq_filter},
     "target_crop": {
-        "name": "目标裁剪 TargetCrop", "group": "管道四模块",
+        "name": "目标裁剪 TargetCrop", "group": "子图识别（人脸/车牌）",
         "desc": "按上游检测框裁子图（输出分辨率可配，默认原分辨率）；"
                 "供车牌识别/人脸检测/VLM 消费。不含检测器。",
         "params": PARAMS["target_crop"], "handler": h_target_crop},
     "annotate": {
-        "name": "标注 Annotator", "group": "管道四模块",
+        "name": "标注 Annotator", "group": "图像（帧/带框图）",
         "desc": "在帧副本上画上游检测框（供 VLM 看“原图+画框”）；纯绘制，无模型。",
         "params": PARAMS["annotate"], "handler": h_annotate},
-    "vlm": {
-        "name": "大模型研判 VLMAnalyzer", "group": "管道四模块",
-        "desc": "复用 pipe.composer.VLMAnalyzer：素材包准备，可接真实 VLM。",
-        "params": PARAMS["vlm"], "handler": h_vlm},
     "face_detect": {
-        "name": "人脸检测 FaceDetector", "group": "人脸识别链路",
+        "name": "人脸检测 FaceDetector", "group": "子图识别（人脸/车牌）",
         "desc": "复用 face_detect.face_detector：SCRFD 检测 + 5 点对齐。",
         "params": PARAMS["face_detect"], "handler": h_face_detect},
     "face_embed": {
-        "name": "特征提取 FaceEmbedder", "group": "人脸识别链路",
+        "name": "特征提取 FaceEmbedder", "group": "向量检索（人脸比对）",
         "desc": "复用 face_embed.face_embedder：对齐裁剪 → 512 维向量。",
         "params": PARAMS["face_embed"], "handler": h_face_embed},
     "face_store": {
-        "name": "向量底库 FaceStore", "group": "人脸识别链路",
+        "name": "向量底库 FaceStore", "group": "向量检索（人脸比对）",
         "desc": "复用 face_embed.face_store：注册 / 检索 / 自检 / 持久化。",
         "params": PARAMS["face_store"], "handler": h_face_store},
     "plate_recog": {
-        "name": "车牌识别 PlateRecognizer", "group": "车牌识别链路",
+        "name": "车牌识别 PlateRecognizer", "group": "子图识别（人脸/车牌）",
         "desc": "复用 plate_recog.plate_recognizer：HyperLPR3 在车辆子图里裁车牌 + 识别；"
                 "车辆子图由上游「目标裁剪」提供，或整帧直读。",
         "params": PARAMS["plate_recog"], "handler": h_plate_recog},
+    "vlm": {
+        "name": "大模型研判 VLMAnalyzer", "group": "大模型研判",
+        "desc": "复用 pipe.composer.VLMAnalyzer：素材包准备，可接真实 VLM。",
+        "params": PARAMS["vlm"], "handler": h_vlm},
     "face_monitor": {
         "name": "视频人脸检索 FaceMonitor", "group": "已完成链路", "hidden": True,
         "desc": "视频/摄像头人脸监控链路：抽帧 + 检测 + 嵌入 + 检索（在「已完成链路」中选择并运行）。",
