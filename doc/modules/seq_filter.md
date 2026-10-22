@@ -82,7 +82,7 @@ events = [{"name": 事件名, "ts": 达成时刻, "detail": {"key","count","span
 
 | 字段 | 类型 | 内容 |
 |---|---|---|
-| items | list | 有序记录（同帧或跨帧均可）：Detection / dict(Record) / 其它可适配对象 |
+| items | list | 有序记录（同帧或跨帧均可）：dict(Record)（链路通用形态）/ Detection（保留的直传兼容形态）/ 其它可适配对象 |
 | ts / frame_idx | float / int | 时间上下文（记录自带 ts 时以记录为准） |
 
 ## 4. 输出（字段和内容）

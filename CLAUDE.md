@@ -83,7 +83,7 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
   （检脸 / 检牌）留在各自识别模块内。
 - **通用记录与事件（模块对接语）**：模块间以 dict 记录传递（图像 / 向量走旁路字段）；
   记录可携带 `events` 列表（一条记录可多事件）；链路尾以"末段记录的事件汇总"为通用输出，
-  不绑定具体模块。老模块对象在边界经适配器统一。API/字段细节见 `umvp/pipe/records.py`
+  不绑定具体模块。老模块对象在边界经适配器统一。检测产物形态定案（WO-0014，2026-10）：YOLO `infer()` 原生产 dict Record（`kind=det`，时间上下文由 `Pipeline.step` 注入）；`Detection` dataclass 保留供外部构造/直传（直传入口经 `to_record` 收敛），dets 系消费读法双形态兼容。API/字段细节见 `umvp/pipe/records.py`
   与 `doc/modules/`。
 - **模型 / 权重自包含**：人脸、车牌模型默认项目内路径（代码按 `__file__` 相对定位），
   不依赖 `~/.insightface` / `~/.hyperlpr3`；均可 `model_root=` 覆盖。

@@ -14,7 +14,7 @@
 
 只取舍、不改内容：放行元素**原样返回**（对象进对象出、dict 进 dict 出），链路上透明插入、
 对所有下游一致生效。经 `to_record` 统一字段视图后判定，因此可作**几乎所有模块**的下游——
-上游是 YOLO（`list[Detection]`）还是产出 dict 记录的模块（车牌/人脸/裁剪结果）都能筛。
+上游是 YOLO（现产 `list[Record]`，kind=det）还是产出 dict 记录的模块（车牌/人脸/裁剪结果）都能筛。
 
 ## 2. 参数
 
@@ -112,7 +112,7 @@ collect_events(items)                        # 链路尾汇总为输出
 
 | 字段 | 类型 | 内容 |
 |---|---|---|
-| dets | list | 元素为任意对象或 dict（Record）：Detection、车牌/人脸/裁剪产物、通用记录 |
+| dets | list | 元素为任意对象或 dict（Record）：dict 记录（链路通用形态）、Detection（保留的直传兼容形态）、车牌/人脸/裁剪产物 |
 | ts | float | 帧时间戳（注入记录供条件引用，可省略） |
 | frame_idx | int | 帧序号（同上） |
 
@@ -123,7 +123,8 @@ collect_events(items)                        # 链路尾汇总为输出
 ## 4. 输出（字段和内容）
 
 放行元素组成的子集（`list`）——**原元素原样返回**，不构造新对象、不改字段；
-上游是 Detection 出来就是 Detection，是 dict 出来就是同一个 dict。
+链路通用形态已是 dict Record，dict 进 dict 出（同一个 dict）；直传的 Detection（对象形态，
+如外部程序直接喂给 `Pipeline.step`）进对象出，兼容保留。
 
 端口声明（模块自描述，P5 端口协议）：`INPUTS = {"dets": "Records"}`、`OUTPUTS = {"dets": "Records"}`
 ——产物 `det_filter.dets` ＝放行子集（逐帧登记在 `Pipeline.artifacts`），下游可经 `inputs` 引用它
@@ -132,7 +133,8 @@ collect_events(items)                        # 链路尾汇总为输出
 
 ## 5. 上下游衔接
 
-- 上游：任何产出 list[Detection] 或 list[Record] 的模块（YOLO `infer()` 最典型）。
+- 上游：任何产出 list[Record] 的模块（YOLO `infer()` 产 dict 记录最典型）；直传的
+  Detection（对象）在 `Pipeline.step` 入口已归一为 dict。
 - 下游：目标裁剪 / 标注 / VLM 报送编排 / 事件尾——本模块不改数据形态，下游无感知。
 - 与消费模块选材参数的分工：本模块管**有效性**（不达标 = 该检测在链路上不存在，对
   所有下游一致）；TargetCrop/Annotator 自带的 classes/filter 管**选材**（本阶段消费哪些

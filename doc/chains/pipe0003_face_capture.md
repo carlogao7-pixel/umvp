@@ -57,7 +57,7 @@ PIPE0003 人脸截取链路（pipelines 表，streams=1）
             │ 要图的帧（驱动层 pipe.frame.wants_frame 门控；帧记录：frame_idx/ts）
             ▼
         YOLO0003 纯推理（pipe.yolo.infer(frame, track=False)）
-            │ → Detection 列表（bbox/score/cls_id=0；人脸链不启用 track）
+            │ → dict 记录列表（kind=det；bbox/score/cls_id=0；人脸链不启用 track）
             │ 产物 yolo.dets（筛选前原始检出）
             ▼
         DF0003 检测筛选（long>=30；group_limits 人≥1）

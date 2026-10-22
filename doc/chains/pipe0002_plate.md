@@ -46,7 +46,7 @@ PIPE0002 车牌识别链路（pipelines 表，streams=1）
 视频帧 ──FM0002 要图决策（每 5 帧取 1，积压自适应放宽）
             │ 要图的帧（帧记录：frame_idx/ts）
             ▼
-        YOLO0002 纯推理 → Detection 列表（bbox/score/cls_id=2/track_id）
+        YOLO0002 纯推理 → dict 记录列表（kind=det；bbox/score/cls_id=2/track_id）
             │
             ▼
         DF0002 检测筛选（车长边≥40 才有效；不达标视为"未识别"，原元素透传）
