@@ -16,6 +16,7 @@
   11. infer 纯推理 + 检测筛选 + 事件尾（last_events / publish）
   12. 产物全名 / 短名解析（P2-0：resolve_artifact / artifact_at / artifact_short / artifact_type）
   13. 同模块多实例（P2-0 解除单插槽：det_filter 独立生效 + 位置键 inputs + 全名产物不覆盖）
+  14. infer 出口 dict 化（WO-0014.3：kind=det 契约形态 + 直传盲区——对象/dict 入口归一、缺 cls_id 跳过）
 
 运行: ai 环境 python pipe/test_composer.py
 """
@@ -140,6 +141,8 @@ check("未配置识别对象不报送", len(s0) == 0)
 
 # ============ 6. 有效性筛选（检测筛选阶段承接原 YOLO 过滤链） ============
 print("== 6. 有效性筛选 ==")
+# 注：本节走**对象直入 DetFilter** 路径——DetFilter 原元素透传，谓词/断言收到的仍是
+# Detection 原对象（属性读成立）；链路直传（Pipeline.step）入口才归一为 dict（见第 21 节）。
 pred_a = [lambda d: (not d.model_path or d.model_path == "m1"),
           lambda d: d.score >= 0.8, lambda d: d.cls_id == 0]
 pred_b = list(reversed(pred_a))  # 顺序无关：交集语义
@@ -228,9 +231,18 @@ yd._model = _Model(_Res(_Boxes([[0, 0, 10, 10], [0, 0, 100, 60], [0, 0, 200, 80]
                                [0, 0, 0], [0.9, 0.9, 0.3])))
 d = yd.infer(None)
 check("infer: 纯推理输出（不过滤，3 框全出）", len(d) == 3)
+_infer_keys = {"kind", "track_id", "cls_id", "bbox", "score", "model_path"}
+_dkeys = _infer_keys | {"ts", "frame_idx"}  # 产物记录全契约字段（infer 集 + 时间上下文）
+check("infer: 元素是 dict 记录（kind=det 契约形态，键集齐全）",
+      all(isinstance(x, dict) and _infer_keys <= set(x) and x["kind"] == "det" for x in d))
+check("infer: 不注入时间上下文（ts/frame_idx 由调用方注入，infer 内无帧上下文）",
+      all("ts" not in x and "frame_idx" not in x for x in d))
+check("infer: bbox 为 (x1,y1,x2,y2) int 元组",
+      all(isinstance(x["bbox"], tuple) and len(x["bbox"]) == 4
+          and all(isinstance(v, int) for v in x["bbox"]) for x in d))
 dfy = DetFilter(filter="score >= 0.5, long >= 50")
 check("det_filter: 小目标+低置信视为未识别，只留正常框",
-      [x.bbox for x in dfy.run(d)] == [(0, 0, 100, 60)], str([x.bbox for x in dfy.run(d)]))
+      [x["bbox"] for x in dfy.run(d)] == [(0, 0, 100, 60)], str([x["bbox"] for x in dfy.run(d)]))
 # Pipeline 集成：det_filter 对裁剪/标注/报送一致生效
 class _Crop:
     def __init__(self): self.n = []
@@ -245,6 +257,11 @@ pi2 = Pipeline(frame=FrameManager(frame_skip=1),
                det_filter=DetFilter(filter="score >= 0.5, long >= 50", events=["筛出"]))
 subs2, _ = pi2.step(0, 0.0, frame=object(), force=True)
 check("Pipeline: 裁剪拿到有效性筛选后的检测", cp.n[-1] == 1)
+check("Pipeline: yolo.dets 产物元素是 dict 记录（step 注入时间上下文后键集齐全）",
+      all(isinstance(x, dict) and _dkeys <= set(x) for x in pi2.artifacts.get(ARTIFACT_DETS, [])))
+_fa = pi2.artifacts.get(ARTIFACT_DET_FILTER_DETS, [])
+check("Pipeline: det_filter.dets 产物元素仍是 dict（筛选只取舍不改形态）",
+      len(_fa) == 1 and isinstance(_fa[0], dict) and _dkeys <= set(_fa[0]))
 check("Pipeline: last_events 汇总末段记录事件（链路尾通用输出）",
       len(pi2.last_events) == 1 and pi2.last_events[0]["name"] == "筛出")
 # Pipeline.publish：外部记录（如 VLM 结果）经事件尾出事件
@@ -272,7 +289,7 @@ class _CropStub:
     OUTPUTS = {"crops": "Records"}
     def __init__(self): self.outs = []
     def run(self, frame, dets, ts=0.0):
-        self.outs = [_Out("IMG%d" % d.track_id) for d in (dets or [])]
+        self.outs = [_Out("IMG%d" % d["track_id"]) for d in (dets or [])]
         return self.outs
 
 class _AnnoStub:
@@ -302,8 +319,14 @@ p3 = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=crop_st, a
 p3.step(0, 0.0, frame=frame_obj, force=True)
 A = p3.artifacts
 check("frame_manager.frame 登记本帧原图", A.get(ARTIFACT_FRAME) is frame_obj)
-check("yolo.dets 登记纯推理原始检出（过滤前 3 框）",
-      [d.bbox for d in A.get(ARTIFACT_DETS, [])] == [(0, 0, 10, 10), (0, 0, 100, 60), (0, 0, 200, 80)])
+check("yolo.dets 登记纯推理原始检出（过滤前 3 框，dict 键读）",
+      [d["bbox"] for d in A.get(ARTIFACT_DETS, [])] == [(0, 0, 10, 10), (0, 0, 100, 60), (0, 0, 200, 80)])
+check("产物形态: yolo.dets / det_filter.dets / seq_filter.dets 元素是 dict 记录且键集齐全"
+      "（step 注入 ts/frame_idx 后带全契约字段）",
+      all(isinstance(x, dict) and _dkeys <= set(x)
+          for lst in (A.get(ARTIFACT_DETS, []), A.get(ARTIFACT_DET_FILTER_DETS, []),
+                      A.get(ARTIFACT_SEQ_FILTER_DETS, []))
+          for x in lst))
 check("det_filter.dets 登记放行后的 dets（1 框）", len(A.get(ARTIFACT_DET_FILTER_DETS, [])) == 1)
 check("seq_filter.dets 登记门控后的 dets（1 框）", len(A.get(ARTIFACT_SEQ_FILTER_DETS, [])) == 1)
 check("target_crop.crops 登记裁剪记录列表", len(A.get(ARTIFACT_CROPS, [])) == 1)
@@ -430,8 +453,8 @@ class _CropGeom:
     OUTPUTS = {"crops": "Records"}
     def __init__(self): self.outs = []
     def run(self, frame, dets, ts=0.0):
-        self.outs = [_CropObj("IMG%d" % d.track_id, (0, 0, 8, 8), (2, 2), 2.0,
-                              track_id=d.track_id, index=i)
+        self.outs = [_CropObj("IMG%d" % d["track_id"], (0, 0, 8, 8), (2, 2), 2.0,
+                              track_id=d["track_id"], index=i)
                      for i, d in enumerate(dets or [])]
         return self.outs
 
@@ -612,11 +635,16 @@ check("多实例: 实例 a 收到 yolo#1.dets 原始 3 条（位置键）",
 check("多实例: 实例 b 收到 yolo#1.dets 原始 3 条（各自独立）",
       _b_spy.got is not None and len(_b_spy.got) == 3)
 check("多实例: #2 filter(score>=0.5) → 2 条（b1,b2）",
-      [d.bbox for d in _pma.artifacts.get("det_filter#2.dets", [])]
+      [d["bbox"] for d in _pma.artifacts.get("det_filter#2.dets", [])]
       == [(0, 0, 10, 10), (0, 0, 100, 60)])
 check("多实例: #5 filter(long>=50) → 2 条（b2,b3，与 #2 不同）",
-      [d.bbox for d in _pma.artifacts.get("det_filter#5.dets", [])]
+      [d["bbox"] for d in _pma.artifacts.get("det_filter#5.dets", [])]
       == [(0, 0, 100, 60), (0, 0, 200, 80)])
+check("多实例: det_filter#N.dets 产物元素是 dict（键集含全契约字段）",
+      all(isinstance(d, dict) and _dkeys <= set(d)
+          for lst in (_pma.artifacts.get("det_filter#2.dets", []),
+                      _pma.artifacts.get("det_filter#5.dets", []))
+          for d in lst))
 check("多实例: 短名 det_filter.dets 不登记（避免歧义覆盖）",
       ARTIFACT_DET_FILTER_DETS not in _pma.artifacts)
 check("多实例: yolo#1.dets 全名登记（过滤器上游）", len(_pma.artifacts.get("yolo#1.dets", [])) == 3)
@@ -632,9 +660,50 @@ _pmb.step(0, 0.0, frame=object(), force=True)
 check("多实例: 实例 b 的 inputs.dets 指向实例 a 的输出（2 条，位置键互不覆盖）",
       _b2.got is not None and len(_b2.got) == 2)
 check("多实例: #2 放行 2 条 / #5 在 #2 基础上再筛 → 1 条（b2）",
-      [d.bbox for d in _pmb.artifacts.get("det_filter#2.dets", [])] == [(0, 0, 10, 10), (0, 0, 100, 60)]
-      and [d.bbox for d in _pmb.artifacts.get("det_filter#5.dets", [])] == [(0, 0, 100, 60)])
+      [d["bbox"] for d in _pmb.artifacts.get("det_filter#2.dets", [])] == [(0, 0, 10, 10), (0, 0, 100, 60)]
+      and [d["bbox"] for d in _pmb.artifacts.get("det_filter#5.dets", [])] == [(0, 0, 100, 60)])
 check("多实例: 按位置升序执行，last_filter=首次进入 3 / 最终放行 1",
       _pmb.last_filter == (3, 1), str(_pmb.last_filter))
+
+# ============ 21. infer 出口 dict 化 + 直传盲区（WO-0014.3 批次2） ============
+print("== 21. infer 出口 dict 化 + 直传盲区 ==")
+# 盲区1：step(dets=[dict,...]) 直传 dict——入口归一为副本 + 补时间上下文，submits 照常分组
+pd = compose(dict(task_id=21, algo_mode="small_crop", class_limits={0: (1, 10)},
+                  check_interval=0.0))
+dd = [{"kind": "det", "track_id": 1, "cls_id": 0, "bbox": (10, 10, 100, 200),
+       "score": 0.9, "model_path": "m1"},
+      {"kind": "det", "track_id": 2, "cls_id": 0, "bbox": (20, 20, 110, 210),
+       "score": 0.8, "model_path": "m1"}]
+sd, _ = pd.step(0, 0.0, dets=dd, force=True)
+check("盲区: step 直传 dict → submits 照常产生（按类分组）",
+      len(sd) == 1 and sd[0].track_key == 0 and sd[0].gran == GRAN_CLASS)
+check("盲区: 直传 dict 合并进该类请求（len(s.dets)=2）", len(sd[0].dets) == 2)
+check("盲区: 直传 dict 归一为副本并补 ts/frame_idx（不改调用方原 dict）",
+      "ts" not in dd[0] and "frame_idx" not in dd[0]
+      and sd[0].dets[0] is not dd[0]
+      and sd[0].dets[0]["ts"] == 0.0 and sd[0].dets[0]["frame_idx"] == 0)
+# 盲区2：直传对象（Detection）→ 入口 to_record 归一为 dict（字段齐全 + 补 kind/时间上下文）
+po = compose(dict(task_id=21, algo_mode="small_crop", class_limits={0: (1, 10)},
+                  check_interval=0.0))
+so, _ = po.step(0, 0.0, dets=[det(9)], force=True)
+check("盲区: 直传 Detection 对象 → 归一为 dict 且全字段 + kind + 时间上下文",
+      len(so) == 1 and len(so[0].dets) == 1
+      and isinstance(so[0].dets[0], dict)
+      and so[0].dets[0]["track_id"] == 9 and so[0].dets[0]["cls_id"] == 0
+      and so[0].dets[0]["bbox"] == (10, 10, 100, 200) and so[0].dets[0]["score"] == 0.9
+      and so[0].dets[0]["model_path"] == "m1" and so[0].dets[0]["kind"] == "det"
+      and so[0].dets[0]["ts"] == 0.0 and so[0].dets[0]["frame_idx"] == 0)
+# 盲区3：_submits 对缺 cls_id / cls_id=-1 的 dict 项跳过（与 web _as_detections 语义对齐）
+p3x = compose(dict(task_id=22, algo_mode="small_crop", class_limits={0: (1, 10)},
+                   check_interval=0.0))
+subs_x = p3x._submits([
+    {"kind": "det", "cls_id": 0, "bbox": (0, 0, 1, 1), "score": 0.9},
+    {"kind": "det", "bbox": (0, 0, 1, 1), "score": 0.8},                # 缺 cls_id → 跳过
+    {"kind": "det", "cls_id": -1, "bbox": (0, 0, 1, 1), "score": 0.7},  # -1 → 跳过
+    {"kind": "det", "cls_id": 1, "bbox": (0, 0, 1, 1), "score": 0.6},
+])
+check("盲区: _submits 跳过缺 cls_id/-1 的 dict 项（其余照常分组）",
+      len(subs_x) == 2 and [s.track_key for s in subs_x] == [0, 1]
+      and all(len(s.dets) == 1 for s in subs_x))
 
 print(f"\n全部通过: {PASS} 项断言")

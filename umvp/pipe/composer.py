@@ -5,7 +5,8 @@
 按"参数归属模块"重构:
   1. FrameManager  帧管理 —— 取图节奏(抽帧 / 墙钟秒 / 帧数) + 背压
   2. YOLODetector  小模型识别 —— **纯推理**：ultralytics 参数可调(conf/iou/imgsz/
-                     max_det/classes/device)，infer() 输出 Detection。有效性过滤/成组判定
+                     max_det/classes/device)，infer() 输出 dict 记录（kind=det，
+                     时间上下文 ts/frame_idx 由 Pipeline.step 注入）。有效性过滤/成组判定
                      归「检测筛选 DetFilter」（Pipeline.det_filter）；时序门控归「时序判定
                      SeqFilter」（Pipeline.seq_filter / event_filter）
   3. VLMAnalyzer   大模型研判 —— 素材准备(缩放/prompt) + 推理
@@ -183,7 +184,12 @@ def _module_of(obj) -> Optional[str]:
 # ---------------- 通用数据 ----------------
 @dataclass
 class Detection:
-    """一次 YOLO 检测（含跟踪 id）——与 spaz producer 对齐。"""
+    """一次 YOLO 检测（含跟踪 id）——与 spaz producer 对齐。
+
+    **兼容形态**：保留供外部构造 / 直传（老调用、test_image_source 等导入依赖）；
+    链路通用产物已是 dict 记录（Record，kind=det）——`infer()` 直接产 dict，
+    直传的 Detection 在 `Pipeline.step` 入口经 `to_record` 归一为 dict。
+    """
 
     track_id: int
     cls_id: int
@@ -199,8 +205,8 @@ class SubmitRequest:
     track_key: int  # 按识别类型=类别编号; large_only 整帧=-1
     gran: str  # "class"（按识别类型） | "scene"（周期性整帧）
     ref: str  # "full:cls{类别}" / "full:global"
-    det: Optional[Detection] = None  # 保留字段（单目标素材用）；按类报送时为空
-    dets: List[Detection] = field(default_factory=list)  # 该类全部有效检测（large_only 为空）
+    det: Optional[dict] = None  # 保留字段（单目标素材用）；按类报送时为空；双形态读（过渡期兼容 Detection）
+    dets: List[dict] = field(default_factory=list)  # 该类全部有效检测（dict 记录；large_only 为空）
 
 
 # ---------------- 模块 1: 帧管理 ----------------
@@ -433,11 +439,14 @@ class YOLODetector:
         self._model = None  # 惰性加载
 
     # ---- 推理 ----
-    def infer(self, frame, track: bool = False) -> List[Detection]:
-        """跑 YOLO 推理，返回 Detection 列表（track=True 用跟踪器保持 track_id 稳定）。
+    def infer(self, frame, track: bool = False) -> List[dict]:
+        """跑 YOLO 推理，返回 dict 记录列表（kind=det；track=True 用跟踪器保持 track_id 稳定）。
 
         输出为**纯推理结果**（不做有效性过滤）；有效性（置信/尺寸/成组数量）
         由链上的检测筛选阶段（Pipeline.det_filter）判定，对全部下游一致生效。
+        记录形态：{"kind": "det", "track_id", "cls_id", "bbox"(x1,y1,x2,y2)tuple,
+        "score", "model_path"}；不含 ts/frame_idx——时间上下文由调用方注入
+        （Pipeline.step 统一补，契约见 pipe.records）。
         """
         if not self.model_path:
             raise RuntimeError("YOLODetector 未配置 model_path，不能推理（外部检测直传模式）")
@@ -452,15 +461,17 @@ class YOLODetector:
             kw["device"] = self.device
         r = (self._model.track(frame, persist=True, tracker=self.tracker, **kw) if track
              else self._model.predict(frame, **kw))[0]
-        dets: List[Detection] = []
+        dets: List[dict] = []
         if r.boxes is None:
             return dets
         for i, b in enumerate(r.boxes.xyxy.tolist()):
             tid = r.boxes.id[i].item() if (track and r.boxes.id is not None) else 0
-            dets.append(Detection(
-                track_id=int(tid), cls_id=int(r.boxes.cls[i].item()),
-                bbox=tuple(int(v) for v in b), score=float(r.boxes.conf[i].item()),
-                model_path=self.model_path.rsplit("/", 1)[-1]))
+            dets.append({"kind": "det",
+                         "track_id": int(tid),
+                         "cls_id": int(r.boxes.cls[i].item()),
+                         "bbox": tuple(int(v) for v in b),
+                         "score": float(r.boxes.conf[i].item()),
+                         "model_path": self.model_path.rsplit("/", 1)[-1]})
         return dets
 
 
@@ -489,7 +500,8 @@ class VLMAnalyzer:
             "track_key": req.track_key,
             "prompt": self.prompt,
             "max_resolution": self.max_resolution,
-            "bbox": req.det.bbox if req.det else None,
+            "bbox": (req.det.get("bbox") if isinstance(req.det, Mapping)
+                     else getattr(req.det, "bbox", None)) if req.det else None,
             "det_count": len(req.dets),
         }
 
@@ -629,15 +641,20 @@ class Pipeline:
                 out[mid] = positions
         return out
 
-    def _submits(self, dets: List[Detection]) -> List[SubmitRequest]:
+    def _submits(self, dets: List[dict]) -> List[SubmitRequest]:
         """按识别类型（类别）构造报送请求（有效性/门控已由 det_filter/seq_filter 完成）。
 
         只分组 + 造语料：一类目标再多也只算一条请求（ref=full:cls{cls}）。何时报、
         报不报由链上 det_filter（有效性）与 seq_filter（节流/变化门控）决定。
+        元素为 dict 记录；缺 cls_id（-1）的项跳过（与 web `_as_detections`
+        「无 cls_id 跳过」语义对齐）。
         """
-        by_cls: Dict[int, List[Detection]] = {}
+        by_cls: Dict[int, List[dict]] = {}
         for d in dets:
-            by_cls.setdefault(d.cls_id, []).append(d)
+            cls = int(d.get("cls_id", -1))
+            if cls < 0:
+                continue
+            by_cls.setdefault(cls, []).append(d)
         return [SubmitRequest(cls, GRAN_CLASS, f"full:cls{cls}", dets=cdets)
                 for cls, cdets in sorted(by_cls.items())]
 
@@ -704,10 +721,13 @@ class Pipeline:
                 f"（可用产物: {sorted(self.artifacts)}）")
         return self.artifacts[full]
 
-    def step(self, frame_idx: int, ts: float, dets: Optional[List[Detection]] = None,
+    def step(self, frame_idx: int, ts: float, dets: Optional[List[dict]] = None,
              frame=None, force: bool = False):
         """处理一帧。返回 (submits, events)。
         dets 由拼接层在 wants_frame 为真时做 YOLO 推理提供（无 YOLO 的模式传 None）；
+        直传入口逐条归一为 dict 记录（对象如 Detection 经 to_record 转换，Mapping 浅拷贝），
+        并统一注入时间上下文 ts/frame_idx（契约：时间由调用方注入，见 pipe.records）——
+        链路通用形态自此为 dict Record（yolo.dets 产物元素带全契约字段 kind/ts/frame_idx）。
         不传 dets 但配置了 yolo 时，传 frame 由模块自推理（车牌按 track 去重时 track=True）。
         force=True 时跳过帧决策检查——供调用方已先行 wants_frame() 门控避免重复采样。
 
@@ -728,8 +748,16 @@ class Pipeline:
             yolo_img = self._port_at(yolo_pos, "yolo", yolo, "image", frame)
             if yolo_img is not None:
                 dets = yolo.infer(yolo_img, track=self.track_needed())
+        if dets is not None:
+            # 出口/入口归一：对象（Detection 等）→ dict 记录（to_record 全字段覆盖），
+            # dict 浅拷贝防上游原地改动；补缺省 kind 与时间上下文（infer 已带的值不覆盖）。
+            dets = [to_record(d) for d in dets]
+            for d in dets:
+                d.setdefault("kind", "det")
+                d.setdefault("ts", ts)
+                d.setdefault("frame_idx", frame_idx)
         if yolo is not None and dets is not None:
-            # yolo.dets（纯推理原始检出，过滤前）
+            # yolo.dets（纯推理原始检出，过滤前；元素为带全契约字段的 dict 记录）
             self._register("yolo", yolo_pos, "dets", dets, len(yolo_insts))
 
         # 检测筛选阶段：有效性判定（逐条条件 + 成组数量；原 YOLO 输出过滤链）——

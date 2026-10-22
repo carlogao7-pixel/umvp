@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import List, Optional
 
 import numpy as np
@@ -40,15 +41,22 @@ def extract_faces(
 ) -> List[FaceResult]:
     """兼容编排：YOLO 识人 → 目标裁剪(裁人) → 人脸检测(检脸+原图出原分辨率人脸)。
 
-    yolo: 已配置 classes=[person] 的 YOLODetector（infer() 返回 Detection 列表）
+    yolo: 已配置 classes=[person] 的 YOLODetector（infer() 返回 dict 记录列表，
+          kind=det；bbox 双形态读，对象/记录均可）
     face_det: FaceDetector 实例
     返回: 去重后的原分辨率人脸列表（每张含原图坐标与来源人框）
     """
     tool = tool or Cropper()
     dets = yolo.infer(img, track=False)
     if min_person_short:
-        dets = [d for d in dets
-                if max(d.bbox[2] - d.bbox[0], d.bbox[3] - d.bbox[1]) >= min_person_short]
+        def _long(d) -> float:
+            """长边（bbox 双形态读：dict 取键、对象取属性），无效框记 -1 触发过滤。"""
+            b = d.get("bbox") if isinstance(d, Mapping) else getattr(d, "bbox", None)
+            try:
+                return max(float(b[2]) - float(b[0]), float(b[3]) - float(b[1]))
+            except (TypeError, ValueError, IndexError):
+                return -1.0
+        dets = [d for d in dets if _long(d) >= min_person_short]
     crops = crop_targets(img, dets, scale=(tool.upscale or 1.0), margin=0.0)
     stage = FaceStage(face_det, Cropper(upscale=1.0, margin=tool.margin),
                       dedup_iou=dedup_iou)
