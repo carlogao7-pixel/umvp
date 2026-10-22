@@ -24,6 +24,14 @@
 
 <!-- 新条目追加在此行下方，最新在上 -->
 
+- [2026-10-22][INB-0070][web][成果] 模块五分类改新口径+下拉框行为修复（WO-0017.1/WO-0017）：server.py MODULES 改新五组（帧管理/图像旁路/识别研判/筛选判定/向量比对）且定义序=业务数据流序（/api/schema 输出序即展示序）；index.html 删 loadSchema 尾部 select(ids[0]) 自动选中、初始空态（标题「请选择模块」+引导文案，preset-bar/estimate/form/run/result 五区块 hidden，新增 showModuleChrome(show) 在 select() 恢复）、renderSidebar 硬编码 MODULE_GROUP_ORDER 固定组序（未知组兜底排最后）。验证：/api/schema 11 可见模块组名+输出序逐条匹配、hidden 4 个保持已完成链路；index.html 静态断言 7 项过；tests/test_agent_runtime.py 39 断言过（agent.py module_catalog group 透传无需改）；script 块 node --check 过
+
+- [2026-10-22][INB-0069][qa][成果] qa 验证 WO-0016 通过（子单 WO-0016.2）：/api/schema 63 断言 + index.html 11 断言全过，test_agent_runtime.py 39 断言过，JS node --check 过
+  细节：schema 逐模块断言 11 可见模块 group 与五分类完全匹配（图像（帧/带框图）/检测记录（目标/事件）/子图识别（人脸/车牌）/向量检索（人脸比对）/大模型研判），hidden 4 个保持「已完成链路」；index.html 断言 select#module-select+optgroup+「选择模块…」占位+onchange→select(id)，旧侧栏 #groups 容器与平铺 button 渲染已移除（renderSidebar 纯 select 实现），设计器 palette 与 db 页签 button 为豁免合法保留；页面浏览器冒烟未做（无 chromium/firefox/playwright，按约定不装依赖）。复现：conda run -n ai python /tmp/opencode/wo0016_verify.py（需 restart.sh 起服务）；commit 574b876 / INB-0068
+
+- [2026-10-22][INB-0068][web][成果] 测试台左边栏模块列表改按生产对象分类+下拉框（WO-0016）：MODULES group 改对象五分类（图像/检测记录/子图识别/向量检索/大模型研判，权威=INDEX.md 产物端口表），侧栏 #groups 平铺按钮改 select+optgroup 选中即切模块
+  细节：hidden 模块保持「已完成链路」；vlm 定义位置移到 plate_recog 后使组序=业务链序；group 仍单一来源 /api/schema，设计器 palette 与 agent.py module_catalog 自动跟随（已核对语义通顺）；setNavActive 改同步 select 值。验证：/api/schema 分组组序正确（端口 8001）、validate_chain PIPE0001 6 阶段过、resources.py 过、test_agent_runtime.py 39 断言过、前端 JS node --check 过。commit 574b876
+
 ## 已同步
 
 
