@@ -39,6 +39,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
@@ -252,11 +253,18 @@ def _bbox_iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _bbox_of(d):
+    """检测项 bbox 双形态读取（Detection 对象 / dict 统一记录）；缺 bbox 返回 None。"""
+    bb = d.get("bbox") if isinstance(d, Mapping) else getattr(d, "bbox", None)
+    return None if bb is None else tuple(int(v) for v in bb)
+
+
 def _match_crops_for_req(req, crops) -> list:
     """在目标裁剪产物 last_crops 里找与本次报送目标对应的**全部**子图。
 
     匹配依据（下游可核对）：优先 req.det.bbox（单目标素材），否则取 req.dets 各框；
     按 bbox 精确相等或 IoU≥0.5 命中（裁剪含 margin/缩放，用 IoU 而非全等）。
+    det/dets 双形态读取（Detection 对象或 dict 记录），缺 bbox 的项跳过不抛错。
     返回按 crops 顺序命中的对象列表（基数约定：一条报送记录可涉多个对象 → 图集）。
     """
     if not crops:
@@ -264,9 +272,13 @@ def _match_crops_for_req(req, crops) -> list:
     wanted = []
     det = getattr(req, "det", None)
     if det is not None:
-        wanted.append(tuple(int(v) for v in det.bbox))
+        bb = _bbox_of(det)
+        if bb is not None:
+            wanted.append(bb)
     for d in getattr(req, "dets", None) or []:
-        wanted.append(tuple(int(v) for v in d.bbox))
+        bb = _bbox_of(d)
+        if bb is not None:
+            wanted.append(bb)
     hits = []
     for c in crops:
         cb = tuple(int(v) for v in c.bbox)
@@ -335,9 +347,13 @@ def _apply_vlm_inputs(pipe, subs):
     items = (getattr(pipe, "artifacts", None) or {}).get(art)
     if items is None:
         return subs
-    dets = _as_detections(items)
+    from pipe.records import to_record
     try:
-        return list(pipe._submits(dets))  # 复用 Pipeline 的按类分组（gran=class）语义
+        # WO-0014.6：喂 _submits 前经 to_record 逐条归一（链路通用语 = dict Record）——
+        # dict 直通、Detection/dataclass 转同名字段 dict；缺 cls_id 的项由 _submits 跳过
+        # （与旧 _as_detections「无 cls_id 跳过」语义对齐）。不再把 dict 产物强转 Detection
+        # 对象（WO-0014.3 后 _submits 只吃 dict，强转会 AttributeError 被吞 → 静默回落默认报送集）。
+        return list(pipe._submits([to_record(d) for d in items]))  # 复用 Pipeline 的按类分组（gran=class）语义
     except Exception:
         return subs
 
@@ -548,7 +564,7 @@ def h_yolo(p: dict) -> dict:
                         classes=_int_list(p, "classes", None),
                         device=str(p.get("device", "")).strip() or None)
     t0 = time.time()
-    dets = yolo.infer(frame)  # 纯推理（有效性筛选由「检测筛选」模块承担）
+    dets = _as_detections(yolo.infer(frame))  # 纯推理（有效性筛选由「检测筛选」模块承担）
     dt = time.time() - t0
     by_cls: dict = {}
     for d in dets:
@@ -870,7 +886,7 @@ def h_plate_recog(p: dict) -> dict:
                             iou=_float(p, "yolo_iou", 0.6), imgsz=_int(p, "yolo_imgsz", 1280),
                             max_det=_int(p, "yolo_max_det", 300),
                             classes=_int_list(p, "yolo_classes", [2]))
-        dets = yolo.infer(frame, track=False)  # 测试页脚手架：造车辆框（生产由上游 yolo 阶段提供）
+        dets = _as_detections(yolo.infer(frame, track=False))  # 测试页脚手架：造车辆框（生产由上游 yolo 阶段提供）
         # 目标裁剪：按车辆框裁车（测试页内联；生产链路由独立「目标裁剪」阶段完成）
         crops = crop_targets(frame, dets, scale=2.0, margin=0.1,
                              classes=_int_list(p, "yolo_classes", [2]))
@@ -1056,7 +1072,7 @@ def h_frame_yolo(p: dict) -> dict:
             continue
         analyzed += 1
         t0 = time.time()
-        dets = yolo.infer(frame, track=track)
+        dets = _as_detections(yolo.infer(frame, track=track))
         infer_times.append(time.time() - t0)
         total_det += len(dets)
         max_det_once = max(max_det_once, len(dets))
@@ -1456,7 +1472,7 @@ def h_pipeline_run(p: dict) -> dict:
         orig_name = output_dir / f"frame_000_{timestamp}_orig.{image_format}"
         _save_image(orig_name, frame)
 
-        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else []
+        dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed())) if pipe.yolo else []
 
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
         subs = _apply_vlm_inputs(pipe, subs)
@@ -1541,7 +1557,7 @@ def h_pipeline_run(p: dict) -> dict:
 
         dets = None
         if pipe.yolo is not None:
-            dets = pipe.yolo.infer(frame, track=pipe.track_needed())
+            dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed()))
 
         subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
         subs = _apply_vlm_inputs(pipe, subs)
@@ -2058,7 +2074,8 @@ def h_pipeline_stream(write, params: dict) -> None:
             if not pipe.frame.wants_frame(n, ts):  # 帧管理取图节奏
                 n += 1
                 continue
-            dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo is not None else []
+            dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed())) \
+                if pipe.yolo is not None else []
             subs, evs = pipe.step(n, ts, dets, frame=frame, force=True)
             subs = _apply_vlm_inputs(pipe, subs)
             if vlm_feedback and pipe.vlm is not None:
@@ -2180,7 +2197,7 @@ def h_chain(p: dict) -> dict:
             analyzed += 1
             dets = None
             if pipe.yolo is not None:
-                dets = pipe.yolo.infer(frame, track=pipe.track_needed())
+                dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed()))
             subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
             subs = _apply_vlm_inputs(pipe, subs)
             total_det += len(dets or [])
@@ -2207,7 +2224,7 @@ def h_chain(p: dict) -> dict:
         if pipe.yolo is None and pipe.plate is None:
             return res(ok=False, error="该链路无 YOLO/车牌阶段，真实图片驱动仅适用于含检测的链路")
         img_path, frame = _load_frame(p)
-        dets = pipe.yolo.infer(frame, track=pipe.track_needed()) if pipe.yolo else None
+        dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed())) if pipe.yolo else None
         canvas = frame.copy()
         _draw_tracks(canvas, dets or [])
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
