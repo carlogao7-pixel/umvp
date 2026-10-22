@@ -81,6 +81,13 @@
 | 图像（旁路） | `frame_manager.frame`、`annotate.annotated`、`target_crop.crops[i].image` | ndarray，不进 JSON |
 | 向量（旁路） | `face_embed.embeddings` | ndarray |
 
+> **检测产物形态（2026-10-21 定案，WO-0014.3）**：`yolo.dets` 及其下游检测记录是**原生
+> dict Record**——`YOLODetector.infer()` 直接产 `{"kind": "det", "track_id", "cls_id",
+> "bbox", "score", "model_path"}`，**不含时间上下文**（infer 内无帧上下文），由
+> `Pipeline.step` 在登记产物前统一注入 `ts`/`frame_idx`（契约「时间上下文由调用方注入」，
+> 见 `pipe.records`）。`Detection` dataclass **保留**供外部构造 / 直传兼容：直传入口
+> （`Pipeline.step(dets=...)`）经 `to_record` 逐条归一为 dict 后进链。
+
 （低清图暂无生产者且本阶段**不设计**——用户 2026-10-16：暂不管，见 §8。）
 
 ### ② 模块自描述（输入/输出声明）
@@ -132,7 +139,7 @@ target_crop/annotate←frame+dets；plate_recog/face_detect←frame+`last_crops`
 
 | 场景 | 现行 | 是否符合约定 |
 |---|---|---|
-| YOLO 逐框 `Detection` | 一个目标一条记录 | ✅（一条记录一个对象，无需图集） |
+| YOLO 逐框检测记录（dict，`kind=det`；`Detection` dataclass 保留供外部构造/直传） | 一个目标一条记录 | ✅（一条记录一个对象，无需图集） |
 | 目标裁剪 `CropResult` | **每个对象一条记录**（各带一张 `image` 子图） | ✅（属逐对象，**不是"一条记录多图"**，不需要图集） |
 | 标注 `Annotator`（VLM 上游） | 一条记录 → **一张图**，多框画在同一张 | ✅ 不受影响 |
 | VLM 按类报送（一条记录含 N 个对象） | `image_source=crops` 收集该类**全部命中对象**的子图 | ✅ **已改（WO-0003）**：按记录的图像旁路＝**图集**（N 张子图）；送审端按 `image_pick` 决定送 1 张（`first`，默认＝逐字等价）还是 N 张（`all`，多图 payload） |

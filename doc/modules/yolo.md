@@ -7,7 +7,7 @@
 ## 1. 模块定位
 
 小模型识别——分析管道中"小模型"这一环，干一件事：**用 YOLO 权重对一帧图像做目标检测**，
-输出 `Detection` 列表。COCO 常用类别：0=人、2=车。
+输出检测记录列表（dict，`kind="det"`）。COCO 常用类别：0=人、2=车。
 
 三个职责中，本模块**只保留推理**（`infer()`：conf/iou/imgsz/max_det/classes/device）；
 **有效性过滤**（置信度/尺寸/成组数量，不达标视为"未识别"）归链上独立的
@@ -60,20 +60,28 @@ classes="0,2"`
 |---|---|---|
 | frame | ndarray (H×W×3, BGR) | 原始帧（`infer()` 推理用；model_path 为空时不需要） |
 
-`Detection` 结构（推理输出）：
+检测记录结构（`infer()` 输出元素 = **dict Record**，2026-10-21 起 infer 直接产 dict）：
 
 | 字段 | 类型 | 内容 |
 |---|---|---|
+| kind | str | 固定 `"det"`（记录类型标识） |
 | track_id | int | 跟踪 ID（未启用跟踪时为 0） |
 | cls_id | int | 类别编号（COCO：0=人，2=车） |
 | bbox | (x1,y1,x2,y2) int | 目标框，**原图像素坐标** |
 | score | float | 置信度 [0,1] |
 | model_path | str，可选 | 产出该检测的权重名（多模型来源区分用） |
 
+> **时间上下文不进 infer**：记录不含 `ts` / `frame_idx`——由 `Pipeline.step` 在登记
+> `yolo.dets` 产物前统一注入（契约「时间上下文由调用方注入」，见 `pipe.records`）。
+> `Detection` dataclass **保留**（除 `kind` 外字段同上表）供外部构造 / 直传（老调用、
+> 测试导入依赖）；直传对象在 `Pipeline.step` 入口经 `to_record` 逐条归一为 dict——
+> 链路通用形态只有 dict Record。
+
 ## 4. 输出与下游（谁用什么）
 
-- `infer(frame, track=False) → list[Detection]`：**纯推理结果**，不做有效性过滤
-  （不达标目标也在此）；`track=True` 用跟踪器保持 track_id 稳定。
+- `infer(frame, track=False) → list[dict]`：**纯推理结果**（元素为 dict 记录，`kind="det"`；
+  不含 `ts`/`frame_idx`，由 `Pipeline.step` 注入），不做有效性过滤（不达标目标也在此）；
+  `track=True` 用跟踪器保持 track_id 稳定。
 - 端口声明（模块自描述，P5 端口协议）：`INPUTS = {"image": "Image"}`、`OUTPUTS = {"dets": "Records"}`
   ——产物 `yolo.dets`＝本帧纯推理原始检出（筛选前），逐帧登记在 `Pipeline.artifacts`。
   下游可经 `inputs` 连它（如 `det_filter.dets` 端口连 `yolo.dets` 即"筛选前"语义）；
@@ -86,7 +94,8 @@ classes="0,2"`
 ## 5. 上下游衔接
 
 - 上游：帧管理判定要图的帧 → 链路把 frame 交给本模块 `infer()`。
-- 下游：`Detection` 列表 → 检测筛选（有效性）→ 时序门控 → 目标裁剪 / 标注 / VLM 报送。
+- 下游：检测记录列表（dict，`kind=det`）→ 检测筛选（有效性）→ 时序门控 →
+  目标裁剪 / 标注 / VLM 报送。
 
 ## 6. 验证
 

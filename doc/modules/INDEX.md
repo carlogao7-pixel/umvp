@@ -11,6 +11,9 @@
 
 - **JSON 主干**：记录必备 `kind` / `ts` / `frame_idx`；通用字段 `bbox` / `score` / `cls_id` /
   `track_id` / `label` / `text`；事件字段 `events`（列表，一条记录可携带多个事件）。
+  检测产物（`yolo.dets` 起）为**原生 dict 记录**（`kind="det"`；`ts`/`frame_idx` 由
+  `Pipeline.step` 注入）；`Detection` dataclass 仅保留供外部构造/直传，直传入口经
+  `to_record` 归一为 dict。
 - **旁路字段**（约定不序列化）：`image`（ndarray 子图/帧，**记录旁路图像统一键名**；
   **或 ndarray 列表＝图集**——一条记录需多图时以集合形式携带、**不拆记录**）、`embedding`（向量）——像素与向量不进 JSON。
   读取器两个（语义有别）：**`image_of(rec)`＝单图语义**（图集时取首张，兼容既有调用）、
@@ -32,7 +35,7 @@
 | 模块 | INPUTS（端口→类型） | OUTPUTS（产物→类型） | 备注（接/产/改） |
 |---|---|---|---|
 | [帧管理](frame_manager.md) | `{}` | `frame_manager.frame` → Image | 产原图（帧元信息进主干） |
-| [YOLO 识别](yolo.md) | `image` → Image | `yolo.dets` → Records | 纯推理产检测记录 |
+| [YOLO 识别](yolo.md) | `image` → Image | `yolo.dets` → Records | 纯推理产检测记录（dict，`kind=det`） |
 | [检测筛选](det_filter.md) | `dets` → Records | `det_filter.dets` → Records | 放行子集＋`events`（改） |
 | [时序判定](seq_filter.md) | `dets` → Records | `seq_filter.dets` → Records | 门控放行＋`events`（改） |
 | [目标裁剪](target_crop.md) | `frame` → Image；`dets` → Records | `target_crop.crops` → Records（元素含 `image`） | 接检测产子图 |
@@ -67,7 +70,7 @@
 | 文档 | 模块 | 代码 | 主要 preset |
 |---|---|---|---|
 | [帧管理](frame_manager.md) | FrameManager 取帧节奏 + 背压（帧记录与原图旁路的起点） | `FrameManager` | FM0001~0003 |
-| [YOLO 识别](yolo.md) | 小模型识别（**纯推理**，产 Detection 记录） | `YOLODetector` | YOLO0001~0003 |
+| [YOLO 识别](yolo.md) | 小模型识别（**纯推理**，产 dict 检测记录，`kind=det`） | `YOLODetector` | YOLO0001~0003 |
 
 ## 二、旁路加工与识别（消费图像旁路 → 产新记录或改写主干）
 
