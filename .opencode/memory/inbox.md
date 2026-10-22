@@ -24,25 +24,40 @@
 
 <!-- 新条目追加在此行下方，最新在上 -->
 
+## 已同步
+
+
+- [2026-10-22][INB-0067][web][成果] WO-0015.2 文档同步核对（web 域 4 篇，以代码为准绳）：全部一致、零修正——①runbook.md 无 dets/Detection 形态表述，:165「34 项断言」= selfcheck_vlm_env 实测仍 34（本次未动）；②database_schema.md 无涉（WO-0014 纯内存形态变更、零 DB 改动，23/17/21 快照不受影响；:48 grep 命中系「tail -n 30 项目/…」误匹配、:296 vlm.dets 指端口目录非数据形态）；③live_overlay.md :23/:41 SSE frame 载荷 dets:[{cls,bbox,score,track}] 与 server.py:2089-2093 现实现一致（_as_detections 服务端归一后再序列化，线上 JSON 契约未变），test.html:819 消费 res.dets 同口径；④storage_design.md :138/:147 为 DB 回归方法泛指非断言数字；grep 复查 5 命中逐一判定无过时，测试断言数 49→59→62（test_port_inputs）未写入本域任何文档
+  报告项（超范围仅报告）：doc/guides/ticketd_service.md:173「52 项断言」指 agent_model.py --self-test，与 WO-0014 无关且不在 4 篇范围内；→ 纯核对无改动，工单 WO-0015.2 置已完成，无 qa 需求
+  → 去向：核对一致零改动（web 域 4 篇无需更新）；报告项 ticketd_service.md:173「52 项断言」系 agent_model.py --self-test 旧数字、与本次无关，未动
+
+- [2026-10-22][INB-0066][pipe-chain][成果] WO-0015.1 文档同步：WO-0014 YOLO dict 化落地后的检测记录形态口径——5 文件 8 处改毕（doc/modules/det_filter.md :17/:115/:126/:135 上游主语改 dict Record·输入/输出补注 Detection 为保留的直传兼容形态、seq_filter.md :85 同款、chains/{pipe0001:37,pipe0002:49,pipe0003:60} 数据流图 YOLO 产物改「dict 记录列表（kind=det…）」），全部对照 umvp/pipe/{yolo,composer}.py 实际行为核实；det_filter/seq_filter 双形态兼容表述保留（模块能力非过时）；权威基准 assembly_ports.md §3①；复查 grep Detection 于 doc/{modules,chains} 仅剩直传兼容口径与 FaceDetection（SCRFD 不相干）
+  → 纯文档改动无代码影响，工单 WO-0015.1 置已完成；无 qa 需求
+  → 去向：已随 WO-0015 落地（doc/modules/{det_filter,seq_filter}.md + doc/chains/ 三篇口径，随 WO-0015 docs commit 入库）
+
 - [2026-10-21][INB-0065][web][成果] WO-0014.6 返修：web_lab/server.py _apply_vlm_inputs 喂 _submits 前改经 pipe.records.to_record 逐条归一（dict 直通 / Detection·dataclass 转同名字段 dict / 缺 cls_id 项由 _submits 跳过），修复 WO-0014.3 dict 化后 vlm.inputs.dets 连线静默失效回落默认报送集（AttributeError 被 except 吞）——tests/test_port_inputs.py 62 断言全绿（§6 yolo.dets 报 3 条含被筛 0.2），test_graph_chain.py 全过、test_composer.py 120 不变；_as_detections 其余 8 处入口归一保留未动
+  → 去向：已随 WO-0014.6 落地（commit 6d40f60）
 
 - [2026-10-21][INB-0064][qa][成果/坑] WO-0014.5 批次2 qa 收尾：infer dict 化断言迁移完成（test_yolo_standalone/test_yolo_params/test_port_inputs 三文件，读法 d.xxx→d["xxx"] 语义不变，port_inputs 增 3 条形态断言），全量回归 15 项：纯逻辑 9 项中 8 项绿（composer120/annotate23/target_crop45/det_filter72/seq_filter50/validate_chain34/image_source73/cropper26），真实推理 6 项全绿（yolo_standalone 跑通、警用端到端 violent1 跑通+人群1 报送4/VLM4/告警2 全流通、plate28/face_capture63/face_extract28、yolo_params 跑通）
   坑（非预期红，产品集成缺口，报备 orchestrator 转 web/pipe-chain）：tests/test_port_inputs.py §6 vlm-dets 红——web_lab/server.py _apply_vlm_inputs(:350-352) 先 _as_detections 把产物转 Detection 对象再喂 pipe._submits，而 WO-0014.3 后 _submits 只吃 dict（d.get(cls_id)）→ AttributeError 被 except Exception 静默吞掉回落默认报送 → vlm.inputs.dets 连线失效（声明 yolo.dets 应报送 3 条实得 2 条）；HEAD 工作树对照全绿 59 断言证明红由未提交产品改动引入；复现：conda run -n ai python tests/test_port_inputs.py（§6 第 4 条断言）或 /tmp/opencode/repro_wo0014_vlm_dets.py；修法建议：_apply_vlm_inputs 直接喂 dict 产物（契约=模块间通用语 dict，跳过语义已由 _submits 缺 cls_id/-1 对齐）或 _submits 双读，由 pipe-chain/web 定夺；修复合流后 test_port_inputs 应报 62 断言全绿（现 50 过+1 红+11 未达）
+  → 去向：已随 WO-0014.5 落地（commit 07ce616）；其报告的 vlm.dets 集成缺口经 WO-0014.6 返修闭环
 
 - [2026-10-21][INB-0063][pipe-chain][成果] WO-0014.3：YOLO infer() 出口 dict 化落地——产物为 {kind:det,track_id,cls_id,bbox,score,model_path}，infer 不带时间上下文；Pipeline.step 统一注入 ts/frame_idx 并把直传入口（对象经 to_record/dict 浅拷贝）归一为 dict；_submits 键读并跳过缺 cls_id 项；SubmitRequest.dets/det 改 dict 标注（prepare 双形态读）；crop_restore 双形态读。Detection dataclass 保留（外部构造/直传兼容）。
   文档三篇已同步（assembly_ports §3①/§3⑥、modules/yolo、modules/INDEX）；test_composer 迁移 +12 断言 108→120 全绿；模块回归 det_filter72/seq_filter50/target_crop45/annotate23/cropper26/validate_chain34/image_source73/三链路(plate28/face_capture63/face_extract28)与 police_uav_pipeline 全绿；预期红=qa WO-0014.5 迁移范围：test_yolo_standalone、test_yolo_params、test_port_inputs e2e 间谍节（直传对象归一为 dict 后 :237 等 d.score 属性读）；test_police_uav_video 静态核查不涉属性直读、留 qa 补跑。
+  → 去向：已随 WO-0014.3 落地（commit dab970f；文档三篇 commit 982e63a）
 
 - [2026-10-21][INB-0062][web][成果] WO-0014.4（批次2 web）：测试台 infer 产物入口统一 _as_detections 归一（web_lab/server.py 共 8 处：h_yolo、h_plate_recog 脚手架、h_frame_yolo、h_pipeline_run 图片/视频两路、h_pipeline_stream SSE、h_chain 视频/图片两路）+ _match_crops_for_req 双形态读 det/dets（新增 _bbox_of：Mapping→get/对象→getattr，缺 bbox 项跳过=静默降级点显式修复）；web 内部对象形态消费代码（画框/统计/SSE 手工转换/表格）零改动；last_crops 侧 c.bbox 不动（crop_targets 产出仍为 CropResult 对象）。③ 落地前后均零行为变化：自证 14 项全过（Detection 原样同对象/to_record dict 字段往返一致/表格行、SSE JSON、画框像素、统计聚合新旧一致/match 新旧实现命中集一致/缺 bbox 跳过不抛），脚本 /tmp/opencode/wo0014_selfcheck.py；test_graph_chain 全过、test_port_inputs 59 项、resources.py 自检、py_compile 均通过。h_vlm 的 SubmitRequest(det=Detection) 构造保持现状（pipe-chain prepare 侧双形态读兼容，无冲突）。
+  → 去向：已随 WO-0014.4 落地（commit 6d40f60）
 
 - [2026-10-21][INB-0061][qa][成果] WO-0014.2 批次1 dict 输入强化用例落地：annotate 16→23、target_crop 35→45、det_filter 66→72、seq_filter 43→50（合计+30），四脚本全绿；只增不改（tests/ 零删除行）。
   红绿证据两级回退验证：①修复前代码 annotate/target_crop 红（AttributeError: d.bbox 直读未适配 dict），det/seq 等价用例立即绿（本就双形态安全）；②中间态（bbox 已修、cls_id 仍 getattr 退化）下探测器红（annotate 逐像素差异/target_crop 产物承接 cls_id=-1），证明 getattr 静默退化可被断言抓出（防 INB-0059 回归核心价值）。dict 构造统一 to_record(Detection(...))，字段集含 model_path 对齐批次2 infer() 产出。实验用产品代码已逐字节恢复为 WO-0014.1 修复版。工单 WO-0014.2 已置待测试，orchestrator 于 WO-0014.1 提交后统一复跑确认。
+  → 去向：已随 WO-0014.2 落地（commit 27bb7dd）
 
 - [2026-10-21][INB-0060][pipe-chain][成果] WO-0014 批次1落地：target_crop/annotate 消费方 6 处读法双形态加固（对象/dict 都正确）——统一复用 conditions._field_value（cls_id→-1/score→0.0/track_id→0 缺省语义逐字保持）+ bbox 双形态读（缺失走现有空框跳过/不画路径）；对象输入路径逐字等价零行为变化；顺手修 seq_filter.py:98 类 docstring『→ list[dict]』与实现（返回原元素）不一致。验证：test_composer 108 + test_target_crop 35 + test_annotate 16 + test_det_filter 66 + test_seq_filter 43 全绿；/tmp 自证 20 断言（to_record(Detection) 喂两模块：画框像素级一致/裁剪几何元数据一致/classes 与 filter DSL 对 dict 生效/缺 bbox 不崩）。
+  → 去向：已随 WO-0014.1 落地（commit 27bb7dd）
 
 - [2026-10-21][INB-0059][orchestrator][坑] 端口类型 Records 粒度粗、不区分元素形态（Detection 对象 vs dict），链上实际双形态流动：yolo.dets=对象原样登记（composer.py:733）、det/seq_filter '对象进对象出'（det_filter.py:140/seq_filter.py:245，to_record 仅建判定视图）、target_crop.crops=登记处 to_record 转 dict（composer.py:781）。消费方适配风格不一：target_crop.py:209-211、annotate.py:56/64 用裸 getattr 只认对象形态——若把 dict 形态产物（如另一 target_crop 的 crops）连进 dets 端口会静默失效（cls_id 落默认 -1、不报错）。双形态安全读法有现成模式 conditions.py:293（isinstance Mapping→get 否则 getattr）。建议 pipe-chain 评估：①消费方统一双形态读法或入口 to_record 收敛；②或端口协议声明各产物元素形态；③validate_chain 是否该拦 Records 内部形态错配
-
-## 已同步
-
+  → 去向：已由 WO-0013 评估 + WO-0014 实施闭环（①双形态加固 27bb7dd、③infer dict 化 dab970f、形态定案入 doc/design/assembly_ports.md §3①）；建议①②采纳落地，③validate_chain 拦 Records 元素形态错配未做（仍为已知边界）
 <!-- /curate 处理后移到这里，注明去向，例如：INB-0001 → CLAUDE.md §三 设计契约 -->
 
 - [2026-10-21][INB-0058][qa][坑] WO-0012.1 复核：mysql_lib.sh:122 注释仍写「仅本机 socket 可连（host=localhost 不匹配 TCP 登录）」，与 INB-0057 自我纠正（实测 socket+TCP loopback 均可达，勿再沿用 socket-only 表述）矛盾
