@@ -55,6 +55,9 @@ def main() -> None:
             t0 = time.time()
             dets = det.infer(frame)  # 模块内 predict，track=False
             dt = time.time() - t0
+            # 形态断言（WO-0014.3 infer dict 化契约）：infer 产物为 dict 记录（kind=det）
+            assert all(isinstance(x, dict) and x.get("kind") == "det" for x in dets), \
+                "infer 产物应为 kind=det 的 dict 记录"
             p = params
             print(f"\n[{name}] conf={p['conf']} iou={p['iou']} imgsz={p['imgsz']} max_det={p['max_det']}  ({dt:.2f}s)")
             if not dets:
@@ -62,13 +65,13 @@ def main() -> None:
                 continue
             by_cls = {}
             for d in dets:
-                by_cls.setdefault(CLS_NAME[d.cls_id], []).append(d)
+                by_cls.setdefault(CLS_NAME[d["cls_id"]], []).append(d)
             for cn, items in by_cls.items():
                 print(f"  {cn}: {len(items)} 个")
                 for i, d in enumerate(items):
-                    x1, y1, x2, y2 = d.bbox
+                    x1, y1, x2, y2 = d["bbox"]
                     w, h = x2 - x1, y2 - y1
-                    print(f"    #{i+1:<2} conf={d.score:<5} box=({x1},{y1})-({x2},{y2})  {w}x{h}")
+                    print(f"    #{i+1:<2} conf={d['score']:<5} box=({x1},{y1})-({x2},{y2})  {w}x{h}")
 
 
 if __name__ == "__main__":

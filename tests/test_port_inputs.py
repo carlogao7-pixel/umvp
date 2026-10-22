@@ -234,7 +234,7 @@ def _run_spy(ann_inputs=None):
 def e2e_checks() -> None:
     # 默认（无 inputs）：annotate 收到 det_filter 过滤后的 dets（0.9/0.7 两条）
     p_def, c_def, frame = _run_spy(None)
-    scores_def = sorted(d.score for d in c_def["dets"])
+    scores_def = sorted(d["score"] for d in c_def["dets"])
     check("e2e 默认: stage_inputs 为空（零回归）", p_def.stage_inputs == {})
     check("e2e 默认: annotate 收到过滤后 dets（2 条，含 0.9/0.7）",
           scores_def == [0.7, 0.9], str(scores_def))
@@ -242,7 +242,7 @@ def e2e_checks() -> None:
 
     # 声明 annotate.dets = yolo.dets（过滤前原始 3 条，绕过检测筛选）
     p_raw, c_raw, _ = _run_spy({"dets": "yolo.dets"})
-    scores_raw = sorted(d.score for d in c_raw["dets"])
+    scores_raw = sorted(d["score"] for d in c_raw["dets"])
     check("e2e yolo.dets: 声明组装为位置键 + 全名",
           p_raw.stage_inputs == {"#3": {"dets": "yolo#1.dets"}})
     check("e2e yolo.dets: annotate 收到 yolo.dets 原始 3 条（含被筛掉的 0.2）",
@@ -252,13 +252,26 @@ def e2e_checks() -> None:
 
     # 声明 annotate.dets = det_filter.dets（显式取过滤后）→ 与默认一致
     p_fil, c_fil, _ = _run_spy({"dets": "det_filter.dets"})
-    scores_fil = sorted(d.score for d in c_fil["dets"])
+    scores_fil = sorted(d["score"] for d in c_fil["dets"])
     check("e2e det_filter.dets: annotate 收到过滤后 2 条",
           scores_fil == [0.7, 0.9], str(scores_fil))
     check("e2e: 显式 det_filter.dets 与默认结果一致",
           scores_fil == scores_def, f"{scores_fil} vs {scores_def}")
     check("e2e: 显式 det_filter.dets 仍与 yolo.dets 不同",
           scores_fil != scores_raw)
+
+    # 形态断言（WO-0013 定案清单第 5 条）：声明 inputs 连线后，spy 收到的 dets 元素
+    # 仍为 dict 记录（kind=det，且带 step 注入的时间上下文）——产物形态不因
+    # 中间环节（直传入口归一 / 产物解析 / 筛选传递）回退成对象。
+    _DET_KEYS = {"kind", "track_id", "cls_id", "bbox", "score", "ts", "frame_idx"}
+    check("e2e 形态: yolo.dets 连线后 spy 收到的元素仍为 dict 记录（kind=det + 全契约字段）",
+          all(isinstance(d, dict) and d.get("kind") == "det" and _DET_KEYS <= set(d)
+              for d in c_raw["dets"]),
+          f"{type(c_raw['dets'][0]).__name__ if c_raw['dets'] else '空'}")
+    check("e2e 形态: det_filter.dets 连线后元素仍为 dict 记录（kind=det）",
+          all(isinstance(d, dict) and d.get("kind") == "det" for d in c_fil["dets"]))
+    check("e2e 形态: 默认（检测流末端）元素同样为 dict 记录（零回归）",
+          all(isinstance(d, dict) and d.get("kind") == "det" for d in c_def["dets"]))
 
     # 同时声明 image 端口指向上游产物（Image 类型）→ 间谍收到该产物
     p_img, c_img, frame2 = _run_spy({"dets": "yolo.dets", "image": "frame_manager.frame"})
@@ -442,13 +455,13 @@ def multi_instance_checks() -> None:
     # annotate 默认收检测流末端（两道筛选后仅 0.9）。若第二实例被静默丢弃，只过紧筛
     # 仍是 0.9——但松筛接 yolo.dets（绕过 #2）后结果不同，见下一组对照。
     _, spy = run_spy(_mi_spec())
-    scores_chain = sorted(d.score for d in spy.calls[0]["dets"])
+    scores_chain = sorted(d["score"] for d in spy.calls[0]["dets"])
     check("多实例: 链式默认 → 两道筛选后仅 0.9", scores_chain == [0.9], str(scores_chain))
 
     # §7.1 行为对照：松筛(#3) 声明 inputs.dets=yolo#1.dets（绕过紧筛，原始 3 条）→
     # annotate 默认收检测流末端 = 松筛输出 0.9/0.7 两条 → 证明 #3 实例确实在跑且参数独立
     p2, spy2 = run_spy(_mi_spec(df2_inputs={"dets": "yolo#1.dets"}))
-    scores_bypass = sorted(d.score for d in spy2.calls[0]["dets"])
+    scores_bypass = sorted(d["score"] for d in spy2.calls[0]["dets"])
     check("多实例: #3 绕过 #2 接 yolo 原始检出 → 0.7/0.9 两条（各自 filter 独立生效）",
           scores_bypass == [0.7, 0.9], str(scores_bypass))
     check("多实例: 绕过紧筛与链式结果确实不同", scores_bypass != scores_chain,
@@ -466,7 +479,7 @@ def multi_instance_checks() -> None:
                               "#3": {"dets": "det_filter#2.dets"},
                               "#4": {"dets": "det_filter#2.dets"}},
           str(p3.stage_inputs))
-    scores_a = sorted(d.score for d in spy3.calls[0]["dets"])
+    scores_a = sorted(d["score"] for d in spy3.calls[0]["dets"])
     check("多实例: annotate 显式接 #2 输出 → 1 条 0.9（未被 #3 连线覆盖）",
           scores_a == [0.9], str(scores_a))
     # 同一产物 det_filter#2.dets 被 #3 与 #4 两个下游引用（fan-out 允许，分支留路）

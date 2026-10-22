@@ -47,21 +47,24 @@ def main() -> None:
         t0 = time.time()
         dets = DETECTOR.infer(frame)  # 模块内推理（纯推理输出，不过滤）
         dt = time.time() - t0
+        # 形态断言（WO-0014.3 infer dict 化契约）：infer 产物为 dict 记录（kind=det）
+        assert all(isinstance(x, dict) and x.get("kind") == "det" for x in dets), \
+            "infer 产物应为 kind=det 的 dict 记录"
 
         print("=" * 78)
         print(f"图片: {img.name} | 推理耗时 {dt:.2f}s")
         print(f"检出 person: {len(dets)} 个")
         for i, d in enumerate(dets):
-            x1, y1, x2, y2 = d.bbox
+            x1, y1, x2, y2 = d["bbox"]
             w, h = x2 - x1, y2 - y1
-            print(f"  #{i+1:<2} conf={d.score:<5.3f} box=({x1},{y1})-({x2},{y2})  {w}x{h}")
+            print(f"  #{i+1:<2} conf={d['score']:<5.3f} box=({x1},{y1})-({x2},{y2})  {w}x{h}")
 
         # 有效性筛选（逐条条件 + 白名单 + 数量范围），再按类分组（报送素材形态）
         valid = DFILTER.run(dets)
         print(f"筛选后有效: {len(valid)} 个 (group_limits={DFILTER.group_limits})")
         by_cls = {}
         for d in valid:
-            by_cls.setdefault(d.cls_id, []).append(d)
+            by_cls.setdefault(d["cls_id"], []).append(d)
         for cls, cdets in sorted(by_cls.items()):
             # 一类一条"类请求"（同类多目标合并；节流与 track 抑制由 Pipeline 编排）
             print(f"类请求素材: full:cls{cls} 该类目标数={len(cdets)}")
