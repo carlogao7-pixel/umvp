@@ -160,10 +160,10 @@
 <main>
   <section id="view-module">
     <header>
-      <h2 id="mod-title">加载中…</h2>
-      <p id="mod-desc" class="desc"></p>
+      <h2 id="mod-title">请选择模块</h2>
+      <p id="mod-desc" class="desc">从左上角下拉框选择一个模块，查看参数并运行测试。</p>
     </header>
-    <div class="preset-bar" id="preset-bar">
+    <div class="preset-bar" id="preset-bar" hidden>
       <span class="pbar-label">命名配置</span>
       <input id="preset-name" type="text" placeholder="配置名（留空=模块名）">
       <button id="preset-save">保存</button>
@@ -171,10 +171,10 @@
       <button id="preset-load">载入</button>
       <button id="preset-delete">删除</button>
     </div>
-    <div id="estimate"></div>
-    <form id="form"></form>
-    <button id="run" disabled>运行测试</button>
-    <div id="result"></div>
+    <div id="estimate" hidden></div>
+    <form id="form" hidden></form>
+    <button id="run" hidden disabled>运行测试</button>
+    <div id="result" hidden></div>
   </section>
   <section id="view-designer" hidden>
     <h2>链路设计器</h2>
@@ -247,8 +247,17 @@ async function loadSchema(){
   refreshModulePresets();
   refreshPipelinePresets();
   fetchModulePresets();
-  const ids = Object.keys(SCHEMA.modules).filter(id => !SCHEMA.modules[id].hidden);
-  if (ids.length) select(ids[0]);
+  // 初始不自动选中任何模块：保持空态引导（WO-0017，去掉平铺按钮时代"默认打开第一个模块"的行为）
+  showModuleChrome(false);
+}
+
+// 下拉框固定组序（业务数据流序，WO-0017）；不在表内的组兜底排最后
+const MODULE_GROUP_ORDER = ["帧管理", "图像旁路", "识别研判", "筛选判定", "向量比对"];
+
+function showModuleChrome(show){
+  // 选中模块后才显示的表单/运行区块；空态（未选模块）时全部隐藏
+  for (const id of ["preset-bar", "estimate", "form", "run", "result"])
+    document.getElementById(id).hidden = !show;
 }
 
 function renderSidebar(){
@@ -259,10 +268,13 @@ function renderSidebar(){
     if (m.hidden) continue;
     (groups[m.group] = groups[m.group] || []).push([id, m]);
   }
-  for (const [gn, list] of Object.entries(groups)){
+  // 组序固定为 MODULE_GROUP_ORDER（不依赖 schema 插入序）；未知组兜底排最后
+  const order = [...MODULE_GROUP_ORDER.filter(g => groups[g]),
+                 ...Object.keys(groups).filter(g => !MODULE_GROUP_ORDER.includes(g))];
+  for (const gn of order){
     const og = document.createElement("optgroup");
     og.label = gn;
-    for (const [id, m] of list){
+    for (const [id, m] of groups[gn]){
       const o = document.createElement("option");
       o.value = id; o.textContent = m.name;
       og.appendChild(o);
@@ -305,6 +317,7 @@ function select(id){
   current = id;
   modulePresetId = null;
   const m = SCHEMA.modules[id];
+  showModuleChrome(true);   // 选中模块后恢复表单/运行区块显示
   document.getElementById("mod-title").textContent = m.name;
   document.getElementById("mod-desc").textContent = m.desc || "";
   document.getElementById("result").innerHTML = "";
