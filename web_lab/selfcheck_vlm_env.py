@@ -5,9 +5,11 @@
   1. 零回归：不设任何 env 时 _resolve_vlm_cfg 逐字回落（spec 给值 / spec 为空两态）；
   2. env 优先：三项各自覆盖 spec；仅设一项时其余回落；
   3. key 别名：GLM_API_KEY 生效，VLM_API_KEY 优先于 GLM_API_KEY；
-  4. 真实请求 spy：url / body.model / Authorization 头（单图 + 多图 list）；
-  5. 4xx 可读提示：401/403/429 抛 VlmHttpError，提示可读；
-  6. 集成：链路里 4xx 提示每轮最多一条（调用 N≥2 次仍只出 1 条）。
+  4. 提供方插槽（WO-0019）：provider=glm → 端点/模型取 VLM_PROVIDERS（覆盖 spec 手填）；
+     provider=custom/未知/缺省 → 回落手填/默认；env 仍压过 provider；key 不受 provider 影响；
+  5. 真实请求 spy：url / body.model / Authorization 头（单图 + 多图 list）；
+  6. 4xx 可读提示：401/403/429 抛 VlmHttpError，提示可读；
+  7. 集成：链路里 4xx 提示每轮最多一条（调用 N≥2 次仍只出 1 条）。
 
 运行: conda run -n ai python web_lab/selfcheck_vlm_env.py
 """
@@ -121,6 +123,87 @@ def resolver_checks() -> None:
     _, _, k = server._resolve_vlm_cfg({})
     check("仅 GLM_API_KEY: key 生效", k == "glmk2", repr(k))
     clear_env()
+
+
+def provider_checks() -> None:
+    """提供方插槽（WO-0019）：vlm_provider 分支解析 + PARAMS schema。"""
+    clear_env()
+    prov = server.VLM_PROVIDERS
+    glm = prov["glm"]
+
+    # 插槽表内容逐字（锁行为：glm 端点/模型、默认插槽=内置默认）
+    check("插槽表: 恰好三家（qwen_selfhost/glm/custom）",
+          set(prov) == {"qwen_selfhost", "glm", "custom"}, str(sorted(prov)))
+    check("插槽表: glm 端点逐字",
+          glm["endpoint"] == "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+          glm["endpoint"])
+    check("插槽表: glm 模型逐字", glm["model"] == "glm-4v-flash", glm["model"])
+    check("插槽表: qwen_selfhost = 内置默认端点/模型",
+          (prov["qwen_selfhost"]["endpoint"], prov["qwen_selfhost"]["model"])
+          == (DEF_URL, DEF_MODEL))
+    check("插槽表: custom 无 endpoint（视为自定义回落）", "endpoint" not in prov["custom"])
+
+    # provider=glm → endpoint/model 取插槽；key 仍按原三级（env → spec）
+    u, m, k = server._resolve_vlm_cfg({"vlm_provider": "glm", "vlm_key": "speck"})
+    check("provider=glm: endpoint/model 取插槽",
+          (u, m) == (glm["endpoint"], glm["model"]), f"{u} {m}")
+    check("provider=glm: key 不受 provider 影响", k == "speck", repr(k))
+
+    # provider=glm 覆盖 spec 手填端点/模型
+    u, m, _ = server._resolve_vlm_cfg(
+        {"vlm_provider": "glm", "vlm_endpoint": "http://spec/v1", "vlm_model": "specm"})
+    check("provider=glm: 覆盖 spec 手填端点/模型",
+          (u, m) == (glm["endpoint"], glm["model"]), f"{u} {m}")
+
+    # provider=custom → 回落 spec 手填；spec 空 → 内置默认
+    u, m, _ = server._resolve_vlm_cfg(
+        {"vlm_provider": "custom", "vlm_endpoint": "http://spec/v1", "vlm_model": "specm"})
+    check("provider=custom: 回落 spec 手填", (u, m) == ("http://spec/v1", "specm"), f"{u} {m}")
+    u, m, _ = server._resolve_vlm_cfg({"vlm_provider": "custom"})
+    check("provider=custom: spec 空 → 内置默认", (u, m) == (DEF_URL, DEF_MODEL), f"{u} {m}")
+
+    # provider 未知 / None（DB 空列还原）→ 回落内置默认（零回归）
+    u, m, _ = server._resolve_vlm_cfg({"vlm_provider": "nope"})
+    check("provider 未知: 回落内置默认", (u, m) == (DEF_URL, DEF_MODEL), f"{u} {m}")
+    u, m, _ = server._resolve_vlm_cfg({"vlm_provider": None})
+    check("provider=None（DB 空列）: 回落内置默认", (u, m) == (DEF_URL, DEF_MODEL), f"{u} {m}")
+    u, m, _ = server._resolve_vlm_cfg({"vlm_provider": "  "})
+    check("provider 纯空白: 回落内置默认", (u, m) == (DEF_URL, DEF_MODEL), f"{u} {m}")
+
+    # env 仍压过 provider（部署级强制覆盖语义不变）
+    os.environ.update(VLM_ENDPOINT="https://env/v1", VLM_MODEL="envm")
+    u, m, _ = server._resolve_vlm_cfg({"vlm_provider": "glm"})
+    check("env 压过 provider=glm", (u, m) == ("https://env/v1", "envm"), f"{u} {m}")
+    clear_env()
+
+    # PARAMS schema：vlm_provider select 参数（/api/schema 暴露、DB 落库路径）
+    spec = server.PARAMS["vlm"]["vlm_provider"]
+    check("PARAMS: vlm_provider type=select", spec.get("type") == "select", str(spec.get("type")))
+    check("PARAMS: default=qwen_selfhost", spec.get("default") == "qwen_selfhost")
+    opts = spec.get("options") or []
+    check("PARAMS: options 三家 value 齐且有序",
+          [(o["value"] if isinstance(o, dict) else o) for o in opts]
+          == ["qwen_selfhost", "glm", "custom"], str(opts))
+    check("PARAMS: options label 均非空",
+          all((o.get("label") if isinstance(o, dict) else o) for o in opts))
+    check("PARAMS: options 与插槽表 label 一致",
+          all(o["label"] == prov[o["value"]]["label"] for o in opts if isinstance(o, dict)))
+    check("PARAMS: vlm_provider 非 test_only（进链路 spec / DB 落库）",
+          not spec.get("test_only"))
+    check("db: select 列类型 VARCHAR(64)（provider 键值可承载）",
+          server.db._SQL_TYPES.get("select") == "VARCHAR(64)")
+
+    # 真实请求 spy：provider=glm → url/model 生效
+    frame = np.zeros((10, 10, 3), np.uint8)
+    cap = {}
+    restore = _spy_requests(cap)
+    try:
+        server._vlm_real({"vlm_provider": "glm"}, {"max_resolution": (1280, 720)}, frame)
+    finally:
+        restore()
+    check("spy provider=glm: url=插槽端点", cap["url"] == glm["endpoint"], cap["url"])
+    check("spy provider=glm: body.model=glm-4v-flash",
+          cap["body"]["model"] == glm["model"], cap["body"]["model"])
 
 
 def spy_checks() -> None:
@@ -253,13 +336,15 @@ def chain_hint_once() -> None:
 
 
 def main() -> int:
-    print("== 1/4 解析优先级与零回归 ==")
+    print("== 1/5 解析优先级与零回归 ==")
     resolver_checks()
-    print("== 2/4 真实请求 spy（url/model/Authorization） ==")
+    print("== 2/5 提供方插槽（vlm_provider 分支 + schema） ==")
+    provider_checks()
+    print("== 3/5 真实请求 spy（url/model/Authorization） ==")
     spy_checks()
-    print("== 3/4 4xx 可读提示 ==")
+    print("== 4/5 4xx 可读提示 ==")
     hint_checks()
-    print("== 4/4 链路级 4xx 提示每轮一条 ==")
+    print("== 5/5 链路级 4xx 提示每轮一条 ==")
     chain_hint_once()
     print(f"\n全部通过：{PASS} 项断言")
     return 0

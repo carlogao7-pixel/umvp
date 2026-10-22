@@ -395,10 +395,23 @@ def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
-# VLM 端点/模型/key 解析：环境变量（部署级强制覆盖）→ 链路阶段参数 → 内置默认。
-# 导出 env 即全链路切到该端点、无需改 DB；不设任何 env 时逐字回落到改动前行为（零回归）。
+# VLM 端点/模型/key 解析：环境变量（部署级强制覆盖）→ 提供方插槽（vlm_provider）→
+# 链路阶段参数 → 内置默认。导出 env 即全链路切到该端点、无需改 DB；
+# 不设任何 env 且未选提供方时逐字回落到改动前行为（零回归）。
 VLM_DEFAULT_ENDPOINT = "http://117.42.21.253:8000/v1/chat/completions"
 VLM_DEFAULT_MODEL = "qwen3-vl-32b"
+
+# VLM 提供方插槽表（WO-0019，仅 OpenAI 兼容范式，_vlm_real 调用形态不变）：
+# 新增提供方 = 在此加一个条目（label + endpoint + model；无 endpoint 的条目视为
+# "自定义"，回落手填端点/模型）。PARAMS["vlm"].vlm_provider 的 options 由此动态生成。
+VLM_PROVIDERS = {
+    "qwen_selfhost": {"label": "自建端点 qwen3-vl-32b（默认）",
+                      "endpoint": VLM_DEFAULT_ENDPOINT, "model": VLM_DEFAULT_MODEL},
+    "glm": {"label": "智谱 glm-4v-flash",
+            "endpoint": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "model": "glm-4v-flash"},
+    "custom": {"label": "自定义（手填端点/模型）"},
+}
 
 
 class VlmHttpError(RuntimeError):
@@ -411,14 +424,22 @@ class VlmHttpError(RuntimeError):
 
 
 def _resolve_vlm_cfg(p: dict) -> tuple:
-    """解析 (url, model, key)：环境变量优先 → spec 阶段参数 → 内置默认。
+    """解析 (url, model, key)：环境变量优先 → 提供方插槽 → spec 阶段参数 → 内置默认。
 
     env：VLM_ENDPOINT / VLM_MODEL / VLM_API_KEY（key 兼容别名 GLM_API_KEY，
-    两者都设时 VLM_API_KEY 优先）。env 为部署级强制覆盖；未设的项回落 spec、再回落默认。
+    两者都设时 VLM_API_KEY 优先）。env 为部署级强制覆盖；未设的项回落后续优先级。
+    vlm_provider（提供方插槽，WO-0019）：值在 VLM_PROVIDERS 且条目含 endpoint 时
+    endpoint/model 取插槽（覆盖 spec 手填 vlm_endpoint/vlm_model）；provider 为
+    custom/缺省/未知时回落 spec 手填、再回落内置默认（零回归）。key 不受 provider 影响。
     """
+    slot = VLM_PROVIDERS.get(str(p.get("vlm_provider") or "").strip()) or {}
+    if "endpoint" not in slot:  # custom（无 endpoint 条目）/缺省/未知 → 插槽不生效
+        slot = {}
     url = (os.environ.get("VLM_ENDPOINT") or "").strip() \
+        or slot.get("endpoint") \
         or str(p.get("vlm_endpoint") or "").strip() or VLM_DEFAULT_ENDPOINT
     model = (os.environ.get("VLM_MODEL") or "").strip() \
+        or slot.get("model") \
         or str(p.get("vlm_model") or "").strip() or VLM_DEFAULT_MODEL
     key = ((os.environ.get("VLM_API_KEY") or os.environ.get("GLM_API_KEY") or "").strip()
            or str(p.get("vlm_key") or "").strip())
@@ -430,7 +451,8 @@ def _vlm_real(p: dict, payload: dict, frame) -> tuple:
 
     frame：单张 ndarray（现状，单图消息）或图集列表（image_pick=all，OpenAI 兼容
     **多图**消息：多个 image_url content 项 + 末尾 text）。单图路径与改动前**逐字等价**。
-    端点/模型/key 三项经 _resolve_vlm_cfg：env 优先 → spec → 默认。
+    端点/模型/key 三项经 _resolve_vlm_cfg：env 优先 → 提供方插槽（vlm_provider）→
+    spec → 默认。
     timeout=(连接, 读取)：连接阶段最多 5s（端点不可达时快速失败），读取按 vlm_timeout（默认 20s）。
     4xx（401/403 鉴权、429 限额）抛 VlmHttpError（携带可读中文提示）。
     注：多图 content 已用智谱 glm-4v-flash 的 OpenAI 兼容 /chat/completions 实证支持
@@ -1172,7 +1194,8 @@ def h_pipeline_run(p: dict) -> dict:
     start_time = _float(p, "start_time", 0.0)
     end_time = _float(p, "end_time", 0.0)
 
-    # 真实 VLM 配置：来自链路 vlm 阶段参数（use_real_vlm/vlm_endpoint/vlm_model/vlm_key）
+    # 真实 VLM 配置：来自链路 vlm 阶段参数（use_real_vlm/vlm_provider/vlm_endpoint/
+    # vlm_model/vlm_key）
     vlm_cfg = {}
     for s in spec.get("stages") or []:
         if s.get("module_id") == "vlm":
@@ -1193,7 +1216,8 @@ def h_pipeline_run(p: dict) -> dict:
     vlm_fail = 0  # 真实调用失败次数（网络等），累计供结果提示
     vlm_hint_shown = False  # 4xx 可读提示每轮最多一条（避免逐帧刷屏）
     # 真实 VLM 端点预探测：不可达则本轮直接跳过真实调用，避免每帧长超时把测试拖住
-    # （URL 经 _resolve_vlm_cfg：env VLM_ENDPOINT 优先，与 _vlm_real 保持一致）
+    # （URL 经 _resolve_vlm_cfg：env VLM_ENDPOINT 优先，其次 vlm_provider 插槽，
+    # 与 _vlm_real 保持一致）
     _vlm_url = _resolve_vlm_cfg(vlm_cfg)[0]
     vlm_unreachable = False
     if feedback and use_real_vlm and not _endpoint_reachable(_vlm_url):
@@ -2380,6 +2404,10 @@ PARAMS = {
                       "help": "没填 bbox 时，用它代表该类目标数量"},
         "use_real_vlm": {"label": "调用真实大模型", "type": "bool", "default": False,
                          "help": "勾选才真发请求；不勾只演示生成素材包"},
+        "vlm_provider": {"label": "提供方", "type": "select", "default": "qwen_selfhost",
+                         "options": [{"value": k, "label": v["label"]}
+                                     for k, v in VLM_PROVIDERS.items()],
+                         "help": "选中即覆盖下方手填端点/模型；环境变量优先于本参数"},
         "vlm_endpoint": {"label": "VLM 端点（留空用默认）", "type": "str",
                          "default": "http://117.42.21.253:8000/v1/chat/completions",
                          "help": "大模型接口地址；环境变量 VLM_ENDPOINT 优先（导出即全链路切换）"},

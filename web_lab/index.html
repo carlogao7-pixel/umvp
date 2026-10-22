@@ -423,7 +423,9 @@ function renderInput(pk, spec, prefix){
     el.id = prefix + "-" + pk;
     for (const o of spec.options){
       const op = document.createElement("option");
-      op.value = o; op.textContent = o;
+      // 选项兼容两种形态：纯字符串（旧参数）/ {value,label} 对象（如 vlm_provider，WO-0019）
+      const val = (o && typeof o === "object") ? o.value : o;
+      op.value = val; op.textContent = (o && typeof o === "object" && o.label) ? o.label : val;
       el.appendChild(op);
     }
     el.value = spec.default !== undefined ? String(spec.default) : spec.options[0];

@@ -242,9 +242,11 @@ def validate(spec: dict, warnings: list | None = None) -> list[str]:
                 errs.append(f"stages[{i}] {mid}: 参数 {k!r} 为模块测试页专用（test_only），"
                             f"不能进链路 spec")
             opts = spec_k.get("options")
+            # 选项支持纯字符串或 {value,label} 对象（vlm.vlm_provider，WO-0019）；按 value 比较。
             # v 为 None=该列未设置（DB 空列还原/未填），回落模块默认，不算非法取值；
             # 显式填了非允许字符串才报错（如 image_source='lowres'）。
-            if opts and v is not None and str(v) not in [str(o) for o in opts]:
+            opt_vals = [str(o["value"] if isinstance(o, dict) else o) for o in (opts or [])]
+            if opt_vals and v is not None and str(v) not in opt_vals:
                 errs.append(f"stages[{i}] {mid}.{k}={v!r} 不在允许值 {opts}")
         errs.extend(_semantic_dry_run(i, mid, params))
     # 5) 声明即执行：已注册产品模块若未被装配器装配，声明了也不会执行（静默失效）。
