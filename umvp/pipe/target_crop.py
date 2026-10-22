@@ -38,7 +38,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from pipe.conditions import match_obj, parse_condition
+from pipe.conditions import _field_value, match_obj, parse_condition
 from pipe.cropper import clamp_bbox
 
 
@@ -157,10 +157,12 @@ def _interp(scale: float) -> int:
 
 
 def _iter_items(dets, boxes):
-    """统一成 (对象, bbox) 序列：dets 用原对象（条件 DSL 取字段）；boxes 用裸框占位对象。"""
+    """统一成 (对象, bbox) 序列：dets 用原对象/记录 dict（条件 DSL 取字段）；boxes 用裸框占位对象。"""
     items = []
     for d in (dets or []):
-        items.append((d, tuple(int(v) for v in d.bbox)))
+        b = d.get("bbox") if isinstance(d, Mapping) else getattr(d, "bbox", None)
+        # bbox 缺失 → 空框，走 crop_targets 现有的"空框跳过"路径（不产出裁剪）
+        items.append((d, tuple(int(v) for v in b) if b else (0, 0, 0, 0)))
     for b in (boxes or []):
         items.append((_RawBox(b), tuple(int(v) for v in b)))
     return items
@@ -206,9 +208,9 @@ def crop_targets(
     total_scale = (float(scale) if scale else 1.0) * out_scale
     out: List[CropResult] = []
     for obj, bbox in _iter_items(dets, boxes):
-        cls_id = int(getattr(obj, "cls_id", -1))
-        score = float(getattr(obj, "score", 0.0))
-        track_id = int(getattr(obj, "track_id", 0) or 0)
+        cls_id = int(_field_value(obj, "cls_id"))
+        score = float(_field_value(obj, "score"))
+        track_id = int(_field_value(obj, "track_id") or 0)
         if cls_set is not None and cls_id not in cls_set:
             continue
         if not match_obj(obj, groups):

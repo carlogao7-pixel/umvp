@@ -9,6 +9,7 @@
      先匹配先得 / 记录自带 ts / key 缺失归 "*" / 非法构造报错
   4. 组合：DetFilter(取舍) → SeqFilter(确认) 串联
   5. 门控：throttle 整类节流 / change track 集合变化（原 Pipeline 编排迁入）
+  7. dict/object 双形态等价（窗口达成 / dict 进 dict 出 / cooldown·throttle dict 路径）
 
 运行: conda run -n ai python tests/test_seq_filter.py
 """
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ROOT / "umvp"))
 from pipe.composer import Detection
 from pipe.det_filter import DetFilter
 from pipe.seq_filter import SeqFilter, SeqRule
+from pipe.records import to_record
 
 PASS = 0
 
@@ -213,6 +215,44 @@ def main() -> None:
     sf = SeqFilter([SeqRule(match="cls_id == 0", event="警情-{label}")])
     o = sf.run([{"cls_id": 0, "label": "治安类", "bbox": (0, 0, 9, 9)}], ts=0.0)
     check("动态事件名：{字段} 占位", o[0]["events"][0]["name"] == "警情-治安类")
+
+    # ---- 7. dict/object 双形态等价（链路通用语回归；本层双形态安全应立即绿） ----
+    # 注意：现有 L58/L172 的 isinstance(..., Detection) 类型断言保留（对象路径仍有效），
+    # 此处新增 dict 路径对照断言。
+    pair = [det((0, 0, 50, 50), tid=7, score=0.95), det((0, 0, 50, 50), tid=7, score=0.95)]
+    recs = [to_record(d) for d in pair]
+    check("dict 字段集与对象一致（含 model_path）",
+          all(set(r.keys()) == {"track_id", "cls_id", "bbox", "score", "model_path"}
+              for r in recs))
+
+    # 窗口规则：对象/dict 两形态各自独立实例，放行集合等价
+    sf_o = SeqFilter([SeqRule(match="cls_id == 0", event="等价", span=5.0, min_n=2)])
+    sf_r = SeqFilter([SeqRule(match="cls_id == 0", event="等价", span=5.0, min_n=2)])
+    sf_o.run(pair[:1], ts=0.0)
+    sf_r.run([dict(r) for r in recs[:1]], ts=0.0)   # 拷贝防污染
+    o_obj = sf_o.run(pair[1:], ts=1.0)
+    o_rec = sf_r.run([dict(r) for r in recs[1:]], ts=1.0)
+    check("双形态等价：窗口达成放行数量一致", len(o_obj) == 1 and len(o_rec) == 1)
+    check("dict 进 dict 出（元素仍为 dict，events 落键）",
+          isinstance(o_rec[0], dict) and o_rec[0]["events"][0]["name"] == "等价")
+    check("对象进对象出（元素仍为 Detection，对照断言）",
+          isinstance(o_obj[0], Detection) and o_obj[0].events[0]["name"] == "等价")
+    check("双形态等价：事件 ts/detail.key 一致",
+          o_obj[0].events[0]["ts"] == o_rec[0]["events"][0]["ts"] == 1.0
+          and o_obj[0].events[0]["detail"]["key"] == o_rec[0]["events"][0]["detail"]["key"] == "7")
+
+    # cooldown：dict 路径首报/期内扣留/过后再报（与对象路径同语义）
+    sf_d = SeqFilter([SeqRule(match="cls_id == 0", event="冷却", cooldown=10.0)])
+    check("cooldown dict 路径：首报/期内扣留/过后再报",
+          len(sf_d.run([to_record(det((0, 0, 50, 50), tid=7))], ts=1.0)) == 1
+          and len(sf_d.run([to_record(det((0, 0, 50, 50), tid=7))], ts=5.0)) == 0
+          and len(sf_d.run([to_record(det((0, 0, 50, 50), tid=7))], ts=12.0)) == 1)
+
+    # throttle 门控：dict 进 dict 出（对照现有对象路径 L172 的 isinstance 断言）
+    sf_t = SeqFilter(throttle={"key": "cls_id", "interval": 3.0})
+    g_rec = sf_t.run([to_record(det((0, 0, 50, 50), tid=1, cls=0))], ts=0.0)
+    check("throttle dict 路径：首帧放行且元素仍为 dict",
+          len(g_rec) == 1 and isinstance(g_rec[0], dict))
 
     print(f"\n全部通过: {PASS} 项断言")
 

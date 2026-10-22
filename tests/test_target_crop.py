@@ -9,6 +9,8 @@
   5. to_original 坐标还原（子图框 → 原图框）
   6. TargetCrop.run / boxes 裸框
   7. Pipeline.crop 集成（帧决策 → 目标裁剪 → 下游消费）
+  8. dict(Record) 输入（裁剪几何 / 产物承接元数据 / filter·classes 对 dict 生效；
+     防 getattr 静默退化回归，INB-0059）
 
 运行: conda run -n ai python tests/test_target_crop.py
 """
@@ -22,6 +24,7 @@ sys.path.insert(0, str(ROOT / "umvp"))
 
 from pipe.target_crop import crop_targets, TargetCrop
 from pipe.composer import Detection, FrameManager, Pipeline
+from pipe.records import to_record
 
 PASS = 0
 
@@ -43,6 +46,14 @@ def make_frame(h: int = 100, w: int = 200) -> np.ndarray:
 
 def det(bbox, cls: int = 2, score: float = 0.9, tid: int = 0) -> Detection:
     return Detection(track_id=tid, cls_id=cls, bbox=bbox, score=score, model_path="m")
+
+
+def crop_safe(frame, dets, **kw):
+    """dict 适配未落地时 _iter_items 直读 d.bbox 抛 AttributeError → 返回 None（用例判红）。"""
+    try:
+        return crop_targets(frame, dets=dets, **kw)
+    except AttributeError:
+        return None
 
 
 def main() -> None:
@@ -154,6 +165,50 @@ def main() -> None:
     p.step(0, 0.0, frame=frame, force=True)
     check("Pipeline: 产出裁剪", len(p.last_crops) == 1 and p.last_crops[0].scale == 2.0)
     check("Pipeline: 裁剪传给车牌阶段", fp.got is p.last_crops)
+
+    # ---- 8. dict(Record) 输入（链路通用语；防 getattr 静默退化回归，INB-0059） ----
+    # dict 统一经 to_record(Detection(...)) 构造（字段集含 model_path，对齐批次2 infer()）。
+    # 当前 _iter_items 直读 d.bbox → dict 必 AttributeError；修复后若 getattr 退化
+    # （cls_id→-1/track_id→0/score→0.0）不报错，只有断言产物字段值才能暴露。
+    r7 = to_record(det((10, 20, 50, 60), cls=2, score=0.85, tid=7))
+    r9 = to_record(det((120, 30, 160, 70), cls=2, score=0.85, tid=9))
+    check("dict 字段集与对象一致（含 model_path）",
+          set(r7.keys()) == {"track_id", "cls_id", "bbox", "score", "model_path"})
+
+    # 8a. 裁剪几何与 dict bbox 一致（与对象输入对照）
+    crops_d = crop_safe(frame, [r7])
+    check("dict 输入：可裁剪（不抛 AttributeError）", crops_d is not None,
+          "" if crops_d is not None else "AttributeError: d.bbox 直读未适配 dict")
+    c_obj = crop_targets(frame, [det((10, 20, 50, 60), cls=2, score=0.85, tid=7)])[0]
+    check("dict 输入：数量", crops_d is not None and len(crops_d) == 1)
+    check("dict 输入：裁剪像素与对象输入一致",
+          crops_d is not None and np.array_equal(crops_d[0].img, c_obj.img))
+    check("dict 输入：offset/scale 一致",
+          crops_d is not None and crops_d[0].offset == c_obj.offset
+          and crops_d[0].scale == c_obj.scale)
+
+    # 8b. 产物 CropResult 承接 dict 元数据（静默失效探测器：退化 cls_id=-1 直接红）
+    check("dict 输入：产物承接 cls_id/score/track_id",
+          crops_d is not None and crops_d[0].cls_id == 2
+          and abs(crops_d[0].score - 0.85) < 1e-6 and crops_d[0].track_id == 7,
+          str((crops_d[0].cls_id, crops_d[0].score, crops_d[0].track_id))
+          if crops_d is not None else "no crop")
+
+    # 8c. 条件 DSL 对 dict 生效：track_id==7 被裁、track_id==9 不被裁
+    #     （match_obj 双形态安全；若筛选层 getattr 退化 track_id 恒 0 → 全被剔除 → 红）
+    got7 = crop_safe(frame, [r7], filter="track_id == 7")
+    got9 = crop_safe(frame, [r9], filter="track_id == 7")
+    check("dict filter：track_id==7 命中被裁", got7 is not None and len(got7) == 1)
+    check("dict filter：track_id==9 不命中不裁", got9 is not None and got9 == [])
+
+    # 8d. classes 对 dict 的 cls_id 生效（静默失效探测器：退化 cls_id=-1 → cls_id=2
+    #     的 dict 会被 classes=[2] 误剔 → 红）
+    got_c2 = crop_safe(frame, [r7], classes=[2])
+    got_c0 = crop_safe(frame, [to_record(det((10, 20, 50, 60), cls=0, tid=1))], classes=[2])
+    check("dict classes 正向：cls_id=2 在 classes=[2] 被裁",
+          got_c2 is not None and len(got_c2) == 1)
+    check("dict classes 反向：cls_id=0 不在 classes=[2] 不裁",
+          got_c0 is not None and got_c0 == [])
 
     print(f"\n全部通过: {PASS} 项断言")
 

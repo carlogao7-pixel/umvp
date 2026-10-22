@@ -18,12 +18,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import cv2
 import numpy as np
 
-from pipe.conditions import match_obj, parse_condition
+from pipe.conditions import _field_value, match_obj, parse_condition
 
 # COCO 常用类别中文名（标注标签用；未收录的用 cls{编号}）
 _COCO_NAMES = {0: "人", 1: "自行车", 2: "车", 3: "摩托", 5: "公交", 7: "卡车"}
@@ -53,15 +54,18 @@ def annotate_frame(
     cls_set = set(int(c) for c in classes) if classes else None
     groups = parse_condition(filter)
     for d in (dets or []):
-        cls_id = int(getattr(d, "cls_id", -1))
+        cls_id = int(_field_value(d, "cls_id"))
         if cls_set is not None and cls_id not in cls_set:
             continue
         if not match_obj(d, groups):
             continue
-        x1, y1, x2, y2 = (int(v) for v in d.bbox)
+        b = d.get("bbox") if isinstance(d, Mapping) else getattr(d, "bbox", None)
+        if not b:
+            continue  # bbox 缺失 → 无框可画，跳过
+        x1, y1, x2, y2 = (int(v) for v in b)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, int(thickness))
         if show_label:
-            tid = int(getattr(d, "track_id", 0) or 0)
+            tid = int(_field_value(d, "track_id") or 0)
             txt = _label(cls_id) + (f"#{tid}" if tid else "")
             cv2.putText(canvas, txt, (x1, max(y1 - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color,

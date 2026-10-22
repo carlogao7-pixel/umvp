@@ -95,7 +95,7 @@ class SeqRule:
 
 
 class SeqFilter:
-    """时序判定阶段：run(items, ts, frame_idx) -> list[dict]（放行 Record）。
+    """时序判定阶段：run(items, ts, frame_idx) -> list（放行的**原元素**，对象/记录 dict 形态保持不变）。
 
     rules    : 规则确认闸列表（SeqRule）；可为空（此时必须有 throttle/change）。
     throttle : {"key": 字段, "interval": 秒} 整类节流门控（等价 check_interval）。

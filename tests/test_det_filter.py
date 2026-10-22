@@ -7,6 +7,7 @@
   3. DetFilter：Detection 列表 / dict(Record) 列表 / ts·frame_idx 注入 /
      原元素原样返回 / 空 filter 全放行 / 非法条件装配期报错
   4. 兼容：v1 旧式条件解析结构不变（target_crop/annotate 共用引擎回归）
+  8. dict/object 双形态等价（放行集合 / dict 进 dict 出 / ts·group_limits 注入）
 
 运行: conda run -n ai python tests/test_det_filter.py
 """
@@ -184,6 +185,37 @@ def main() -> None:
         check("事件规格缺 name 报错", False)
     except ValueError:
         check("事件规格缺 name 报错", True)
+
+    # ---- 8. dict/object 双形态等价（链路通用语回归；本层双形态安全应立即绿） ----
+    pair = [det((10, 20, 60, 70), cls=0, tid=1, score=0.95),
+            det((110, 20, 160, 70), cls=2, tid=5, score=0.60),
+            det((0, 0, 20, 10), cls=0, tid=2, score=0.40)]
+    recs = [to_record(d) for d in pair]
+    check("dict 字段集与对象一致（含 model_path）",
+          all(set(r.keys()) == {"track_id", "cls_id", "bbox", "score", "model_path"}
+              for r in recs))
+
+    fe = DetFilter("cls_id in 0|2, score >= 0.5")
+    out_obj = fe.run(pair)
+    out_rec = fe.run(recs)
+    check("双形态等价：放行集合一致（按 bbox/score/cls_id 比较）",
+          [(d.bbox, d.score, d.cls_id) for d in out_obj] ==
+          [(r["bbox"], r["score"], r["cls_id"]) for r in out_rec])
+    check("对象进对象出（元素仍为 Detection）",
+          all(isinstance(d, Detection) for d in out_obj))
+    check("dict 进 dict 出（元素仍为 dict 且字段齐全含 model_path）",
+          all(isinstance(r, dict) and "model_path" in r for r in out_rec))
+
+    # ts/frame_idx 注入对双形态等价生效
+    check("ts 注入双形态等价",
+          len(DetFilter("ts >= 3").run(pair, ts=2.9)) == 0
+          and len(DetFilter("ts >= 3").run(recs, ts=2.9)) == 0
+          and len(DetFilter("ts >= 3").run(pair, ts=3.0)) == 3
+          and len(DetFilter("ts >= 3").run(recs, ts=3.0)) == 3)
+    # group_limits 成组判定双形态等价
+    fg = DetFilter("", group_limits={0: (1, 300)})
+    check("group_limits 双形态等价",
+          [d.track_id for d in fg.run(pair)] == [r["track_id"] for r in fg.run(recs)])
 
     print(f"\n全部通过: {PASS} 项断言")
 
