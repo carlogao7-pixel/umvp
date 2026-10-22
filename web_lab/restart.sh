@@ -19,6 +19,10 @@ for a in "$@"; do
   esac
 done
 
+# 本地 VLM 端点配置（vlm_env.sh 不入 git；存在即注入 VLM_ENDPOINT/VLM_MODEL/VLM_API_KEY，
+# setsid 拉起的 server 进程继承，env 优先级高于链路参数——见 server.py _resolve_vlm_cfg）
+[ -f "$SELF/vlm_env.sh" ] && . "$SELF/vlm_env.sh"
+
 # 从透传参数里取 --port（支持 --port N 与 --port=N）
 PORT=8001
 PREV=""

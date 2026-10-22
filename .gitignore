@@ -27,3 +27,6 @@ out/transcoded/
 out/web_lab.log
 # 测试输出（人脸提取链路产物：人脸图 + 标注图）
 tests/data/out/
+
+# ---- 本地密钥/端点配置（不入库）----
+web_lab/vlm_env.sh

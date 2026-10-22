@@ -24,6 +24,21 @@
 
 <!-- 新条目追加在此行下方，最新在上 -->
 
+- [2026-10-22][INB-0076][qa][成果/验证] WO-0019 qa 复验全过（子单 WO-0019.2）：①env 持久化——restart 起服 8001 HTTP 200，/proc/<server pid>/environ 确认 VLM_ENDPOINT/VLM_MODEL/VLM_API_KEY 注入且指向 open.bigmodel.cn/glm-4v-flash（key 值未读未打印），vlm_env.sh 未被 git 跟踪、check-ignore 命中、权限 600；②VLM_PROVIDERS 插槽——selfcheck_vlm_env.py 57 断言全过，test_validate_chain 34/34、test_agent_runtime 39 过，/api/schema 断言 vlm_provider type=select default=qwen_selfhost options={value,label} 三家且旧四参数仍在，进程内独立断言 _resolve_vlm_cfg 14 项全过（glm 覆盖 spec 手填且 key 不变、custom/缺省/未知/空白/None 回落原三级零回归、env 压过 provider），DB preset_params_vlm 含 vlm_provider 列 varchar(64)（只查列名未导数据），git show 294bd51 改动 4 文件与 INB-0075 一致；浏览器冒烟未做（无无头浏览器）；提醒：①部分 .gitignore/restart.sh/run.sh 尚未提交，建议 orchestrator 决定提交时机
+
+- [2026-10-22][INB-0075][web][成果/部署] VLM 提供方下拉插槽落地（WO-0019②）：server.py 新增 VLM_PROVIDERS 插槽表（qwen_selfhost/glm/custom，新增提供方=加一个条目）+ PARAMS[vlm].vlm_provider select（默认 qwen_selfhost，options 动态生成 {value,label}）+ _resolve_vlm_cfg 插入第二优先级 env→provider→spec→默认（custom/缺省/未知回落原三级零回归，key 不变；链路 _vlm_url 复用同一函数自动生效）。微调说明：options 用 {value,label} 对象以显示中文 label，index.html select 渲染与 validate_chain 取值校验各加一行向后兼容（纯字符串选项行为不变）；agent.py module_catalog 原样透传 options（dict 可 JSON 序列化，LLM 目录更可读，未动该文件）。DB：vlm_provider 列经 _ensure_module_table 启动自动补列 VARCHAR(64)，无需手工迁移（已验 preset_params_vlm 出现新列，老 preset 行 NULL=等价改前）。验证：selfcheck_vlm_env.py 57 断言全过（原 34+新增 23 provider 分支）；test_agent_runtime.py 39 过；test_validate_chain.py 34/34 过；umvp/resources.py 正常；validate_chain 实跑 vlm_provider=glm/custom 合法通过、=openai 拦截；restart 后 /api/schema 含 vlm_provider select 三家，DB 列自动创建，老链路 PIPE0001-3 完好；验完已 stop。env 生效中行为：本机 vlm_env.sh 注入的 VLM_ENDPOINT/VLM_MODEL 优先于 provider（部署级强制覆盖语义不变，选 glm 不生效属预期）。commit 294bd51
+
+- [2026-10-22][INB-0074][orchestrator][成果/部署] 测试台 VLM 切智谱 glm-4v-flash 已落地（WO-0019①）：新增本地不入仓 web_lab/vlm_env.sh（VLM_ENDPOINT/VLM_MODEL/VLM_API_KEY=智谱glm-4v-flash，key 提取自 opencode 配置、文件 600、已进 .gitignore），run.sh/restart.sh 存在即 source（无此文件的机器行为不变）
+  实测：restart 后 server env 生效，selfcheck_vlm_env.py 34 断言全过，bigmodel 端点 curl 真实调用 HTTP 200 正常回复；env 优先级高于链路参数，页面 vlm 参数框仍显示默认 qwen3-vl-32b 属正常（use_real_vlm 仍需链路勾选）；②提供方下拉插槽派 web 进行中
+
+- [2026-10-22][INB-0073][qa][成果] WO-0018.1 侧栏五组下拉框改动 qa 回归全过（WO-0018.2）
+  验证：restart.sh 后 curl 静态断言 26 项（五组 select 齐全有序/无 optgroup/无 #module-select/新样式 #module-nav .grp+select 在/占位与互斥逻辑在）过；/api/schema 回归 11 可见模块五组逐一对应、hidden 4 不变，git show 6d43252 --stat 核对仅 index.html；DOM stub 状态机抽查 14 项（提取线上 renderSidebar/setNavActive 真实函数：初始全占位→选模块互斥置值→designer/db/test 全回落→换组互斥→非法 id 兜底→onchange 只调 select(id) 且占位空值守卫）过；node --check 过；tests/test_agent_runtime.py 39 断言过；验后 stop.sh。浏览器冒烟不做（无无头浏览器，同 INB-0069 约定）。注：stub 初版双占位为测试侧 bug（createElement('select') 应为空选项）已修正，非被测代码问题。
+
+- [2026-10-22][INB-0072][web][成果] index.html 侧栏模块导航改每组一个下拉框（五组各一 select，互斥选中，WO-0018.1）
+  细节：renderSidebar 按 MODULE_GROUP_ORDER 渲染五个「组名(.grp)+select」单元，组内沿用 schema 输出序、首项占位「选择…」(value="")、未知组兜底排最后保留；互斥统一收敛在 setNavActive 同步 #module-nav select（模块视图=所属组置值其余清占位，非模块视图全回落；程序赋值不触发 change 无递归），onchange 只调 select(id) 避免双写；样式换 #module-nav .grp/#module-nav select，旧 #module-select/optgroup 清理；空态/showModuleChrome/select(id)/server.py 未动。验证：curl 静态断言 13 项过（五组名齐全/无 optgroup/无 #module-select/互斥逻辑在）；/api/schema 回归 11 可见=五组逐一对应、hidden 4 不变；tests/test_agent_runtime.py 39 断言过；script 块 node --check 过；node+DOM stub 状态机推演 9 项过（提取线上 script 真实函数执行：初始全占位→选模块→切设计器回落→切回置值→换组互斥→非模块视图回落）；无浏览器冒烟（同 INB-0069 约定不装依赖）。
+
+- [2026-10-22][INB-0071][qa][坑] conda run -n ai python - 与 heredoc/stdin 管道组合不生效（python 收到空 stdin 直接报 JSONDecodeError/无输出），verify 类内联断言脚本须先落临时文件再 conda run -n ai python <file> 执行（WO-0017.2 验证时踩到，/tmp/opencode 下临时脚本方式已验证可行）
+
 - [2026-10-22][INB-0070][web][成果] 模块五分类改新口径+下拉框行为修复（WO-0017.1/WO-0017）：server.py MODULES 改新五组（帧管理/图像旁路/识别研判/筛选判定/向量比对）且定义序=业务数据流序（/api/schema 输出序即展示序）；index.html 删 loadSchema 尾部 select(ids[0]) 自动选中、初始空态（标题「请选择模块」+引导文案，preset-bar/estimate/form/run/result 五区块 hidden，新增 showModuleChrome(show) 在 select() 恢复）、renderSidebar 硬编码 MODULE_GROUP_ORDER 固定组序（未知组兜底排最后）。验证：/api/schema 11 可见模块组名+输出序逐条匹配、hidden 4 个保持已完成链路；index.html 静态断言 7 项过；tests/test_agent_runtime.py 39 断言过（agent.py module_catalog group 透传无需改）；script 块 node --check 过
 
 - [2026-10-22][INB-0069][qa][成果] qa 验证 WO-0016 通过（子单 WO-0016.2）：/api/schema 63 断言 + index.html 11 断言全过，test_agent_runtime.py 39 断言过，JS node --check 过
