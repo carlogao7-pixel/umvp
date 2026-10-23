@@ -323,6 +323,82 @@ def _pick_vlm_images(source: str, req, frame, pipe) -> tuple:
     return ([frame] if frame is not None else []), "无标注图，回退原帧", True
 
 
+def _annotate_stats(pipe, dets_arg=None, frame=None):
+    """annotate 阶段本帧展示统计（驱动层 timeline/日志用，WO-0022）。
+
+    record 模式（scope=record）产物为 annotate.annotated_records（带图记录流），
+    last_annotated 不更新——展示取数零跨板块：
+      - 出图张数/截断数：用 annotate 模块同一套画框判定（pipe.annotate._visible）对
+        **本帧输入记录**干跑计数——drawn = min(可画数, 上限)、dropped = max(0, 可画数-上限)，
+        与模块实际行为逐条一致（_visible 正是 annotate_frame/annotate_records 共用的
+        唯一画框判定实现）；上限 = 实例公开属性 max_records。
+      - 输入记录解析（与 composer._port_at 默认语义一致）：该实例显式连线产物
+        （stage_inputs.dets）→ 主干在**该实例位置之前**最近一次改写产物（yolo →
+        det_filter → seq_filter.dets，位置即处理序，取位置最大者）→ 驱动层传入的
+        dets（链上无改写阶段时）；任一步产物缺失向下回退。
+    返回 (rec_stats, has_frame_inst, ran)：
+      rec_stats      —— [(drawn, cap, dropped), ...]（record 实例按位置升序）；
+      has_frame_inst —— 存在 frame 模式实例（或无实例）→ 驱动层保留原「标注图」文案行；
+      ran            —— 本帧 annotate 是否实际执行（原图与检出俱备才跑，同 composer 门）。
+    """
+    insts = [(int(pos), obj) for pos, obj in (getattr(pipe, "annotators", None) or [])]
+    if not insts and getattr(pipe, "annotate", None) is not None:
+        insts = [(None, pipe.annotate)]  # 单插槽直挂（测试/旧装配）回退
+    rec_insts = []
+    has_frame = not insts  # 无实例（异常 spec）→ 视同有 frame 实例，保持旧文案行为
+    for _pos, obj in insts:
+        if getattr(obj, "scope", "frame") == "record":
+            rec_insts.append((_pos, obj))
+        else:
+            has_frame = True
+    ran = frame is not None and dets_arg is not None
+    if not ran or not rec_insts:
+        return [], has_frame, ran
+    from pipe.records import to_record as _to_record
+    from pipe.annotate import _visible as _anno_visible
+    from pipe.conditions import parse_condition as _parse_cond
+    arts = getattr(pipe, "artifacts", None) or {}
+    si = getattr(pipe, "stage_inputs", None) or {}
+    positions = getattr(pipe, "module_positions", None) or {}
+
+    def _trunk_inputs(anno_pos):
+        """主干检出记录（annotate 位置的默认输入）：只统计位置在 annotate 之前的改写
+        （位置即处理序），取其中位置最大者的 .dets 产物——annotate 之后的阶段
+        （如事件尾 seq_filter）不改写 annotate 的输入。"""
+        best, best_pos = None, -1
+        for mid in ("yolo", "det_filter", "seq_filter"):
+            for p_ in (positions.get(mid) or []):
+                if anno_pos is not None and p_ >= anno_pos:
+                    continue
+                a = arts.get(f"{mid}#{p_}.dets")
+                if a is not None and p_ > best_pos:
+                    best, best_pos = a, p_
+        if best is None:  # 位置未知（单插槽直挂回退）→ 短名别名按处理序兜底
+            for mid in ("yolo", "det_filter", "seq_filter"):
+                a = arts.get(f"{mid}.dets")
+                if a is not None:
+                    best = a
+        return best
+
+    stats = []
+    for pos, inst in rec_insts:
+        cap = max(1, int(getattr(inst, "max_records", 32)))
+        inputs = None
+        mapping = (si.get(f"#{pos}") if pos is not None else None) or si.get("annotate") or {}
+        if isinstance(mapping, dict) and mapping.get("dets"):
+            up = arts.get(mapping["dets"])
+            if up is not None:
+                inputs = up
+        if inputs is None:
+            inputs = _trunk_inputs(pos)
+        if inputs is None:
+            inputs = [_to_record(d) for d in (dets_arg or [])]
+        groups = _parse_cond(getattr(inst, "filter", "") or "")
+        matching = sum(1 for _ in _anno_visible(inputs, getattr(inst, "classes", None), groups))
+        stats.append((min(matching, cap), cap, max(0, matching - cap)))
+    return stats, has_frame, ran
+
+
 def _apply_vlm_inputs(pipe, subs):
     """vlm 阶段声明 inputs.dets 时，按指定上游产物重构送审请求（决定"报送哪些检测"）。
 
@@ -1332,11 +1408,21 @@ def h_pipeline_run(p: dict) -> dict:
             _emit("info", f"裁出 {len(crops)} 张{crop_unit}" + (f"（track {tids}）" if tids else ""),
                   ts, stage="target_crop", frame_no=frame_no, log_line=True, prefix="    ")
 
-        # 标注：本帧生成带框图（供 VLM 素材）
+        # 标注：本帧生成带框图（供 VLM 素材）；record 模式逐实例展示出图张数/截断告警
+        # （WO-0022：record 模式 last_annotated 不更新，旧文案会误报「无检出」）
         if "annotate" in _stage_order:
-            vis = getattr(pipe, "last_annotated", None)
-            _emit("info", "已生成标注图" if vis is not None else "无检出，未生成标注图",
-                  ts, stage="annotate", frame_no=frame_no, log_line=True, prefix="    ")
+            _anno_recs, _anno_has_frame, _anno_ran = _annotate_stats(pipe, dets, frame)
+            for _drawn, _cap, _dropped in _anno_recs:
+                _emit("info", f"逐记录出图 {_drawn} 张（上限 {_cap}）", ts,
+                      stage="annotate", frame_no=frame_no, log_line=True, prefix="    ")
+                if _dropped:
+                    _emit("alarm", f"带图记录超上限 {_cap}，截断 {_dropped} 条"
+                                   "（可调高 annotate.max_records 或收紧上游筛选）", ts,
+                          stage="annotate", frame_no=frame_no, log_line=True, prefix="    ")
+            if _anno_has_frame or not _anno_ran:
+                vis = getattr(pipe, "last_annotated", None)
+                _emit("info", "已生成标注图" if vis is not None else "无检出，未生成标注图",
+                      ts, stage="annotate", frame_no=frame_no, log_line=True, prefix="    ")
 
         # VLM 研判：本帧处理内容（真实/模拟研判；未开启回填/端点不可达则展示素材准备）
         if "vlm" in _stage_order and pipe.vlm is not None:
@@ -2152,7 +2238,7 @@ def h_chain(p: dict) -> dict:
     def _tag(stage):
         return f"[{_stage_label(stage)}] "
 
-    def _step_out(frame_no, ts, dets, subs, al):
+    def _step_out(frame_no, ts, dets, subs, al, frame=None):
         """逐模块展示本帧处理内容（不管是否向下传递），每条带帧序数。"""
         if "frame_manager" in _so:
             log.append(_tag("frame_manager") + f"帧#{frame_no} 放行 ts={ts:.2f}s")
@@ -2175,6 +2261,26 @@ def h_chain(p: dict) -> dict:
             tids = [c.track_id for c in crops if getattr(c, "track_id", 0)]
             log.append("    " + _tag("target_crop") + f"帧#{frame_no} 裁出 {len(crops)} 张子图"
                        + (f"（track {tids}）" if tids else ""))
+        # 标注：本帧生成带框图；record 模式逐实例展示出图张数/截断告警（WO-0022，
+        # 此前本 runner 无标注展示；脚本报文无原图帧 → 标注两种模式都不执行）
+        if "annotate" in _so:
+            _anno_recs, _anno_has_frame, _anno_ran = _annotate_stats(pipe, dets, frame)
+            if not _anno_ran:
+                _why = "无原图帧，未处理" if frame is None else "无检出输入，未处理"
+                log.append("    " + _tag("annotate") + f"帧#{frame_no} {_why}")
+            else:
+                for _drawn, _cap, _dropped in _anno_recs:
+                    log.append("    " + _tag("annotate")
+                               + f"帧#{frame_no} 逐记录出图 {_drawn} 张（上限 {_cap}）")
+                    if _dropped:
+                        log.append("    " + _tag("annotate")
+                                   + f"帧#{frame_no} 带图记录超上限 {_cap}，截断 {_dropped} 条"
+                                     "（可调高 annotate.max_records 或收紧上游筛选）")
+                if _anno_has_frame:
+                    _vis = getattr(pipe, "last_annotated", None)
+                    log.append("    " + _tag("annotate")
+                               + (f"帧#{frame_no} 已生成标注图" if _vis is not None
+                                  else f"帧#{frame_no} 无检出，未生成标注图"))
         if "vlm" in _so and pipe.vlm is not None:
             if not subs:
                 log.append("    " + _tag("vlm") + f"帧#{frame_no} 无报送，未处理")
@@ -2228,7 +2334,7 @@ def h_chain(p: dict) -> dict:
             subs = _apply_vlm_inputs(pipe, subs)
             total_det += len(dets or [])
             total_plate += len(getattr(pipe, "last_plates", []))
-            _step_out(n, ts, dets, subs, al)
+            _step_out(n, ts, dets, subs, al, frame=frame)
             if len(images) < 4:
                 canvas = frame.copy()
                 _draw_tracks(canvas, dets or [])
@@ -2261,7 +2367,7 @@ def h_chain(p: dict) -> dict:
             cv2.putText(canvas, pl.plate_no, (px1, max(py1 - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         images.append({"title": "检测标注（蓝=目标框, 绿=车牌框）", "data": _img_data_url(canvas)})
-        _step_out(0, 0.0, dets, subs, al)
+        _step_out(0, 0.0, dets, subs, al, frame=frame)
     else:
         script = str(p.get("script", ""))
         lines = [l for l in script.splitlines() if l.strip() and not l.strip().startswith("#")]
