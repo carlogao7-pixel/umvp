@@ -24,6 +24,11 @@
 
 <!-- 新条目追加在此行下方，最新在上 -->
 
+- [2026-10-23][INB-0081][pipe-chain][成果] 修复 INB-0080（WO-0020.4）：PlateResult.to_dict() 对 plate_crop_bbox=None 防御（有值才放键，与 car_bbox 同语义），链路正常路径两字段由 Cropper.extract 成对产出故零影响；排查 FaceResult 全字段必填无同类边界；test_image_source 73 断言 / plate 回归 28 / face_vehicle_overlay 27 全绿
+
+- [2026-10-23][INB-0080][qa][坑] qa 复验 WO-0020 发现回归：test_image_source.py 崩溃——PlateResult 有 plate_img 但 plate_crop_bbox=None（合法组合）时 PlateResult.to_dict() list(None) 抛 TypeError；WO-0020.2 新增 _plate_record adapter 调 to_dict() 首次暴露此组合（此前 to_dict 仅链路内调用、字段恒有值）
+  → 归属 umvp/plate_recog/plate_recognizer.py to_dict()（93-94 行未防御 None）或 adapter 改直构 dict，@orchestrator 转派 pipe-chain；复现：conda run -n ai python tests/test_image_source.py（records_checks 第 92 行 rp = to_record(p)）
+
 - [2026-10-23][INB-0079][pipe-chain][成果] WO-0020.2 face_detect.faces/plate_recog.plates 产物归一为 dict Record：FaceResult/PlateResult 注册 @register_adapter（face 补 kind/bbox=face_bbox/label='face'/face_img→image；plate 补 kind/label=text=plate_no/plate_img→image），composer 登记产物时 to_record+注入 ts/frame_idx——产物表（artifacts）从此统一 dict 记录，last_faces/last_plates 保持对象形态（web_lab 驱动层读属性零回归）；annotate 标签优先读记录 label 通用字段（人脸框标 face，det 无 label 走 COCO 名零回归）。test_face_vehicle_overlay 临时断言已翻转（人脸框画出，e2e 27 断言绿）
   → 全量回归绿：composer120/annotate23/image_source72/det_filter72/seq_filter50/target_crop45/cropper26/face_capture63/face_extract28/plate28/validate_chain34/port_inputs62/police_uav两套；证据图 tests/data/out/overlay_evidence/（annotateB_vehicle.png 人脸+车辆框同图，视觉核验通过）。doc/modules（face_detect/plate_recog/annotate/INDEX 通用语）与 .claude 组装文档的产物形态描述待 /curate 同步
 
