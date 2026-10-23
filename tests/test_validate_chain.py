@@ -373,6 +373,75 @@ def test_inputs_old_spec_no_error_no_warn():
         assert errs == [] and w == [], (mods, errs, w)
 
 
+# ---------------- annotate 双模式（WO-0021：scope + record 连线合法性） ----------------
+
+def _rec_chain(scope_at_3="record", inputs_at_4=None, extra_params=None):
+    """fm→yolo→det_filter→annotate#3→annotate#4→seq_filter；可调 #3 scope 与 #4 连线。"""
+    mods = ["frame_manager", "yolo", "det_filter", "annotate", "annotate", "seq_filter"]
+    spec = _port_chain({}, mods)
+    p3 = {"thickness": 2, "scope": scope_at_3}
+    if extra_params:
+        p3.update(extra_params)
+    spec["stages"][3]["params"] = p3
+    if inputs_at_4 is not None:
+        spec["stages"][4]["inputs"] = inputs_at_4
+    return spec
+
+
+def test_annotate_scope_record_valid():
+    # record 实例的带图流被下游实例连线（全名）→ 合法（零 error 零 warning）
+    spec = _rec_chain("record", {"dets": "annotate#3.annotated_records"})
+    errs, w = _warns(spec)
+    assert errs == [] and w == [], (errs, w)
+
+
+def test_annotate_scope_short_name_ambiguous_still_rejected():
+    # 多实例短名歧义照常被 P2-0 规则⑥拦（"不猜"优先于 scope 匹配）
+    spec = _rec_chain("record", {"dets": "annotate.annotated_records"})
+    errs, w = _warns(spec)
+    assert any("歧义" in e and "全名" in e for e in errs), errs
+    assert w == [], w
+
+
+def test_annotate_scope_record_frame_artifact_rejected():
+    # record 实例不产帧级标注图：连 annotate#3.annotated → 错（提示用 annotated_records）
+    spec = _rec_chain("record", {"dets": "annotate#3.annotated"})
+    errs, w = _warns(spec)
+    assert any("record" in e and "annotated_records" in e for e in errs), errs
+    assert w == [], w
+
+
+def test_annotate_scope_default_records_artifact_rejected():
+    # 缺省 frame 实例不产带图流：连 annotate.annotated_records → 错（提示开 record 或连 annotated）
+    spec = _rec_chain("frame", {"dets": "annotate#3.annotated_records"})
+    errs, w = _warns(spec)
+    assert any("annotated_records" in e and "record" in e for e in errs), errs
+    # 显式 scope=frame 同样拦
+    spec = _rec_chain("frame", {"dets": "annotate.annotated_records"})
+    errs, _ = _warns(spec)
+    assert any("annotated_records" in e for e in errs), errs
+
+
+def test_annotate_scope_invalid_value_rejected():
+    # scope 非法取值（经参数表 options 校验）
+    errs, _ = _warns(_rec_chain("banana"))
+    assert any("scope" in e and "不在允许值" in e for e in errs), errs
+
+
+def test_annotate_max_records_nonpositive_rejected():
+    # max_records 必须 ≥ 1
+    errs, _ = _warns(_rec_chain("record", extra_params={"max_records": 0}))
+    assert any("max_records" in e for e in errs), errs
+    errs, _ = _warns(_rec_chain("record", extra_params={"max_records": 8}))
+    assert errs == [], errs
+
+
+def test_annotate_scope_omitted_old_spec_ok():
+    # 旧 spec（无 scope / 无 inputs）：零 error 零 warning（零回归）
+    errs, w = _warns(_rec_chain(None, None))
+    assert errs == [] and w == [], (errs, w)
+
+
 def _with(idx, mid, patch):
     stages = list(BASE_PLATE)
     params = dict(stages[idx][1])

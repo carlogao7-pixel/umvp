@@ -53,6 +53,7 @@ from pipe.composer import (  # noqa: E402
     Detection,
     PortResolutionError,
 )
+from pipe.records import image_set_of  # noqa: E402
 
 PASS = 0
 
@@ -88,9 +89,10 @@ def decl_checks() -> None:
     check("decl: target_crop 吃 frame:Image+dets:Records 出 crops:Records",
           decl["target_crop"]["inputs"] == {"frame": "Image", "dets": "Records"}
           and decl["target_crop"]["outputs"] == {"crops": "Records"})
-    check("decl: annotate 吃 image:Image+dets:Records 出 annotated:Image",
+    check("decl: annotate 吃 image:Image+dets:Records 出双模式产物（WO-0021）",
           decl["annotate"]["inputs"] == {"image": "Image", "dets": "Records"}
-          and decl["annotate"]["outputs"] == {"annotated": "Image"})
+          and decl["annotate"]["outputs"] == {"annotated": "Image",
+                                              "annotated_records": "Records"})
     check("decl: face_detect 吃 frame:Image+crops:Records 出 faces:Records",
           decl["face_detect"]["inputs"] == {"frame": "Image", "crops": "Records"}
           and decl["face_detect"]["outputs"] == {"faces": "Records"})
@@ -123,6 +125,11 @@ def decl_checks() -> None:
           and ARTIFACT_TYPES[ARTIFACT_ANNOTATED] == "Image"
           and ARTIFACT_TYPES[ARTIFACT_DETS] == "Records"
           and ARTIFACT_TYPES[ARTIFACT_CROPS] == "Records")
+    # annotate 双模式产物（WO-0021）：annotated_records 静态在表（Records）
+    from pipe.composer import ARTIFACT_ANNOTATED_RECORDS
+    check("decl: annotate.annotated_records 在产物类型表（Records，WO-0021）",
+          ARTIFACT_TYPES.get(ARTIFACT_ANNOTATED_RECORDS) == "Records",
+          str(ARTIFACT_TYPES.get(ARTIFACT_ANNOTATED_RECORDS)))
 
 
 # ==================== 2. _chain_from_spec：stage_inputs 透传 ====================
@@ -487,6 +494,74 @@ def multi_instance_checks() -> None:
           True, "det_filter#2.dets ×2 下游")
 
 
+# ==================== 8. annotate 双模式（WO-0021）：record 产物连线端到端 ====================
+
+def _rec_spec() -> dict:
+    """fm→yolo→det_filter→annotate#3(record)→annotate#4(frame)→seq_filter。
+
+    #4 显式连线 inputs.dets = annotate#3.annotated_records（逐记录带图流）——
+    验证 record 产物在运行时可被后续实例经连线消费（同模块后续实例天然位于其上游）。
+    """
+    return {"name": "qa-anno-record", "stages": [
+        {"module_id": "frame_manager",
+         "params": {"sampling": "analysis", "frame_skip": 1}},
+        {"module_id": "yolo", "params": {"model_path": "models/yolov8n.pt", "classes": "0"}},
+        {"module_id": "det_filter", "params": {"filter": "score >= 0.5"}},
+        {"module_id": "annotate", "params": {"scope": "record", "max_records": 32}},
+        {"module_id": "annotate", "params": {"thickness": 2},
+         "inputs": {"dets": "annotate#3.annotated_records"}},
+        {"module_id": "seq_filter", "params": {"throttle": "", "change": "", "rules": ""}},
+    ]}
+
+
+def annotate_record_checks() -> None:
+    import numpy as np
+
+    pipe = server._chain_from_spec(_rec_spec())
+    check("record 连线: 装配出两个 annotate 实例（位置 3/4）",
+          [p for p, _ in pipe.annotators] == [3, 4],
+          str([p for p, _ in pipe.annotators]))
+    check("record 连线: #3 实例 scope=record 装配生效",
+          getattr(pipe.annotators[0][1], "scope", None) == "record")
+    check("record 连线: stage_inputs 位置键归一为全名",
+          pipe.stage_inputs == {"#4": {"dets": "annotate#3.annotated_records"}},
+          str(pipe.stage_inputs))
+
+    # #4 换间谍捕获入参（#3 保持真模块产带图记录；帧用真 ndarray 供 #3 裁帧复制）
+    spy = _AnnoSpy()
+    pipe.annotators = [(pos, spy if pos == 4 else obj) for pos, obj in pipe.annotators]
+    frame = np.zeros((60, 80, 3), np.uint8)
+    dets = [Detection(track_id=d.track_id, cls_id=d.cls_id, bbox=d.bbox, score=d.score)
+            for d in _RAW]
+    pipe.step(0, 0.0, dets=dets, frame=frame, force=True)
+
+    # #3 产物：过滤后 2 条、每条带整帧图（60×80）
+    recs = pipe.artifacts.get("annotate#3.annotated_records")
+    check("record 连线: #3 登记带图记录流（全名路径）",
+          isinstance(recs, list) and len(recs) == 2, str(type(recs)))
+    check("record 连线: #3 产物每条 image 为整帧尺寸",
+          all(np.asarray(image_set_of(r)[0]).shape == frame.shape for r in recs))
+    check("record 连线: #3 不产帧级 annotated（record 模式）",
+          "annotate#3.annotated" not in pipe.artifacts
+          and "annotate.annotated" not in pipe.artifacts)
+
+    # #4（frame 模式）经连线确实收到 #3 的带图记录（端到端证据：与主干 dets 不同——
+    # 主干元素无 image 键，#4 收到的元素有）
+    assert len(spy.calls) == 1, f"#4 应被调用一次，实为 {len(spy.calls)}"
+    got = spy.calls[0]["dets"]
+    check("record 连线: #4 收到 2 条记录（det_filter 过滤后）",
+          sorted(d["score"] for d in got) == [0.7, 0.9],
+          str(sorted(d["score"] for d in got)))
+    check("record 连线: #4 收到的元素带 image（图随记录走）",
+          all(image_set_of(d) for d in got))
+    check("record 连线: #4 收到的图即 #3 产物（同一对象透传）",
+          all(any(image_set_of(d)[0] is image_set_of(r)[0] for r in recs) for d in got))
+    check("record 连线: 主干不被带图流替换（yolo.dets 无 image 键）",
+          all("image" not in d for d in pipe.artifacts["yolo#1.dets"]))
+    check("record 连线: last_annotated 取最后 frame 实例产物（#4 spy 返回值）",
+          pipe.last_annotated == ("ANNOTATED", spy.calls[0]["image"]))
+
+
 def main() -> None:
     print("== 1. module_port_decls：模块自描述端口声明 ==")
     decl_checks()
@@ -502,6 +577,8 @@ def main() -> None:
     vlm_dets_checks()
     print("== 7. 同模块多实例（P2-0 验收） ==")
     multi_instance_checks()
+    print("== 8. annotate 双模式（WO-0021）：record 产物连线端到端 ==")
+    annotate_record_checks()
     print(f"\n全部通过: {PASS} 项断言")
 
 
