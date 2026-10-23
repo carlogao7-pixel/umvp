@@ -91,7 +91,8 @@ class PlateResult:
             d["car_bbox"] = list(self.car_bbox)
             d["upscale"] = self.upscale
         if self.plate_img is not None:
-            d["plate_crop_bbox"] = list(self.plate_crop_bbox)
+            if self.plate_crop_bbox is not None:
+                d["plate_crop_bbox"] = list(self.plate_crop_bbox)
             d["plate_img_size"] = [int(self.plate_img.shape[1]), int(self.plate_img.shape[0])]
         return d
 
