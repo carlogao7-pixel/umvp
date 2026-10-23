@@ -1,6 +1,8 @@
 # 拼接层端口协议（设计稿）
 
 > 状态：✅ **三步全部实施（2026-10-16）**：第 0 步 WO-0002.1、第 1 步 WO-0002.2、第 2 步 WO-0002.3。
+> ✅ **WO-0021（2026-10-23）增补**：§9 标注双模式（scope，已实施）、§10 帧级数据通用约定
+> （只约定，暂无生产者）、§11 VLM 图像源统一进端口（只定案，实施待启动）。
 > 后续跟进：✅ **WO-0003（2026-10-16）图集与送审**——`records.image_set_of`/`image_of`、
 > `target_crop.crops` 记录化、`plate_recog`/`face_detect`/`vlm.dets` 纳入 `inputs` 解析、
 > `vlm.image_pick` 多图送审（见 §3⑥）。需求来源：
@@ -245,5 +247,94 @@ target_crop/annotate←frame+dets；plate_recog/face_detect←frame+`last_crops`
    后续路线，本版执行仍为线性。
 4. **低清图**：**暂不管**——本阶段不设计 `frame_lowres` 之类生产者，第 1 步 `image_source`
    先只覆盖 `frame / annotated / crops`。
+5. **（2026-10-23，WO-0021）标注双模式**：`annotate` 增 `scope` 参数——`frame`（默认，
+   现状零回归）/ `record`（逐记录带整帧图）。record 模式**仅登记 Records 产物、主干 dets
+   不动**（最小惊讶：与「标注不动主干」现状语义一致；下游显式连线取）。单帧带图记录数上限
+   `max_records=32`（依据见 §9）。
+6. **（2026-10-23，WO-0021）帧级记录型数据**：单条 `kind="frame"` 记录，作为**独立
+   Records 产物**（独立数据流，不混入 dict 主干）；理由与约定见 §10。
+7. **（2026-10-23，WO-0021）VLM 图像源统一进端口**：`vlm.inputs.image` 解禁 +
+   `image_source` 退役映射（§11）——**本稿只定案，实施拆后续工单**。
 
 **剩余未决**：第 2 步设计器连线 UI 的改动量评估（届时由 web 板块给出）。
+
+## 9. 标注双模式（scope，WO-0021 定案 2026-10-23，已实施）
+
+### 9.1 参数与语义
+
+| 参数 | 取值 | 语义 |
+|---|---|---|
+| `scope` | `frame`（默认） | **现状**：帧副本上画全部上游框，产帧级 `annotated`（Image）。零回归。 |
+| | `record` | **逐记录**：每条记录单独一张**整帧**图、只画该记录自己的框；图挂该记录 `image` 旁路（浅拷贝记录，不污染上游），记录流**透传**输出为 Records 产物 `annotate.annotated_records`。下游 `inputs.dets` 接它即图随记录走（`image_set_of` 读取）。`filter`/`classes` 只决定**画不画图**（不满足的记录原样透传、不带图）——删记录是 `det_filter` 的职责，标注不改记录流内容。 |
+| `max_records` | 32（默认，仅 record 模式生效） | 单帧带图记录数上限；超限**截断**（保留前 N 条）并打告警日志（stderr）。 |
+
+### 9.2 产物形态与「主干不动」定案
+
+- **OUTPUTS 双类型处理**：类属性声明双产物——`OUTPUTS = {"annotated": "Image",
+  "annotated_records": "Records"}`；**运行时按 scope 只登记其一**
+  （frame → `annotated`；record → `annotated_records`）。
+- **产物名分立而非同名变型**：端口协议的类型是静态表（`ARTIFACT_TYPES`），同名产物随
+  scope 变型会让校验器无法静态判型，故 record 流用独立产物名。
+- **主干不动（最小惊讶）**：record 模式只登记产物，**不替换主干 dets**——与「标注不动
+  主干」现状语义一致；带图记录流只能被**显式连线**消费（`inputs.dets =
+  "annotate[#k].annotated_records"`）。主干继续供事件汇总（`collect_events`）、报送分组、
+  plate/face 等既有消费者按原语义使用，不被带图流污染。
+- **last_annotated**：仅 frame 模式实例更新（= 最后一个 frame 实例的产物图，无则 None）；
+  record 实例不影响（无单一"标注图"概念）。纯 record 链上驱动层 `image_source=annotated`
+  走既有回退逻辑（回退原帧并标注来源），无需改。
+- **多实例混链**：record 实例不更新 `cur_img`（无单图）；其后实例的默认 `image` 回退
+  上一 frame 实例的图 / 本帧原帧；其后实例可经 `inputs.dets` 连接前一 record 实例的
+  `annotated_records`（同模块后续实例在运行时顺序上天然位于其上游）。
+- **运行时顺序说明**：`Pipeline.step` 内 annotate 是最后执行的视觉阶段，跨模块"运行时
+  下游"目前不存在；record 流的现实消费者 = 驱动层（读产物表）与同模块后续实例连线，
+  跨模块消费随 §11 VLM 端口统一 / §10 帧级数据生产者落地。
+
+### 9.3 上限依据（`max_records=32`）
+
+1. **对照检出上限**：YOLO `max_det` 默认 300 是**纯推理**检出上限；record 模式消费的是
+   经 `det_filter`/`seq_filter` 筛选后的报送级记录流，常态个位数——上限防的是筛选全开的
+   退化场景，不必对齐 300。
+2. **内存估算**：整帧图 1280×720×3 B ≈ 2.8 MB/张；32 张 ≈ 88 MB 单帧峰值旁路内存
+   （图像走旁路不进 JSON），可承受；若 300 张全画 ≈ 830 MB/帧，不可承受。
+3. **下游消费量级**：VLM 多图送审一般 ≤ 20 张/请求、驱动层落盘 `max_saved_images=200`
+   ——两位数上限与下游量级匹配且留余量。
+
+## 10. 帧级数据通用约定（WO-0021 定案 2026-10-23；**只约定，暂无生产者**）
+
+帧级数据三类载体，**全走产物表 + 端口协议，不新增机制**：
+
+| 载体 | 产物类型 | 形态 | 现状 |
+|---|---|---|---|
+| 图像 | Image | 原帧（`frame_manager.frame`）、整帧标注图（`annotate.annotated`） | ✅ 现状即如此 |
+| 记录型 | Records | **单条 `kind="frame"` 记录，作为独立 Records 产物**（独立数据流，不混入 dict 主干） | 无生产者（首个预期 = 未来 VLM 全帧研判） |
+| 向量 | Vector | `face_embed.embeddings` 先例 | ✅ |
+
+- **记录型走独立流的理由**：主干语义 = **逐目标记录**（bbox/track/count；YOLO、
+  det_filter、seq_filter、target_crop 全按逐目标假设消费）——帧级数据混入主干会迫使
+  全链路模块加 `kind` 过滤、污染统计（计数/成组判定/事件收集都把"帧记录"误当目标）；
+  独立流零污染、消费显式（连线声明即用）、与产物表的帧作用域自洽。
+- **事件汇总纳入**（约定入稿；行为改动随首个生产者实施）：链尾事件汇总从
+  `collect_events(主干)` 扩为**显式纳入帧记录携带的事件**（帧记录可经 `add_event`
+  携带 events）。
+- **生产者约定**：任何模块可产帧记录——OUTPUTS 声明 Records 产物、内容为单条
+  `kind="frame"` 记录；产物命名归属**生产阶段名下**（如 `vlm.frame_assessment`），
+  首个预期生产者 = 未来 VLM 全帧研判。
+
+## 11. VLM 图像源统一进端口（第二子项，WO-0021 定案 2026-10-23；**只定案，实施待启动**）
+
+- **解禁 `vlm.inputs.image`**：可接帧级 Image 产物——`annotate.annotated`（带框图）、
+  `frame_manager.frame`（原帧）。`image_source=crops` 的裁剪图集**不经** `inputs.image`
+  （其为 Records 语义），已由 `inputs.dets` + `image_pick` 覆盖。
+- **`image_source` 退役映射表**（退役时 validate_chain 对旧值报错并提示映射）：
+
+| 旧值 | 新 spec 等价写法 | 说明 |
+|---|---|---|
+| `annotated`（默认） | `inputs.image = "annotate.annotated"` | 需 annotate 在上游；旧语义"无 annotate 回退原帧"→ 端口语义为"未声明 inputs 按默认取原帧"，等价 |
+| `frame` | `inputs.image = "frame_manager.frame"` | 直接映射 |
+| `crops` | **无需映射** | 已由 `inputs.dets`（选报送检测集）+ `image_pick`（first/all）覆盖；退役时报错提示改连线 |
+
+- **旧 spec 零回归**：`image_source` 未删除前旧 spec 照跑（现状语义不变）。
+- **校验断言变更预告**：`vlm.inputs` 白名单从 `{dets}` 放开为 `{dets, image}`；
+  `inputs.image` 与 `image_source` **同时声明 → 报错**（避免双机制，与 §3③ 精神一致）；
+  终态 `image_source` 从 PARAMS / `VLM_IMAGE_SOURCES` 移除。
+- **实施待用户或后续工单启动**（WO-0021 本轮不实施）。
