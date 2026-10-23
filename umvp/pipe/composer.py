@@ -809,20 +809,6 @@ class Pipeline:
                                [to_record(c) for c in cur_crops], len(crop_insts))
             self.last_crops = cur_crops
 
-        # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）。多实例链式：下一实例
-        # 默认 image 取上一实例标注图（单实例默认仍为本帧原图，零回归）。
-        self.last_annotated = None
-        anno_insts = self._stage_instances("annotate")
-        if anno_insts and frame is not None and dets is not None:
-            cur_img = frame
-            for pos, an in anno_insts:
-                anno_img = self._port_at(pos, "annotate", an, "image", cur_img)
-                anno_dets = self._port_at(pos, "annotate", an, "dets", dets)
-                cur_img = an.run(anno_img, anno_dets, ts)
-                if cur_img is not None:
-                    self._register("annotate", pos, "annotated", cur_img, len(anno_insts))
-            self.last_annotated = cur_img
-
         vlm_insts = self._stage_instances("vlm")
         vlm = vlm_insts[0][1] if vlm_insts else None
         if yolo is not None:
@@ -868,6 +854,21 @@ class Pipeline:
             self.last_face_input = list(face_crops)
             self.last_faces = list(fc.run(face_frame, face_crops, ts))
             self._register("face_detect", pos, "faces", self.last_faces, len(face_insts))
+        # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）。多实例链式：下一实例
+        # 默认 image 取上一实例标注图（单实例默认仍为本帧原图，零回归）。
+        # 位置在 plate_recog/face_detect 之后（呈现后于识别）：标注可经 inputs 连线消费
+        # 人脸/车牌产物画框（如 face_detect.faces），否则连线产物不在本帧产物表。
+        self.last_annotated = None
+        anno_insts = self._stage_instances("annotate")
+        if anno_insts and frame is not None and dets is not None:
+            cur_img = frame
+            for pos, an in anno_insts:
+                anno_img = self._port_at(pos, "annotate", an, "image", cur_img)
+                anno_dets = self._port_at(pos, "annotate", an, "dets", dets)
+                cur_img = an.run(anno_img, anno_dets, ts)
+                if cur_img is not None:
+                    self._register("annotate", pos, "annotated", cur_img, len(anno_insts))
+            self.last_annotated = cur_img
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
         # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
         self.last_events = (collect_events(dets) if dets else []) + plate_events
