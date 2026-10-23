@@ -1,0 +1,24 @@
+{
+  "name": "演示·人脸车辆同图画框",
+  "description": "YOLO 识人车 → 目标裁剪(人) → 人脸检测 → 标注A(人脸框) → 标注B(叠画车辆框)。端口连线(inputs)实战样例：标注A.dets←face_detect#3.faces；标注B.image←annotate#4.annotated 接力底图(同模块多实例须全名)、标注B.dets←yolo#1.dets 原始检出。末段空 det_filter 为事件尾（链路输出=事件，终段白名单要求）。",
+  "streams": 1,
+  "stages": [
+    {"module_id": "frame_manager",
+     "params": {"sampling": "analysis", "frame_skip": 1, "backpressure": "standard"}},
+    {"module_id": "yolo",
+     "params": {"model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
+                "imgsz": 1280, "max_det": 300, "classes": "0,2", "device": ""}},
+    {"module_id": "target_crop",
+     "params": {"classes": "0"}},
+    {"module_id": "face_detect",
+     "params": {"det_thresh": 0.4, "det_size": "640,640"}},
+    {"module_id": "annotate",
+     "params": {"thickness": 2, "show_label": true},
+     "inputs": {"dets": "face_detect#3.faces"}},
+    {"module_id": "annotate",
+     "params": {"thickness": 2, "show_label": true, "filter": "cls_id == 2"},
+     "inputs": {"image": "annotate#4.annotated", "dets": "yolo#1.dets"}},
+    {"module_id": "det_filter",
+     "params": {"filter": ""}}
+  ]
+}
