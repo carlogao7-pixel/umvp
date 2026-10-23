@@ -2506,15 +2506,16 @@ PARAMS = {
                  "test_only": True, "help": "测试页按该框裁剪"},
     },
     "annotate": {
-        "scope": {"label": "标注产物形态", "type": "select", "default": "frame",
-                  "options": ["frame", "record"],
-                  "help": "frame=帧级：整帧一张标注图（默认，现状）；"
-                          "record=逐记录：每条记录单独一张整帧图、只画自己的框，"
-                          "图挂记录 image 旁路，记录流作为 Records 产物 "
-                          "（annotate.annotated_records）供下游连线取用"},
-        "max_records": {"label": "单帧记录上限（record 模式）", "type": "int", "default": 32,
-                        "help": "record 模式下单帧最多产出的带图记录数，超限截断并告警"
-                                "（整帧图约 2.8MB/张@720p，32 张≈88MB 峰值）"},
+        "scope": {"label": "标注出图方式", "type": "select", "default": "frame",
+                  "options": [{"value": "frame", "label": "整帧一张"},
+                              {"value": "record", "label": "逐记录出图"}],
+                  "help": "整帧一张：本帧所有框画在同一张图上（默认，原有行为）；"
+                          "逐记录出图：每个目标单独一张整帧图、只画自己的框，"
+                          "下游阶段连线取 annotate.annotated_records 才能收到这些带图记录"},
+        "max_records": {"label": "单帧出图上限（逐记录模式）", "type": "int", "default": 32,
+                        "show_if": {"key": "scope", "eq": "record"},
+                        "help": "逐记录出图时单帧最多出多少条带图记录，超出截断并写告警日志"
+                                "（每张整帧图约 2.8MB@720p，32 张约 88MB 内存峰值）"},
         "thickness": {"label": "框线粗细（像素）", "type": "int", "default": 2,
                       "help": "画框的线宽"},
         "show_label": {"label": "显示类别标签", "type": "bool", "default": True,
@@ -3507,6 +3508,11 @@ _SEED_STANDALONE = [
         "out_size": "", "margin": 0.0,
         "classes": "", "filter": ""}),
     ("annotate", "标注·默认", {
+        "thickness": 2, "show_label": True, "classes": "", "filter": ""}),
+    # 标注双模式示范（WO-0021）：逐记录出图——每个目标单独一张整帧图只画自己框，
+    # 下游连线取 annotate.annotated_records；给设计器用户一个可直接选用的起点
+    ("annotate", "标注·逐记录示范", {
+        "scope": "record", "max_records": 32,
         "thickness": 2, "show_label": True, "classes": "", "filter": ""}),
     ("plate_recog", "车牌识别·默认", {
         "detect_level": "high", "mode": "crop", "margin": 0.1,

@@ -485,7 +485,15 @@ function fillForm(scope, params){
     const el = scope.querySelector('[data-name="' + k + '"]');
     if (!el) continue;
     if (el.dataset.type === "bool") el.checked = !!v;
-    else el.value = v === null || v === undefined ? "" : String(v);
+    else if (v === null || v === undefined){
+      // preset 缺值（如 schema 新增参数列后的旧 preset NULL）→ 回 schema 默认，
+      // 避免 select 失配显示空白、数值框空着让人困惑
+      el.value = el.dataset.default || "";
+      if (el.tagName === "SELECT" && el.value !== ""
+          && !Array.from(el.options).some(o => o.value === el.value))
+        el.value = el.options.length ? el.options[0].value : "";
+    }
+    else el.value = String(v);
   }
 }
 
@@ -775,7 +783,9 @@ async function loadModulePreset(){
   const p = data.preset;
   modulePresetId = p.id;  // 绑定：改参数保存即更新这条
   if (p.module_id && p.module_id !== current) select(p.module_id);
-  fillForm(document.getElementById("form"), p.params);
+  const form = document.getElementById("form");
+  fillForm(form, p.params);
+  applyShowIf(form);  // 程序赋值不触发 change，需手动联动 show_if 显隐
   try{  // 估算随载入参数更新
     const r = await fetch("/api/pipeline/estimate", {
       method: "POST",
