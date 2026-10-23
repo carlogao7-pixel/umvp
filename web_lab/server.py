@@ -1853,7 +1853,9 @@ def _build_stage_instance(mid: str, p: dict):
         return Annotator(thickness=_int(p, "thickness", 2),
                          show_label=_bool(p, "show_label"),
                          classes=_int_list(p, "classes", None),
-                         filter=_str_param(p, "filter"))
+                         filter=_str_param(p, "filter"),
+                         scope=_str_param(p, "scope") or "frame",
+                         max_records=_int(p, "max_records", 32))
     if mid in ("face_detect", "extract_faces"):
         return _build_face_stage(p)
     if mid == "plate_recog":
@@ -2504,6 +2506,15 @@ PARAMS = {
                  "test_only": True, "help": "测试页按该框裁剪"},
     },
     "annotate": {
+        "scope": {"label": "标注产物形态", "type": "select", "default": "frame",
+                  "options": ["frame", "record"],
+                  "help": "frame=帧级：整帧一张标注图（默认，现状）；"
+                          "record=逐记录：每条记录单独一张整帧图、只画自己的框，"
+                          "图挂记录 image 旁路，记录流作为 Records 产物 "
+                          "（annotate.annotated_records）供下游连线取用"},
+        "max_records": {"label": "单帧记录上限（record 模式）", "type": "int", "default": 32,
+                        "help": "record 模式下单帧最多产出的带图记录数，超限截断并告警"
+                                "（整帧图约 2.8MB/张@720p，32 张≈88MB 峰值）"},
         "thickness": {"label": "框线粗细（像素）", "type": "int", "default": 2,
                       "help": "画框的线宽"},
         "show_label": {"label": "显示类别标签", "type": "bool", "default": True,

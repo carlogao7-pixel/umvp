@@ -19,9 +19,12 @@
      DAG 校验——产物名（短名/全名）须在 ARTIFACT_TYPES、端口须在该模块 INPUTS 声明、
      引用须指向**上游阶段**（全名按位置判定）、类型匹配、每端口单一上游（fan_in=0 时
      值须字符串；多实例短名歧义报错要求写全名）。**可连线端口清单与"未纳入解析"名单均
-     从 server.CHAIN_RESOLVED_PORTS 推导**，不再硬编码。`vlm.inputs` 只允许 `dets`；
-     `vlm.inputs.image` 不接受（图片源统一由 vlm 参数 image_source 管），提示改用 image_source。
-     未声明 inputs 的旧 spec 不报错不警告。
+      从 server.CHAIN_RESOLVED_PORTS 推导**，不再硬编码。`vlm.inputs` 只允许 `dets`；
+      `vlm.inputs.image` 不接受（图片源统一由 vlm 参数 image_source 管），提示改用 image_source。
+      annotate 双模式（WO-0021）：scope ∈ {frame, record}（经参数表 options 校验）、
+      max_records ≥ 1；连线产物与该 annotate 实例 scope 匹配（record 实例不产
+      annotated、frame 实例不产 annotated_records，连线期拦截）。
+      未声明 inputs 的旧 spec 不报错不警告。
   6) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
      - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
        （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
@@ -65,6 +68,7 @@ TERMINAL_OK = {"det_filter", "seq_filter", "plate_recog", "face_detect", "face_e
 _NUM_RULES = {
     ("yolo", "conf"): (0.0, 1.0), ("yolo", "iou"): (0.0, 1.0),
     ("frame_manager", "frame_skip"): (1, None),
+    ("annotate", "max_records"): (1, None),  # record 模式单帧带图记录上限（WO-0021）
 }
 
 
@@ -119,7 +123,8 @@ def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
 
 
 def _validate_stage_inputs(i: int, mid: str, st: dict, upstream_ids: list,
-                           positions_by_module: dict, decl: dict, warns: list) -> list:
+                           positions_by_module: dict, decl: dict, warns: list,
+                           anno_scope_by_idx: dict | None = None) -> list:
     """校验阶段 inputs 连线（P5 第 2 步 DAG 规则，P2-0 位置化）。返回 error 列表。
 
     规则（设计稿 §3④/§3.4，逐条可读报错）：
@@ -128,7 +133,10 @@ def _validate_stage_inputs(i: int, mid: str, st: dict, upstream_ids: list,
       ③ 端口须在该模块 INPUTS 声明中（非法端口 → 错）；
       ④ 引用须指向**上游阶段**（全名按位置：位置须 < 本阶段下标；短名须为上游模块 → 错）；
       ⑤ 类型匹配：产物类型 vs 模块 INPUTS[端口]（不匹配 → 错）；
-      ⑥ 短名在多实例下歧义 → 报错要求写全名（resolve_artifact）。
+      ⑥ 短名在多实例下歧义 → 报错要求写全名（resolve_artifact）；
+      ⑦ annotate 双模式产物与该实例 scope 匹配（WO-0021）：连 `annotate.annotated`
+        （帧级标注图）要求该实例 scope≠record；连 `annotate.annotated_records`（逐记录
+        带图流）要求该实例 scope=record——产物名静态在表，产不产由 scope 定，连线期拦截。
     同一产物被多个下游引用**允许**（分支留路，不报警）。
     对本期未纳入解析的阶段（见 server.CHAIN_UNRESOLVED_INPUT_MODULES）：写了 inputs
     只给非致命警告；本期该名单已为空（plate_recog/face_detect/vlm.dets 均已解析）。
@@ -182,6 +190,19 @@ def _validate_stage_inputs(i: int, mid: str, st: dict, upstream_ids: list,
                 continue
             head, _dot, _tail = full.partition(".")
             producer, _hash, pos_str = head.partition("#")
+            # ⑦ annotate 双模式：产物须与该实例 scope 匹配（WO-0021，设计稿 §9）。
+            #    产物名静态在 ARTIFACT_TYPES，但"产不产"由该 annotate 实例的 scope 决定。
+            if producer == "annotate" and pos_str.isdigit() and anno_scope_by_idx:
+                scope = str(anno_scope_by_idx.get(int(pos_str)) or "frame").strip().lower()
+                short = artifact_short(a)
+                if short == "annotate.annotated" and scope == "record":
+                    errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用 {a!r}：该 annotate "
+                                f"实例为 record 模式，不产帧级标注图 annotate.annotated"
+                                f"（逐记录带图流请连线 annotate.annotated_records）")
+                elif short == "annotate.annotated_records" and scope != "record":
+                    errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用 {a!r}：该 annotate "
+                                f"实例未开 record 模式（scope={scope or 'frame'}），不产 "
+                                f"annotate.annotated_records（帧级标注图请连线 annotate.annotated）")
             if pos_str.isdigit():
                 if int(pos_str) >= i:
                     errs.append(f"stages[{i}] {mid}.inputs[{port!r}] 引用 {a!r} 不是上游产物"
@@ -260,14 +281,18 @@ def validate(spec: dict, warnings: list | None = None) -> list[str]:
     # 6) 端口连线 DAG 校验（P5 第 2 步 + P2-0 位置化）：inputs={端口: 上游产物名}。
     #    未声明 inputs 的旧 spec 不报错不警告（零回归）；端口声明与类型取模块 INPUTS 声明。
     #    仅对已注册产品模块校验（未知/隐藏模块已在第 4 步报错，避免重复噪声）。
+    #    annotate 的 scope 按实例下标收集（产物↔scope 匹配检查用，WO-0021）。
     decl = module_port_decls()
     positions_by_module = _positions_by_module(ids)
+    anno_scope_by_idx = {i: (st.get("params") or {}).get("scope")
+                         for i, st in enumerate(stages)
+                         if st.get("module_id") == "annotate"}
     for i, st in enumerate(stages):
         mid = st.get("module_id")
         if not mid or mid not in MODULES or (MODULES.get(mid) or {}).get("hidden"):
             continue
         errs.extend(_validate_stage_inputs(i, mid, st, ids[:i], positions_by_module,
-                                           decl, warns))
+                                           decl, warns, anno_scope_by_idx))
     # 7) vlm.image_source 与上游产物一致性（非致命警告）：
     #    显式声明 annotated 但链路上游无 annotate / 声明 crops 但上游无 target_crop 时，
     #    驱动层会静默回退到默认源（annotated→原帧），行为正确但非用户本意，故提示。

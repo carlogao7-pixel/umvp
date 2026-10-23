@@ -48,7 +48,8 @@ ARTIFACT_DETS = "yolo.dets"                        # YOLO 检出记录列表（R
 ARTIFACT_DET_FILTER_DETS = "det_filter.dets"       # 检测筛选放行后的 dets（Records）
 ARTIFACT_SEQ_FILTER_DETS = "seq_filter.dets"       # 时序判定门控后的 dets（Records）
 ARTIFACT_CROPS = "target_crop.crops"               # 裁剪记录列表（元素含 image 键，Records）
-ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image）
+ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image；annotate scope=frame，默认）
+ARTIFACT_ANNOTATED_RECORDS = "annotate.annotated_records"  # 逐记录带整帧标注图（Records；annotate scope=record，WO-0021）
 ARTIFACT_FACES = "face_detect.faces"               # 人脸检测记录（dict，含 bbox/label/image，Records）
 ARTIFACT_PLATES = "plate_recog.plates"             # 车牌识别记录（dict，含 label/text/image，Records）
 
@@ -60,6 +61,7 @@ ARTIFACT_TYPES: Dict[str, str] = {
     ARTIFACT_SEQ_FILTER_DETS: "Records",
     ARTIFACT_CROPS: "Records",
     ARTIFACT_ANNOTATED: "Image",
+    ARTIFACT_ANNOTATED_RECORDS: "Records",
     ARTIFACT_FACES: "Records",
     ARTIFACT_PLATES: "Records",
 }
@@ -879,17 +881,29 @@ class Pipeline:
         # 默认 image 取上一实例标注图（单实例默认仍为本帧原图，零回归）。
         # 位置在 plate_recog/face_detect 之后（呈现后于识别）：标注可经 inputs 连线消费
         # 人脸/车牌产物画框（如 face_detect.faces），否则连线产物不在本帧产物表。
+        # 双模式（WO-0021，设计稿 assembly_ports.md §9）：scope=frame（默认）产帧级
+        # annotated（Image）；scope=record 产逐记录带整帧图流 annotated_records（Records）
+        # ——仅登记产物、主干 dets 不动（最小惊讶：与「标注不动主干」现状语义一致），
+        # 下游消费显式连线取；record 实例不更新 cur_img/last_annotated（无单一标注图）。
         self.last_annotated = None
         anno_insts = self._stage_instances("annotate")
         if anno_insts and frame is not None and dets is not None:
             cur_img = frame
+            last_anno = None
             for pos, an in anno_insts:
                 anno_img = self._port_at(pos, "annotate", an, "image", cur_img)
                 anno_dets = self._port_at(pos, "annotate", an, "dets", dets)
-                cur_img = an.run(anno_img, anno_dets, ts)
+                out = an.run(anno_img, anno_dets, ts)
+                if getattr(an, "scope", "frame") == "record":
+                    if out:
+                        self._register("annotate", pos, "annotated_records",
+                                       out, len(anno_insts))
+                    continue  # 主干与 cur_img/last_annotated 均不动
+                cur_img = out
+                last_anno = cur_img
                 if cur_img is not None:
                     self._register("annotate", pos, "annotated", cur_img, len(anno_insts))
-            self.last_annotated = cur_img
+            self.last_annotated = last_anno
         # 链路尾通用输出：末段检测记录携带的事件（det_filter/seq_filter 等模块追加）+
         # 车牌事件尾产出。通用、不绑定模块——供驱动层读取。
         self.last_events = (collect_events(dets) if dets else []) + plate_events
