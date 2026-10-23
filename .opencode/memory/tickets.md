@@ -32,6 +32,8 @@
 
 | 编号 | 日期 | 发起人 | 承接 | 需求/改动描述 | 验证 | 备注 |
 |---|---|---|---|---|---|---|
+| WO-0020 | 2026-10-23 | orchestrator | pipe-chain | 业务：用户要一个人脸和车辆都画框输出的实际链路；因标注单 dets 端口不支持合流，用两次标注接力（第二遍在第一遍成品图上叠画）实现，同时作为端口连线机制的实战样例。实现方式：pipe-chain 按 doc/modules 端口表与链路壳标准写 spec（stages+inputs 连线，同模块多实例用全名 annotate#<位置>.annotated），加 tests 断言（连线解析/接力图像传递/人脸坐标画框），用真实 YOLO+SCRFD 对 tests/data 素材端到端跑通。补充：构建演示链路 spec：人脸+车辆同图画框输出（帧管理→YOLO(classes=0,2)→目标裁剪→人脸检测→标注A(dets←faces)→标注B(image←标注A.annotated, dets←yolo.dets)），验证端口指定上游的接力画框实战可行性 | spec 过 validate_chain；新增/既有测试全绿；端到端真实模型出图含人脸框+人/车框（同一张图）；测试台可载入运行 | pipe-chain 子单 WO-0020.1 完成（INB-0077）：spec=tests/data/specs/face_vehicle_overlay.json，测试=tests/test_face_vehicle_overlay.py（26 断言）；模块缺口（faces 无 bbox 画不出人脸框）见 INB-0078 待转派 |
+| WO-0020.1 | 2026-10-23 | pipe-chain | pipe-chain | 构建演示链路 spec：人脸+车辆同图画框（端口指定上游 inputs 连线实战样例）+ 断言测试 |  | 完成：spec+composer 顺序调整+26 断言测试；全量回归绿。验证命令：conda run -n ai python tests/test_face_vehicle_overlay.py；conda run -n ai python web_lab/validate_chain.py tests/data/specs/face_vehicle_overlay.json。缺口记录 INB-0078 |
 
 ## 已完成
 
