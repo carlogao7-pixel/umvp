@@ -23,6 +23,7 @@ import numpy as np
 
 from face_detect.face_detector import FaceDetector
 from pipe.cropper import Cropper, iou
+from pipe.records import register_adapter
 from pipe.target_crop import as_crop
 
 
@@ -48,6 +49,22 @@ class FaceResult:
             "upscale": self.upscale,
             "index": self.index,
         }
+
+
+@register_adapter(FaceResult)
+def _face_record(f: FaceResult) -> dict:
+    """FaceResult → 通用记录（dict，WO-0020.2）：在 dataclass 字段之上补契约通用字段——
+
+    kind="face" / bbox=face_bbox（原图坐标，下游标注等统一读 bbox）/ label="face"；
+    face_img 旁路图保留旧键（经 to_record 时自动补统一键 image，见 pipe.records）。
+    ts/frame_idx 不在此注入（契约：时间上下文由调用方补，Pipeline.step 登记产物时写）。
+    """
+    d = f.to_dict()
+    d["kind"] = "face"
+    d["bbox"] = list(f.face_bbox)
+    d["label"] = "face"
+    d["face_img"] = f.face_img
+    return d
 
 
 class FaceStage:

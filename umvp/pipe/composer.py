@@ -38,7 +38,9 @@ _NEG_INF = -1e18  # 首见必送：模拟 spaz 以 unix 时间戳减 0 的语义
 
 # ---------------- 产物端口协议（P5 第 2 步，设计稿 doc/design/assembly_ports.md §3） ----------------
 # 产物命名 = {阶段标识}.{产物名}，逐帧登记在 Pipeline.artifacts；值类型三选一：
-#   Image（ndarray 原帧/带框图）/ Records（dict/对象记录列表）/ Vector（向量）。
+#   Image（ndarray 原帧/带框图）/ Records（dict 记录列表，链路通用语）/ Vector（向量）。
+#   Records 类产物统一为 dict 记录（对象在登记边界经 to_record 归一，WO-0020.2）；
+#   驱动层的 last_crops/last_faces/last_plates 等仍为对象形态（读属性，零回归）。
 # 模块以类属性 INPUTS / OUTPUTS 自描述端口（类型字符串）；装配器按 stage_inputs 连线解析。
 # 这些常量对外导出，供 web 段（spec 解析/校验/设计器）引用，避免字符串散落。
 ARTIFACT_FRAME = "frame_manager.frame"            # 本帧原图（Image）
@@ -47,8 +49,8 @@ ARTIFACT_DET_FILTER_DETS = "det_filter.dets"       # 检测筛选放行后的 de
 ARTIFACT_SEQ_FILTER_DETS = "seq_filter.dets"       # 时序判定门控后的 dets（Records）
 ARTIFACT_CROPS = "target_crop.crops"               # 裁剪记录列表（元素含 image 键，Records）
 ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image）
-ARTIFACT_FACES = "face_detect.faces"               # 人脸检测结果（Records）
-ARTIFACT_PLATES = "plate_recog.plates"             # 车牌识别结果（Records）
+ARTIFACT_FACES = "face_detect.faces"               # 人脸检测记录（dict，含 bbox/label/image，Records）
+ARTIFACT_PLATES = "plate_recog.plates"             # 车牌识别记录（dict，含 label/text/image，Records）
 
 # 产物名 → 类型（校验连线类型匹配；也是"可用产物清单"的唯一来源）
 ARTIFACT_TYPES: Dict[str, str] = {
@@ -834,7 +836,16 @@ class Pipeline:
             plate_crops = self._port_at(pos, "plate_recog", pl, "crops", self.last_crops)
             self.last_plate_input = list(plate_crops)
             self.last_plates = list(pl.run(plate_frame, plate_crops, ts))
-            self._register("plate_recog", pos, "plates", self.last_plates, len(plate_insts))
+            # 产物归一（WO-0020.2）：PlateResult 对象 → dict 记录（adapter 补 kind/label/text，
+            # 见 plate_recognizer._plate_record）+ 注入时间上下文；last_plates 保持对象形态
+            # 供驱动层读属性（零回归）。
+            plate_recs = []
+            for p in self.last_plates:
+                r = to_record(p)
+                r.setdefault("ts", ts)
+                r.setdefault("frame_idx", frame_idx)
+                plate_recs.append(r)
+            self._register("plate_recog", pos, "plates", plate_recs, len(plate_insts))
             for p in self.last_plates:
                 if not p.plate_no:
                     continue
@@ -853,7 +864,17 @@ class Pipeline:
             face_crops = self._port_at(pos, "face_detect", fc, "crops", self.last_crops)
             self.last_face_input = list(face_crops)
             self.last_faces = list(fc.run(face_frame, face_crops, ts))
-            self._register("face_detect", pos, "faces", self.last_faces, len(face_insts))
+            # 产物归一（WO-0020.2）：FaceResult 对象 → dict 记录（adapter 补 kind/bbox/label，
+            # 见 face_pipeline._face_record；bbox=face_bbox 原图坐标）+ 注入时间上下文；
+            # last_faces 保持对象形态供驱动层读属性（零回归）。产物表里的记录从此可被
+            # 下游阶段（annotate 画人脸框等）统一按 bbox 消费。
+            face_recs = []
+            for f in self.last_faces:
+                r = to_record(f)
+                r.setdefault("ts", ts)
+                r.setdefault("frame_idx", frame_idx)
+                face_recs.append(r)
+            self._register("face_detect", pos, "faces", face_recs, len(face_insts))
         # 标注阶段：在帧副本上画上游检测框（供 VLM 看"原图 + 画框"）。多实例链式：下一实例
         # 默认 image 取上一实例标注图（单实例默认仍为本帧原图，零回归）。
         # 位置在 plate_recog/face_detect 之后（呈现后于识别）：标注可经 inputs 连线消费

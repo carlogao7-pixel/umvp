@@ -66,7 +66,10 @@ def annotate_frame(
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, int(thickness))
         if show_label:
             tid = int(_field_value(d, "track_id") or 0)
-            txt = _label(cls_id) + (f"#{tid}" if tid else "")
+            # 标签文本：记录的 label 通用字段优先（如人脸 "face"/车牌号，WO-0020.2），
+            # 无 label 的检测记录回退 COCO 类别名（原行为零回归）。
+            lbl = d.get("label") if isinstance(d, Mapping) else getattr(d, "label", None)
+            txt = (str(lbl) if lbl else _label(cls_id)) + (f"#{tid}" if tid else "")
             cv2.putText(canvas, txt, (x1, max(y1 - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color,
                         max(1, int(thickness) - 1), cv2.LINE_AA)

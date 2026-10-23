@@ -11,16 +11,19 @@ spec: tests/data/specs/face_vehicle_overlay.json
 覆盖:
   1. spec 过 validate_chain（进程内 validate() 无 error + CLI 子进程 exit=0）。
   2. 装配: stage_inputs 位置键 + 产物全名（#4/#5）；annotate 两实例按位置装配。
-  3. 连线解析（纯逻辑 stub + 间谍）: 标注A 实参收到人脸记录（faces 产物）；
-     标注B 实参收到 yolo.dets 原始检出 + 底图**是**标注A 产物（接力生效）。
+  3. 连线解析（纯逻辑 stub + 间谍）: 标注A 实参收到人脸记录（faces 产物，dict 含
+     bbox/label——WO-0020.2 产物归一后形态）；标注B 实参收到 yolo.dets 原始检出 +
+     底图**是**标注A 产物（接力生效）。
   4. 端到端（真实 YOLO + 真实 SCRFD, 素材 人遮挡1.png: 人=10 车=4 脸=3）:
      faces 连线可解析（不抛 PortResolutionError——composer step 插槽顺序
-     annotate 移至 face_detect 之后的回归）、dets/faces 两类记录非空、
-     标注A/B 产物图尺寸=原帧、末段产物=标注B、标注图确有画框（像素差异）。
+     annotate 移至 face_detect 之后的回归）、faces 产物归一为 dict 记录
+     （kind/bbox/label/image 齐全）、dets/faces 两类记录非空、标注A/B 产物图
+     尺寸=原帧、末段产物=标注B、标注图确有画框（人脸框+车辆框 → 与原帧像素差异）。
 
-已知缺口（记录于回报，不在本测试修）: face_detect.faces 产物为 FaceResult
-对象且无 bbox 字段（仅 face_bbox/person_bbox），annotate 只读 bbox → 人脸框
-当前画不出（静默跳过），标注A 产物与原帧像素相同属预期。
+WO-0020.2 修复: face_detect.faces 产物经 to_record 归一为 dict Record
+（FaceResult 注册 adapter：kind="face"/bbox=face_bbox 原图坐标/label="face"/
+face_img 旁路补 image；composer 登记时注入 ts/frame_idx）——annotate 读 bbox
+画出人脸框（原先 FaceResult 对象无 bbox 静默画不出的缺口已闭合）。
 
 运行: conda run -n ai python tests/test_face_vehicle_overlay.py
 """
@@ -136,13 +139,15 @@ class _CropStub:
 
 
 class _FaceStub:
-    """人脸桩：产出带 face_bbox 的人脸记录（模拟 FaceResult 产物形态）。"""
+    """人脸桩：产出归一后的人脸记录（与真实 FaceResult adapter 产物同构：
+    dict + kind/bbox/label，WO-0020.2）。"""
     INPUTS = {"frame": "Image", "crops": "Records"}
     OUTPUTS = {"faces": "Records"}
 
     def run(self, frame, crops, ts=0.0):
-        return [{"kind": "face", "face_bbox": (20, 20, 50, 50),
-                 "person_bbox": (10, 10, 60, 160), "score": 0.95}]
+        return [{"kind": "face", "bbox": (20, 20, 50, 50),
+                 "face_bbox": (20, 20, 50, 50), "person_bbox": (10, 10, 60, 160),
+                 "score": 0.95, "label": "face"}]
 
 
 def wire_checks(spec: dict) -> None:
@@ -169,9 +174,10 @@ def wire_checks(spec: dict) -> None:
     check("连线: 标注A 被调用一次", len(spy_a.calls) == 1, str(len(spy_a.calls)))
     check("连线: 标注B 被调用一次", len(spy_b.calls) == 1, str(len(spy_b.calls)))
     ca, cb = spy_a.calls[0], spy_b.calls[0]
-    check("连线: 标注A dets 实参 = face_detect.faces 人脸记录（含 face_bbox）",
+    check("连线: 标注A dets 实参 = face_detect.faces 人脸记录（dict 归一，含 bbox/label）",
           len(ca["dets"]) == 1 and ca["dets"][0].get("kind") == "face"
-          and "face_bbox" in ca["dets"][0], str(ca["dets"])[:80])
+          and "bbox" in ca["dets"][0] and ca["dets"][0].get("label") == "face",
+          str(ca["dets"])[:80])
     check("连线: 标注A image 实参 = 本帧原图（默认）", ca["image"] is frame)
     check("连线: 标注B dets 实参 = yolo.dets 原始检出（人+车 2 条，绕过筛选）",
           [d["cls_id"] for d in cb["dets"]] == [0, 2], str(cb["dets"])[:80])
@@ -210,6 +216,11 @@ def e2e_checks(spec: dict) -> None:
           f"人={len(persons)} 车={len(cars)}")
     check("端到端: 人脸记录非空（SCRFD 检出）", len(faces) > 0,
           f"脸={len(faces)}")
+    check("端到端: faces 产物已归一 dict 记录（kind/bbox/label/image 齐全，WO-0020.2）",
+          all(isinstance(f, dict) and f.get("kind") == "face" and "bbox" in f
+              and f.get("label") == "face" and f.get("image") is not None
+              for f in faces),
+          f"首条键={sorted(faces[0]) if faces else '空'}")
 
     img_a = pipe.artifacts.get("annotate#4.annotated")
     img_b = pipe.artifacts.get("annotate#5.annotated")
@@ -223,12 +234,12 @@ def e2e_checks(spec: dict) -> None:
     check("端到端: 标注B 确有画框（与原帧存在像素差异；车框来自 yolo.dets）",
           abs(int(cv2.sumElems(cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY))[0]
                   - cv2.sumElems(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))[0])) > 0)
-    # 标注A 只收人脸记录且人脸框当前画不出（无 bbox 字段，见文件头缺口说明）→
-    # 其产物与原帧像素相同属预期；此处断言该行为已被理解而非意外。
+    # 标注A 只收人脸记录——faces 产物已归一含 bbox（WO-0020.2）→ 人脸框画出，
+    # 产物与原帧存在像素差异（原缺口：对象无 bbox 静默画不出，diff 恒 0，已闭合）。
     diff_a = abs(int(cv2.sumElems(cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY))[0]
                      - cv2.sumElems(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))[0]))
-    check("端到端: 标注A 与原帧像素相同（缺口预期：faces 无 bbox 画不出，待模块修复）",
-          diff_a == 0, f"diff={diff_a}")
+    check("端到端: 标注A 确有画框（人脸框；faces 已归一含 bbox）", diff_a > 0,
+          f"diff={diff_a}")
 
     # 证据落盘（供人工查验框效果；临时目录，测试结束保留打印路径）
     out_dir = Path(tempfile.gettempdir()) / "umvp_overlay_evidence"

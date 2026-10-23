@@ -333,7 +333,8 @@ check("target_crop.crops 登记裁剪记录列表", len(A.get(ARTIFACT_CROPS, []
 check("target_crop.crops 元素含 image 键（旁路图统一名；img 兼容别名保留）",
       A[ARTIFACT_CROPS][0].get("image") == "IMG0" and A[ARTIFACT_CROPS][0].get("img") == "IMG0")
 check("annotate.annotated 登记带框图", A.get(ARTIFACT_ANNOTATED) is anno_st.ret)
-check("face_detect.faces 登记人脸记录", A.get(ARTIFACT_FACES) == [{"kind": "face"}])
+check("face_detect.faces 登记人脸记录（dict 归一 + 注入 ts/frame_idx，WO-0020.2）",
+      A.get(ARTIFACT_FACES) == [{"kind": "face", "ts": 0.0, "frame_idx": 0}])
 check("plate_recog.plates 登记车牌记录", A.get(ARTIFACT_PLATES) == [])
 check("零回归：last_crops 仍是对象列表（驱动层在用）",
       p3.last_crops and p3.last_crops[0] is crop_st.outs[0])

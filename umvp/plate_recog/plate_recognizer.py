@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from pipe.cropper import Cropper, iou
+from pipe.records import register_adapter
 
 # -------------------- 默认模型路径（项目自包含） --------------------
 # 本文件位于 umvp/plate_recog/，向上两级是项目根；模型根目录下含 <版本>/onnx/*.onnx
@@ -93,6 +94,23 @@ class PlateResult:
             d["plate_crop_bbox"] = list(self.plate_crop_bbox)
             d["plate_img_size"] = [int(self.plate_img.shape[1]), int(self.plate_img.shape[0])]
         return d
+
+
+@register_adapter(PlateResult)
+def _plate_record(p: PlateResult) -> dict:
+    """PlateResult → 通用记录（dict，WO-0020.2）：在 dataclass 字段之上补契约通用字段——
+
+    kind="plate" / label=text=plate_no（下游标注/事件统一读通用字段）；bbox 字段本就有
+    （原图坐标）。plate_img 旁路图保留旧键（经 to_record 时自动补统一键 image；
+    无图不造键）。ts/frame_idx 不在此注入（契约：时间上下文由调用方补）。
+    """
+    d = p.to_dict()
+    d["kind"] = "plate"
+    d["label"] = p.plate_no
+    d["text"] = p.plate_no
+    if p.plate_img is not None:
+        d["plate_img"] = p.plate_img
+    return d
 
 
 def _ensure_models(model_root: str) -> None:
