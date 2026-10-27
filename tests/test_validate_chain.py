@@ -19,23 +19,69 @@ def _stages(*pairs):
     return {"name": "t", "stages": [{"module_id": m, "params": p} for m, p in pairs]}
 
 
+# ---- PIPE0002 车牌链路形态基线（WO-0024：独立门控阶段 gate_filter 转正为播种形态；
+#      WO-0026：事件尾 rules key 升级组合键） ----
+# 7 步播种形态：det_filter 与 target_crop 之间插 gate_filter（独立门控，按 track_id
+# 每 5s 放行、tid 缺失归匿名桶），plate_recog 内置去重关（track_dedup=False，
+# track_cooldown 保留作回切开关），seq_filter rules key="track_id,label"（组合键，
+# 同车异号按 track 收敛、tid=0 回退按号——设计稿 doc/design/event_dedup_key.md）。
+# 与 web_lab/server.py _SEED_PLATE_STAGES 对齐（test_baseline_matches_seed_shape 防漂移）。
+_SEQ_RULES_COMBO = ('[{"match": "kind == plate", "event": "{label}", '
+                    '"key": "track_id,label", "cooldown": -1.0}]')
+_SEQ_RULES_LABEL = ('[{"match": "kind == plate", "event": "{label}", '
+                    '"key": "label", "cooldown": -1.0}]')
 BASE_PLATE = [
     ("frame_manager", {"sampling": "analysis", "frame_skip": 5, "interval_sec": 3.0,
                        "interval_frames": 30, "backpressure": "standard"}),
     ("yolo", {"model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
               "imgsz": 1280, "max_det": 300, "classes": "2", "device": ""}),
     ("det_filter", {"filter": "long >= 40", "group_limits": "2:1,300"}),
+    ("gate_filter", {"key": "track_id", "interval": 5.0, "filter": ""}),
     ("target_crop", {"out_size": "×2", "margin": 0.1, "classes": "2", "filter": ""}),
     ("plate_recog", {"detect_level": "high", "mode": "crop", "margin": 0.1,
-                     "dedup_iou": 0.6, "track_dedup": True, "track_cooldown": 5.0}),
-    ("seq_filter", {"throttle": "", "change": "",
-                    "rules": '[{"match": "kind == plate", "event": "{label}", '
-                             '"key": "label", "cooldown": -1.0}]'}),
+                     "dedup_iou": 0.6, "track_dedup": False, "track_cooldown": 5.0}),
+    ("seq_filter", {"throttle": "", "change": "", "rules": _SEQ_RULES_COMBO}),
 ]
+
+# 回切形态（组合键升级前的旧默认 6 步）：无 gate_filter + track_dedup=True +
+# rules key=label（单字段）。两者仍是合法 spec（回切开关），校验器不得误拒。
+def _rollback_params(m, p):
+    if m == "plate_recog":
+        return {**p, "track_dedup": True}
+    if m == "seq_filter":
+        return {**p, "rules": _SEQ_RULES_LABEL}
+    return p
+
+
+BASE_PLATE_ROLLBACK = [(m, _rollback_params(m, p))
+                       for m, p in BASE_PLATE if m != "gate_filter"]
 
 
 def test_baseline_ok():
-    assert validate(_stages(*BASE_PLATE)) == [], "PIPE0002 形态基线应全绿"
+    assert validate(_stages(*BASE_PLATE)) == [], "PIPE0002 7 步播种形态基线应全绿"
+
+
+def test_baseline_matches_seed_shape():
+    # 防漂移契约：测试基线与 web 播种常量 _SEED_PLATE_STAGES 的模块序列与参数一致
+    # （WO-0024 前 BASE_PLATE 曾滞留旧 6 步形态过时——立此断言防再次漂移）
+    import json as _json
+    from server import _SEED_PLATE_STAGES
+    seed = [(mid, params) for mid, _sname, params in _SEED_PLATE_STAGES]
+    assert [m for m, _p in BASE_PLATE] == [m for m, _p in seed], "模块序列与播种不一致"
+    for (m_test, p_test), (m_seed, p_seed) in zip(BASE_PLATE, seed):
+        assert set(p_test) == set(p_seed), f"{m_test}: 参数键集合与播种不一致"
+        for k, v in p_seed.items():
+            if k == "rules":
+                assert _json.loads(p_test[k]) == _json.loads(v), f"{m_test}.{k} 与播种不一致"
+            else:
+                assert p_test[k] == v, f"{m_test}.{k}: {p_test[k]!r} != 播种 {v!r}"
+
+
+def test_rollback_form_ok():
+    # 回切形态（旧 6 步、track_dedup=True）仍是合法 spec：拒绝与否只看语法/注册/
+    # 装配合法性，不因「形态过时」误拒
+    errs = validate(_stages(*BASE_PLATE_ROLLBACK))
+    assert errs == [], f"回切形态应全绿: {errs}"
 
 
 def test_seed_forms_ok():
@@ -78,6 +124,43 @@ def test_seed_face_forms_assembled_ok():
     assert validate(embed) == [], f"face_embed 形态应通过: {validate(embed)}"
 
 
+def test_gate_filter_gray_to_baseline_upgrade():
+    # WO-0023 灰度 B 版（WO-0024 转正；WO-0026 补 rules key 一词）：从回切形态出发做
+    # 「换装」——det_filter 之后插 gate_filter、plate_recog 关内置去重、seq_filter rules
+    # key 升组合键；结果应与新基线逐阶段一致（形态升级 = 纯结构操作 + key 一词，
+    # 其余参数不动），且 spec 全绿
+    upgraded = list(BASE_PLATE_ROLLBACK)
+    idx = next(i for i, (m, _p) in enumerate(upgraded) if m == "plate_recog")
+    upgraded[idx] = ("plate_recog", {**upgraded[idx][1], "track_dedup": False})
+    upgraded.insert(3, ("gate_filter", {"key": "track_id", "interval": 5.0, "filter": ""}))
+    sidx = next(i for i, (m, _p) in enumerate(upgraded) if m == "seq_filter")
+    upgraded[sidx] = ("seq_filter", {**upgraded[sidx][1], "rules": _SEQ_RULES_COMBO})
+    assert upgraded == BASE_PLATE, "换装结果应与新基线逐阶段一致"
+    errs = validate(_stages(*upgraded))
+    assert errs == [], f"换装后 spec 应全绿: {errs}"
+
+
+def test_gate_filter_test_only_params_rejected():
+    # 测试页专用参数（detections/ts）不进链路 spec（机制同其它模块 test_only）；
+    # 基线索引 3 = gate_filter（7 步形态）
+    stages = list(BASE_PLATE)
+    stages[3] = ("gate_filter", {"key": "track_id", "interval": 5.0,
+                                 "detections": "2,1,0.9,1,1,2,2"})
+    errs = validate(_stages(*stages))
+    assert any("test_only" in e and "gate_filter" in e for e in errs), errs
+    stages[3] = ("gate_filter", {"key": "track_id", "interval": 5.0, "ts": 3.0})
+    errs = validate(_stages(*stages))
+    assert any("test_only" in e and "gate_filter" in e for e in errs), errs
+
+
+def test_gate_filter_unknown_param_rejected():
+    # 参数白名单以 PARAMS 注册为唯一来源：拼错/未注册的键报「未知参数」
+    stages = list(BASE_PLATE)
+    stages[3] = ("gate_filter", {"key": "track_id", "cool": 3.0})
+    errs = validate(_stages(*stages))
+    assert any("未知参数 'cool'" in e for e in errs), errs
+
+
 def test_declared_but_not_assembled_rejected():
     # WO-0001 事故回归：face_store 已注册产品模块，但 _chain_from_spec 无对应装配——
     # 「声明了也静默不执行」，校验器必须拦（旧版曾放过，正是人脸链 det_filter 失效同类）。
@@ -90,25 +173,25 @@ def test_declared_but_not_assembled_rejected():
 
 def test_experiment_round3_bad_dsl():
     # 实验③同型：det_filter.filter 硬语法错（缺值）必须被拦
-    errs = validate(_stages(*_with(2, "det_filter", {"filter": "long >="})))
+    errs = validate(_stages(*_with("det_filter", {"filter": "long >="})))
     assert any("det_filter" in e for e in errs), errs
 
 
 def test_experiment_round3_fake_model():
     # 实验③：yolo.model_path="yolov5s.pt"（编造模型路径）曾被放过
-    errs = validate(_stages(*_with(1, "yolo", {"model_path": "yolov5s.pt"})))
+    errs = validate(_stages(*_with("yolo", {"model_path": "yolov5s.pt"})))
     assert any("不存在" in e for e in errs), errs
 
 
 def test_experiment_round2_bad_events():
     # 实验②：det_filter.events="unique(plate_id)"（非 JSON 列表）曾被放过
-    errs = validate(_stages(*_with(2, "det_filter", {"events": "unique(plate_id)"})))
+    errs = validate(_stages(*_with("det_filter", {"events": "unique(plate_id)"})))
     assert any("装配" in e for e in errs), errs
 
 
 def test_experiment_round2_rule_without_window():
     # 实验②类：seq_filter 规则 min_n>1 却无窗口（SeqRule 装配期拒绝）
-    errs = validate(_stages(*_with(5, "seq_filter", {
+    errs = validate(_stages(*_with("seq_filter", {
         "rules": '[{"match": "kind == plate", "event": "x", "min_n": 3}]'})))
     assert any("装配" in e for e in errs), errs
 
@@ -116,31 +199,31 @@ def test_experiment_round2_rule_without_window():
 def test_crop_filter_dsl():
     # 真·非法语法（缺值/缺括号）；注：字段名编造与方向写反属语义幻觉，静态校验不拦
     for bad in [">= 40", "long >=", "(long >= 40"]:
-        errs = validate(_stages(*_with(3, "target_crop", {"filter": bad})))
+        errs = validate(_stages(*_with("target_crop", {"filter": bad})))
         assert any("无法解析" in e or "值为空" in e or "右括号" in e for e in errs), (bad, errs)
-    assert validate(_stages(*_with(3, "target_crop", {"filter": "long >= 40"}))) == []
+    assert validate(_stages(*_with("target_crop", {"filter": "long >= 40"}))) == []
 
 
 def test_numeric_bounds():
-    errs = validate(_stages(*_with(0, "frame_manager", {"frame_skip": 0.5})))
+    errs = validate(_stages(*_with("frame_manager", {"frame_skip": 0.5})))
     assert any("frame_skip" in e for e in errs), errs
-    errs = validate(_stages(*_with(1, "yolo", {"conf": 1.5})))
+    errs = validate(_stages(*_with("yolo", {"conf": 1.5})))
     assert any("conf" in e for e in errs), errs
 
 
 def test_seq_filter_all_empty_ok():
     # 门控/规则全空：与运行时一致（静默跳过），不算 error
-    assert validate(_stages(*_with(5, "seq_filter", {"throttle": "", "change": "", "rules": ""}))) == []
+    assert validate(_stages(*_with("seq_filter", {"throttle": "", "change": "", "rules": ""}))) == []
 
 
 def test_experiment_round3_dsl_not_static_checkable():
     # 实验③病例 "w<h40"：DSL 语法合法（h40=字符串值），语义错误静态校验不拦——记录局限
-    assert validate(_stages(*_with(2, "det_filter", {"filter": "w<h40"}))) == []
+    assert validate(_stages(*_with("det_filter", {"filter": "w<h40"}))) == []
 
 
 def test_test_only_key_rejected():
     # 实验①病例：bbox 是 target_crop 测试页专用参数，不得进链路 spec
-    errs = validate(_stages(*_with(3, "target_crop", {"bbox": "10,10,200,200"})))
+    errs = validate(_stages(*_with("target_crop", {"bbox": "10,10,200,200"})))
     assert any("test_only" in e for e in errs), errs
 
 
@@ -442,8 +525,10 @@ def test_annotate_scope_omitted_old_spec_ok():
     assert errs == [] and w == [], (errs, w)
 
 
-def _with(idx, mid, patch):
+def _with(mid, patch):
+    """在基线中按 module_id 定位阶段并合并参数补丁（按 id 定位，结构演进不误改相邻阶段）。"""
     stages = list(BASE_PLATE)
+    idx = next(i for i, (m, _p) in enumerate(stages) if m == mid)
     params = dict(stages[idx][1])
     params.update(patch)
     stages[idx] = (mid, params)

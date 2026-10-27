@@ -70,6 +70,7 @@ _TEST_LOCK = threading.Lock()
 _STAGE_LABELS = {
     "frame_manager": "帧管理", "yolo": "YOLO识别", "target_crop": "目标裁剪",
     "annotate": "标注", "vlm": "VLM研判", "det_filter": "检测筛选", "seq_filter": "时序判定",
+    "gate_filter": "门控",
     "plate_recog": "车牌识别", "face_detect": "人脸检测", "face_embed": "人脸嵌入",
     "face_store": "向量底库", "extract_faces": "原分辨率提取",
 }
@@ -77,6 +78,26 @@ _STAGE_LABELS = {
 
 def _stage_label(mid) -> str:
     return _STAGE_LABELS.get(mid) or (mid or "")
+
+
+def _gate_stats_text(pipe) -> str:
+    """门控分键拦截明细（产物 gate_filter.stats）→ 时间线/日志附加文案。
+
+    多实例逐实例收集 blocked_detail（短名别名仅单实例存在，全名恒可读）；"*" 键 =
+    匿名桶（key 值 None/空/0 归一），排序置顶一眼看出匿名拦截量。无明细返回空串。
+    """
+    arts = getattr(pipe, "artifacts", None) or {}
+    poss = (getattr(pipe, "module_positions", None) or {}).get("gate_filter") or []
+    names = [f"gate_filter#{p}.stats" for p in poss] or ["gate_filter.stats"]
+    parts = []
+    for nm in names:
+        for rec in (arts.get(nm) or []):
+            detail = rec.get("blocked_detail") if isinstance(rec, dict) else None
+            for k, n in sorted((detail or {}).items(),
+                               key=lambda kv: (kv[0] != "*", str(kv[0]))):
+                if n:
+                    parts.append(f"*（匿名）×{n}" if k == "*" else f"{k}×{n}")
+    return "（拦截明细：" + "、".join(parts) + "）" if parts else ""
 
 
 # ---------------- 通用工具 ----------------
@@ -847,6 +868,40 @@ def h_seq_filter(p: dict) -> dict:
     return res(text="\n".join(text), tables=tables)
 
 
+def h_gate_filter(p: dict) -> dict:
+    """门控模块测试页：模拟检测 → 按 key+间隔放行 → 放行/拦截明细（含分键统计）。
+
+    单次运行只体现"首见放行/同帧同桶"；冷却节奏跨帧生效，链路行为用链路测试台看。
+    """
+    from pipe.gate_filter import GateFilter
+    try:
+        gf = GateFilter(key=(_str_param(p, "key") or "track_id"),
+                        interval=_float(p, "interval", 5.0),
+                        filter=_str_param(p, "filter"))
+    except ValueError as e:
+        return res(ok=False, error=f"门控参数无法解析：{e}")
+    dets, err = _parse_sim_dets(p)
+    if err:
+        return res(ok=False, error=err)
+    ts = _float(p, "ts", 0.0)
+    keep = gf.run(dets, ts=ts, frame_idx=0)
+    keep_ids = {id(d) for d in keep}
+    st = gf.last_stats or {}
+    detail = "、".join((f"*（匿名）×{n}" if k == "*" else f"{k}×{n}")
+                      for k, n in sorted((st.get("blocked_detail") or {}).items(),
+                                         key=lambda kv: (kv[0] != "*", str(kv[0])))) or "无"
+    text = [f"输入 {len(dets)} 条 | 放行 {len(keep)} 条 | 拦截 {len(dets) - len(keep)} 条（ts={ts}）",
+            f"门控: key={gf.key} | interval={gf.interval} | "
+            + (f"filter={gf.filter}" if gf.filter else "filter=（空=全部受门控）"),
+            f"拦截分键: {detail}"]
+    rows = [[i, d.cls_id, getattr(d, gf.key, "-"), f"{d.score:.3f}",
+             "✓ 放行" if id(d) in keep_ids else "✗ 拦截"]
+            for i, d in enumerate(dets)]
+    tables = [{"title": "逐条判定", "headers": ["#", "类别", f"key({gf.key})", "置信度", "结果"],
+               "rows": rows}]
+    return res(text="\n".join(text), tables=tables)
+
+
 def h_vlm(p: dict) -> dict:
     from pipe.composer import VLMAnalyzer, SubmitRequest, Detection
     vlm = VLMAnalyzer(max_resolution=tuple(_int_tuple(p, "max_resolution", 2) or (1280, 720)),
@@ -1385,6 +1440,15 @@ def h_pipeline_run(p: dict) -> dict:
                 _emit("info", f"有效性筛选 {fi[0]} → {fi[1]}（筛掉 {fi[0] - fi[1]} 条）", ts,
                       stage="det_filter", frame_no=frame_no, log_line=True, prefix="    ")
 
+        # 门控：按 key 节流放行（仅在确有拦截时刷日志，参照 det_filter 形态；
+        # 附加产物 gate_filter.stats 的分键明细，"*（匿名）" 即匿名桶拦截量）
+        if "gate_filter" in _stage_order:
+            gi = getattr(pipe, "last_gate", None)
+            if gi is not None and gi[0] != gi[1]:
+                _emit("info", f"门控 放行 {gi[1]} / 拦截 {gi[0] - gi[1]}"
+                              + _gate_stats_text(pipe), ts,
+                      stage="gate_filter", frame_no=frame_no, log_line=True, prefix="    ")
+
         # YOLO 识别：检出统计 +（向下游）报送/传递
         if "yolo" in _stage_order:
             by_cls = {}
@@ -1736,7 +1800,7 @@ def h_pipeline_run(p: dict) -> dict:
 # _chain_from_spec 能装配进执行路径的阶段（validate_chain「声明即执行」断言的唯一依据）：
 # 新增可装配阶段务必同步登记，否则 spec 声明了它却静默不执行（WO-0001 事故即此类）。
 CHAIN_ASSEMBLED_MODULES = {
-    "frame_manager", "yolo", "det_filter", "seq_filter", "target_crop",
+    "frame_manager", "yolo", "det_filter", "seq_filter", "gate_filter", "target_crop",
     "annotate", "vlm", "plate_recog", "face_detect", "extract_faces", "face_embed",
 }
 
@@ -1765,6 +1829,7 @@ _PORT_DECL_SOURCES = {
     "vlm": ("pipe.composer", "VLMAnalyzer"),
     "det_filter": ("pipe.det_filter", "DetFilter"),
     "seq_filter": ("pipe.seq_filter", "SeqFilter"),
+    "gate_filter": ("pipe.gate_filter", "GateFilter"),
     "target_crop": ("pipe.target_crop", "TargetCrop"),
     "annotate": ("pipe.annotate", "Annotator"),
     "face_detect": ("face_detect.face_pipeline", "FaceStage"),
@@ -1928,6 +1993,11 @@ def _build_stage_instance(mid: str, p: dict):
         return _det_filter_of(p)
     if mid == "seq_filter":
         return _seq_filter_of(p, what="gates")
+    if mid == "gate_filter":
+        from pipe.gate_filter import GateFilter
+        return GateFilter(key=(_str_param(p, "key") or "track_id"),
+                          interval=_float(p, "interval", 5.0),
+                          filter=_str_param(p, "filter"))
     if mid == "target_crop":
         from pipe.target_crop import TargetCrop
         return TargetCrop(margin=_float(p, "margin", 0.0),
@@ -2017,6 +2087,7 @@ def _chain_from_spec(spec: dict):
     yolo = _first("yolo")
     vlm = _first("vlm")
     det_filter = _first("det_filter")
+    gate_filter = _first("gate_filter")
     crop = _first("target_crop")
     annotate = _first("annotate")
     plate = _first("plate_recog")
@@ -2071,7 +2142,7 @@ def _chain_from_spec(spec: dict):
     # ---- 按位置装配同模块多实例（P2-0）：多实例列表 [(position, obj), ...] ----
     # composer.Pipeline.step() 按这些列表**位置升序链式**执行各模块实例；单插槽字段保留
     # （取第一实例）兼容旧读法与仅支持单实例的模块（yolo/vlm）。
-    _PLURAL = {"det_filter": [], "seq_filter": [], "target_crop": [],
+    _PLURAL = {"det_filter": [], "seq_filter": [], "gate_filter": [], "target_crop": [],
                "annotate": [], "plate_recog": [], "face_detect": []}
     for i, s in enumerate(stages):
         mid = s.get("module_id")
@@ -2087,7 +2158,9 @@ def _chain_from_spec(spec: dict):
         frame=fm, yolo=yolo, vlm=vlm,
         crop=crop, annotate=annotate, plate=plate, face=face,
         det_filter=det_filter, seq_filter=seq_filter, event_filter=event_filter,
+        gate_filter=gate_filter,
         det_filters=_PLURAL["det_filter"], seq_filters=_PLURAL["seq_filter"],
+        gate_filters=_PLURAL["gate_filter"],
         target_crops=_PLURAL["target_crop"], annotators=_PLURAL["annotate"],
         plate_stages=_PLURAL["plate_recog"], face_stages=_PLURAL["face_detect"],
         stage_positions=stage_positions, stage_inputs=stage_inputs,
@@ -2198,6 +2271,7 @@ def h_pipeline_stream(write, params: dict) -> None:
             detection_count += len(dets or [])
             plate_count += len(plates)
             event_total += len(evs)
+            _gi = getattr(pipe, "last_gate", None)  # 门控统计旁路（叠加展示；确有拦截才带）
             write("frame", {
                 "n": n, "ts": round(ts, 3),
                 "dets": [{"cls": d.cls_id, "bbox": list(d.bbox),
@@ -2209,6 +2283,8 @@ def h_pipeline_stream(write, params: dict) -> None:
                            for p in plates],
                 "alarms": [{"action": e.get("name", "事件"), "desc": str(e.get("detail") or ""),
                             "conf": 1.0} for e in evs],
+                "gate": ({"passed": _gi[1], "blocked": _gi[0] - _gi[1]}
+                         if _gi and _gi[0] != _gi[1] else None),
             })
             n += 1
     finally:
@@ -2247,6 +2323,12 @@ def h_chain(p: dict) -> dict:
             if fi is not None and fi[0] != fi[1]:
                 log.append("    " + _tag("det_filter")
                            + f"帧#{frame_no} 有效性筛选 {fi[0]} → {fi[1]}（筛掉 {fi[0] - fi[1]} 条）")
+        if "gate_filter" in _so:
+            gi = getattr(pipe, "last_gate", None)
+            if gi is not None and gi[0] != gi[1]:
+                log.append("    " + _tag("gate_filter")
+                           + f"帧#{frame_no} 门控 放行 {gi[1]} / 拦截 {gi[0] - gi[1]}"
+                           + _gate_stats_text(pipe))
         if "yolo" in _so:
             by_cls = {}
             for d in dets or []:
@@ -2466,14 +2548,33 @@ PARAMS = {
                            "等价原 track_change_only"},
         "rules": {"label": "确认/事件规则（JSON 列表）", "type": "text", "default": "",
                   "help": "SeqRule 规格，如 [{\"match\":\"label in 治安类|交警类\",\"event\":\"{label}\","
-                          "\"key\":\"label\",\"cooldown\":30}]；event 支持 {字段} 动态占位，"
-                          "cooldown<0=同对象一次，window_n/min_n/hit_ratio 为窗口；空=无规则"},
+                          "\"key\":\"label\",\"cooldown\":30}]；分组键 key 支持逗号组合字段"
+                          "（如 \"track_id,label\"），按序取第一个非空（非 0/None）字段值做分组键，"
+                          "全部无效归匿名组 *；event 支持 {字段} 动态占位，"
+                          "cooldown<0=同组一次，window_n/min_n/hit_ratio 为窗口；空=无规则"},
         "detections": {"label": "模拟检测（每行一条）", "type": "text", "default": "",
                        "test_only": True,
                        "help": "每行: 类别,track,置信度,x1,y1,x2,y2（如 '0,1,0.9,100,100,200,200'）"},
         "ts": {"label": "帧时间戳（秒）", "type": "float", "default": 0.0,
                "test_only": True,
                "help": "门控/规则计时用（同一帧多次调用可改 ts 观察节流）"},
+    },
+    "gate_filter": {
+        "key": {"label": "分组键字段 key", "type": "str", "default": "track_id",
+                "help": "按该记录字段分桶冷却（track_id/cls_id/label 等，可用派生字段 w/h/short/long/area）；"
+                        "取值 None/空/0 归匿名桶 *（统一受门控）；key=cls_id 时 COCO 类 0（person）也落匿名桶"},
+        "interval": {"label": "放行间隔 interval（秒，三值）", "type": "float", "default": 5.0,
+                     "help": ">0=同 key 每 N 秒最多放行一次（首见放行）；<0=同 key 只放行一次；"
+                             "0=全放行（no-op）"},
+        "filter": {"label": "门控范围（条件 DSL，空=全部）", "type": "text", "default": "",
+                   "help": "只对命中记录做门控（如 'cls_id == 2'）；未命中记录直接放行且不耗该桶冷却额度；"
+                           "语法同检测筛选；空=全部记录受门控"},
+        "detections": {"label": "模拟检测（每行一条）", "type": "text", "default": "",
+                       "test_only": True,
+                       "help": "每行: 类别,track,置信度,x1,y1,x2,y2（如 '2,1,0.9,100,100,200,200'）"},
+        "ts": {"label": "帧时间戳（秒）", "type": "float", "default": 0.0,
+               "test_only": True,
+               "help": "门控计时用（改 ts 重跑观察冷却窗口）"},
     },
     "vlm": {
         "max_resolution": {"label": "送审缩放上限（宽,高）", "type": "str", "default": "1280,720",
@@ -2779,6 +2880,12 @@ MODULES = {
                 "+ 窗口/单条规则确认与事件标注。链路里插在检测筛选之后；"
                 "承载原 Pipeline 的 check_interval/track_change_only 语义。",
         "params": PARAMS["seq_filter"], "handler": h_seq_filter},
+    "gate_filter": {
+        "name": "门控 GateFilter", "group": "门控",
+        "desc": "复用 pipe.gate_filter.GateFilter：按 key+时间间隔放行（物理过滤：被拦记录不传下游、"
+                "零标记字段；None/空/0 归匿名桶 * 统一受门控）。链路里插在时序判定之后、目标裁剪之前，"
+                "是检测流最后一道闸；拦截可观测走统计旁路（Pipeline.last_gate / 产物 gate_filter.stats）。",
+        "params": PARAMS["gate_filter"], "handler": h_gate_filter},
     "face_embed": {
         "name": "特征提取 FaceEmbedder", "group": "向量比对",
         "desc": "复用 face_embed.face_embedder：对齐裁剪 → 512 维向量。",
@@ -3544,7 +3651,8 @@ _SEED_STAGES = [
         }], ensure_ascii=False)}),
 ]
 
-# 第二条链路：车牌识别（帧管理 → YOLO 识车 → 车牌识别(裁车牌+识别) → 告警）
+# 第二条链路：车牌识别（帧管理 → YOLO 识车 → 检测筛选 → 门控 → 目标裁剪(裁车)
+# → 车牌识别(裁车牌+识别) → 事件尾告警；WO-0024 换装独立门控阶段）
 _SEED_PLATE_NAME = "车牌识别链路"
 _SEED_PLATE_STAGES = [
     # 帧管理：车牌视频按 5 帧抽 1（比警用链路密，兼顾远角小牌）
@@ -3558,20 +3666,27 @@ _SEED_PLATE_STAGES = [
     # 检测筛选：车长边≥40 才有效（小目标视为未识别）
     ("det_filter", "车牌识别·检测筛选", {
         "filter": "long >= 40", "group_limits": "2:1,300"}),
+    # 独立门控（WO-0024 方案A）：按 track_id 每 5 秒放行一次，物理过滤在裁剪/识别之前
+    # （tid 缺失的记录归匿名桶 * 统一受门控，杜绝绕过）
+    ("gate_filter", "车牌识别·门控", {
+        "key": "track_id", "interval": 5.0, "filter": ""}),
     # 目标裁剪：按 YOLO 车辆框裁车放大 2×（供车牌识别在车图里裁车牌）
     ("target_crop", "车牌识别·目标裁剪", {
         "out_size": "×2", "margin": 0.1,
         "classes": "2", "filter": ""}),
     # 车牌识别：从车图裁车牌 + 识别 + 坐标还原 + 原图出原分辨率车牌小图
-    # （track_dedup：同一辆车只识别一次，5 秒后可重试）
+    # （track_dedup=False：内置去重关，放行节流已由上游门控阶段承担；
+    #   track_cooldown 保留作回切开关——置 True 即回旧行为）
     ("plate_recog", "车牌识别·车牌识别", {
         "detect_level": "high", "mode": "crop", "margin": 0.1,
-        "dedup_iou": 0.6, "track_dedup": True, "track_cooldown": 5.0}),
-    # 事件尾（原「告警策略」inspection 的等价）：车牌记录经 publish 出事件，同车牌号只一次
+        "dedup_iou": 0.6, "track_dedup": False, "track_cooldown": 5.0}),
+    # 事件尾（原「告警策略」inspection 的等价）：车牌记录经 publish 出事件；
+    # key=组合键（设计稿 event_dedup_key.md，WO-0026）：tid>0 按 track 分组（同车异号
+    # 收敛一条），tid 缺失/0 回退按号（=旧行为），全字段无效归匿名组
     ("seq_filter", "车牌识别·时序判定", {
         "throttle": "", "change": "",
         "rules": json.dumps([{
-            "match": "kind == plate", "event": "{label}", "key": "label", "cooldown": -1.0,
+            "match": "kind == plate", "event": "{label}", "key": "track_id,label", "cooldown": -1.0,
         }], ensure_ascii=False)}),
 ]
 
@@ -3626,12 +3741,18 @@ _SEED_STANDALONE = [
 ]
 
 
-def _seed_chain(name: str, stages: list, description: str, have: dict) -> None:
+def _seed_chain(name: str, stages: list, description: str, have: dict,
+                converge: dict | None = None) -> None:
     """幂等播种一条链路：先保各阶段模块 preset，再建链路引用。
 
     已存在同名链路时：阶段结构一致则原样保留（不动用户改动）；结构变化则按模块复用
     旧 preset（保留其参数）、补建缺失阶段、丢弃下线阶段，重建步骤（save_pipeline 同名
     覆盖）。这样既迁移结构，又不产生重复 preset。
+
+    converge（WO-0024）：{module_id: 强制参数}——结构变更重建时，对被复用的旧 preset
+    强制收敛指定参数（其余用户参数保留；定向更新 id 不变）。用于「形态升级后旧参数
+    语义反转」的场景：如 PIPE0002 换装独立门控后 plate_recog 的 track_dedup 必须关，
+    否则旧库复用 preset 仍 True，生效形态变成「叠加」而非目标形态。
     """
     expected = [mid for mid, _s, _p in stages]
     existing = next((p for p in db.list_pipelines() if p["name"] == name), None)
@@ -3643,6 +3764,23 @@ def _seed_chain(name: str, stages: list, description: str, have: dict) -> None:
         print(f"[seed] 链路「{name}」阶段已变更，重建…")
         for s in (existing.get("steps") or []):
             reuse.setdefault(s["module_id"], s["preset_id"])  # 按模块复用旧 preset
+    if converge and reuse:
+        forced = {mid: patch for mid, patch in converge.items() if mid in reuse}
+        if forced:
+            cur = {p["id"]: p["params"] for p in db.list_presets("module")}
+            for mid, patch in forced.items():
+                pid = reuse[mid]
+                old = cur.get(pid)
+                if old is None:
+                    print(f"[seed] 警告：模块配置 {pid}（{mid}）参数读取失败，"
+                          f"跳过强制收敛（链路「{name}」）")
+                    continue
+                changed = {k: v for k, v in patch.items() if old.get(k) != v}
+                if not changed:
+                    continue
+                db.save_preset("module", "", mid, {**old, **patch}, preset_id=pid)
+                print(f"[seed] 模块配置 {pid}（{mid}）强制收敛 {changed}"
+                      f"（链路「{name}」结构变更迁移，其余参数保留）")
     stage_ids = []
     for mid, sname, params in stages:
         pid = reuse.get(mid)
@@ -3658,6 +3796,55 @@ def _seed_chain(name: str, stages: list, description: str, have: dict) -> None:
     pid, _created = db.save_pipeline(name, stage_ids, streams=1, budget={},
                                      meta={"description": description})
     print(f"[seed] 链路「{name}」已播种（{pid}）")
+
+
+# SEQ0002 事件尾 rules 旧默认（组合键升级前，WO-0026）：存量库启动播种时，
+# rules 恰好等于此值（JSON 语义等价，键序无关）→ 定向升级为组合键版；
+# 用户改过（≠此值）→ 保留不动并提示手工换法
+_LEGACY_SEQ_RULES = [{
+    "match": "kind == plate", "event": "{label}", "key": "label", "cooldown": -1.0,
+}]
+_SEQ_GROUP_KEY_NEW = "track_id,label"
+
+
+def _converge_seq_group_key() -> None:
+    """SEQ0002 事件尾分组键定向收敛（设计稿 event_dedup_key.md Q3，WO-0026.1）。
+
+    组合键升级只改 rules 一个词，链路阶段结构未变——`_seed_chain` 对结构一致的
+    已存在链路提前 return、不迁移 preset 参数，故单独立此函数：启动播种时按
+    链路引用找到车牌链路的 seq_filter preset，按「是否恰好等于旧默认」分派：
+      - 等于旧默认（key="label" 那份 JSON，语义等价比较）→ 定向更新为组合键版
+        （id 与其余参数不变，打 [seed] 日志）；
+      - 已是新键 → 静默（幂等重入）；
+      - 用户改过（≠旧默认）→ 保留不动，打一行提示告知手工换法（改 rules 的 key 一词）。
+    """
+    pl = next((p for p in db.list_pipelines() if p["name"] == _SEED_PLATE_NAME), None)
+    if pl is None:
+        return
+    sid = next((s.get("preset_id") for s in (pl.get("steps") or [])
+                if s.get("module_id") == "seq_filter"), None)
+    cur = next((p for p in db.list_presets("module") if p["id"] == sid), None) if sid else None
+    if cur is None:
+        return
+    try:
+        rules = json.loads(str(cur["params"].get("rules") or ""))
+    except (ValueError, TypeError):
+        rules = None
+    if not isinstance(rules, list):
+        rules = None
+    if rules != _LEGACY_SEQ_RULES:
+        if rules != [{"match": "kind == plate", "event": "{label}",
+                      "key": _SEQ_GROUP_KEY_NEW, "cooldown": -1.0}]:
+            print(f"[seed] 模块配置 {sid}（seq_filter）rules 非旧默认值（用户已改），"
+                  f"保留不动；如需组合键去重请把 rules 的 key 手工改为 "
+                  f"\"{_SEQ_GROUP_KEY_NEW}\"（链路「{_SEED_PLATE_NAME}」）")
+        return
+    new_rules = [{**r, "key": _SEQ_GROUP_KEY_NEW} for r in rules]
+    db.save_preset("module", "", "seq_filter",
+                   {**cur["params"], "rules": json.dumps(new_rules, ensure_ascii=False)},
+                   preset_id=sid)
+    print(f"[seed] 模块配置 {sid}（seq_filter）rules key 定向收敛 "
+          f"label → {_SEQ_GROUP_KEY_NEW}（组合键升级，其余参数保留）")
 
 
 def _seed_pipeline() -> None:
@@ -3676,8 +3863,11 @@ def _seed_pipeline() -> None:
                     "警用无人机监测链路：帧管理→YOLO识人车→VLM研判警情→告警策略"
                     "（模块自定义拼接）", have)
         _seed_chain(_SEED_PLATE_NAME, _SEED_PLATE_STAGES,
-                    "车牌识别链路：帧管理→YOLO识车→车牌识别(HyperLPR3)→告警"
-                    "（模块自定义拼接）", have)
+                    "车牌识别链路：帧管理→YOLO识车→检测筛选→门控→目标裁剪(裁车)"
+                    "→车牌识别(HyperLPR3)→事件尾告警"
+                    "（模块自定义拼接；独立门控按 track_id 节流放行）", have,
+                    converge={"plate_recog": {"track_dedup": False}})
+        _converge_seq_group_key()  # 存量 SEQ0002 rules 旧默认 → 组合键（结构未变，_seed_chain 不迁移）
         _seed_chain(_SEED_FACE_NAME, _SEED_FACE_STAGES,
                     "人脸截取链路：帧管理→YOLO识人→原分辨率人脸提取"
                     "（无嵌入/检索/告警，截取落盘即目的）", have)

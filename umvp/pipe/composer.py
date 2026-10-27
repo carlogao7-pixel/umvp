@@ -47,6 +47,8 @@ ARTIFACT_FRAME = "frame_manager.frame"            # 本帧原图（Image）
 ARTIFACT_DETS = "yolo.dets"                        # YOLO 检出记录列表（Records）
 ARTIFACT_DET_FILTER_DETS = "det_filter.dets"       # 检测筛选放行后的 dets（Records）
 ARTIFACT_SEQ_FILTER_DETS = "seq_filter.dets"       # 时序判定门控后的 dets（Records）
+ARTIFACT_GATE_FILTER_DETS = "gate_filter.dets"     # 门控放行后的 dets（Records）
+ARTIFACT_GATE_FILTER_STATS = "gate_filter.stats"   # 门控统计（Records；观测专用，非连线端口）
 ARTIFACT_CROPS = "target_crop.crops"               # 裁剪记录列表（元素含 image 键，Records）
 ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image；annotate scope=frame，默认）
 ARTIFACT_ANNOTATED_RECORDS = "annotate.annotated_records"  # 逐记录带整帧标注图（Records；annotate scope=record，WO-0021）
@@ -59,6 +61,8 @@ ARTIFACT_TYPES: Dict[str, str] = {
     ARTIFACT_DETS: "Records",
     ARTIFACT_DET_FILTER_DETS: "Records",
     ARTIFACT_SEQ_FILTER_DETS: "Records",
+    ARTIFACT_GATE_FILTER_DETS: "Records",
+    ARTIFACT_GATE_FILTER_STATS: "Records",
     ARTIFACT_CROPS: "Records",
     ARTIFACT_ANNOTATED: "Image",
     ARTIFACT_ANNOTATED_RECORDS: "Records",
@@ -73,6 +77,7 @@ RESOLVED_PORTS: Dict[str, Tuple[str, ...]] = {
     "yolo": ("image",),
     "det_filter": ("dets",),
     "seq_filter": ("dets",),
+    "gate_filter": ("dets",),
     "target_crop": ("frame", "dets"),
     "annotate": ("image", "dets"),
     "plate_recog": ("frame", "crops"),
@@ -174,6 +179,7 @@ _CLASS_TO_MODULE: Dict[str, str] = {
     "VLMAnalyzer": "vlm",
     "DetFilter": "det_filter",
     "SeqFilter": "seq_filter",
+    "GateFilter": "gate_filter",
     "TargetCrop": "target_crop",
     "Annotator": "annotate",
     "FaceStage": "face_detect",
@@ -538,12 +544,14 @@ class Pipeline:
     face: Optional[object] = None  # 人脸识别阶段（FaceStage.run(frame, crops, ts)）
     det_filter: Optional[DetFilter] = None  # 检测筛选阶段（有效性：逐条+成组，2026-10 自 YOLO 迁入）
     seq_filter: Optional[object] = None  # 时序判定阶段（节流/变化门控 + 事件，2026-10 自 Pipeline 迁入）
+    gate_filter: Optional[object] = None  # 门控阶段（按 key+间隔放行，物理过滤+统计旁路，2026-10 WO-0023）
     event_filter: Optional[object] = None  # 事件尾（VLM/车牌等外部记录经 publish 走它出事件，可作链路尾）
     # ---- 同模块多实例（P2-0 节点实例身份，设计稿 §3.1）：list[(position, obj)]，按 position 升序执行 ----
     # 每类同模块阶段可多实例并存、各自独立生效（产物全名 {module}#{position}.{artifact} 互不覆盖）。
     # 旧单插槽字段（yolo/crop/...）保留读取兼容：单插槽实例 position 取 stage_positions（未声明=None）。
     det_filters: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, DetFilter), ...]
     seq_filters: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, SeqFilter), ...]
+    gate_filters: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, GateFilter), ...]
     target_crops: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, TargetCrop), ...]
     annotators: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, Annotator), ...]
     plate_stages: List[Tuple[int, Any]] = field(default_factory=list)  # [(位置, PlateStage), ...]
@@ -561,6 +569,7 @@ class Pipeline:
     last_plate_input: List = field(default_factory=list)  # 最近一帧传给车牌阶段的车辆子图（门控后）
     last_face_input: List = field(default_factory=list)  # 最近一帧传给人脸阶段的子图（门控后）
     last_filter: Optional[Tuple[int, int]] = None  # 最近一帧检测筛选统计 (进入, 放行)（供时间线展示；未运行=None）
+    last_gate: Optional[Tuple[int, int]] = None  # 最近一帧门控统计 (进入, 放行)（参照 last_filter 同型；供时间线/诊断读取）
     last_events: List = field(default_factory=list)  # 最近一帧末段记录携带的事件（链路尾通用输出，见 records.events）
     # ---- 产物端口协议（P5 第 2 步；P2-0 扩展节点实例身份） ----
     # artifacts: 逐帧产物表 {产物名: 值}，step() 每帧开始时重建、各阶段执行后登记；
@@ -613,6 +622,7 @@ class Pipeline:
             "vlm": (self.vlm, None),
             "det_filter": (self.det_filter, self.det_filters),
             "seq_filter": (self.seq_filter, self.seq_filters),
+            "gate_filter": (self.gate_filter, self.gate_filters),
             "target_crop": (self.crop, self.target_crops),
             "annotate": (self.annotate, self.annotators),
             "plate_recog": (self.plate, self.plate_stages),
@@ -798,6 +808,29 @@ class Pipeline:
             if ran:
                 dets = cur
 
+        # 门控阶段：按 key + 时间间隔放行（物理过滤：被拦不传下游、无标记字段；
+        # 统计旁路 last_gate=(进入,放行) 参照 last_filter 同型 + 产物 gate_filter.stats）。
+        # 位于 seq_filter 之后、target_crop 之前——最细粒度的最后一道闸，拦截对所有下游
+        # （裁剪/标注/报送/事件）一致生效；多实例按位置升序链式执行。
+        self.last_gate = None
+        gf_insts = self._stage_instances("gate_filter")
+        if gf_insts:
+            cur = dets if dets is not None else []
+            ran = bool(dets)
+            first_in = None
+            for pos, gf in gf_insts:
+                if ran:
+                    gf_in = self._port_at(pos, "gate_filter", gf, "dets", cur)
+                    if first_in is None:
+                        first_in = len(gf_in)
+                    cur = gf.run(gf_in, ts=ts, frame_idx=frame_idx)
+                    self._register("gate_filter", pos, "stats",
+                                   [gf.stats_record(ts, frame_idx)], len(gf_insts))
+                self._register("gate_filter", pos, "dets", cur, len(gf_insts))
+            if ran:
+                dets = cur
+                self.last_gate = (first_in, len(cur))
+
         # 目标裁剪阶段：按上游检测框裁子图（供车牌识别/人脸检测/VLM 下游消费）。
         self.last_crops = []
         crop_insts = self._stage_instances("target_crop")
@@ -853,7 +886,8 @@ class Pipeline:
                     continue
                 rec = {"kind": "plate", "label": p.plate_no, "score": p.score,
                        "content": {"plate_no": p.plate_no, "type_name": p.type_name,
-                                   "color": p.color, "bbox": list(p.bbox)}}
+                                   "color": p.color, "bbox": list(p.bbox)},
+                       "track_id": int(getattr(p, "track_id", 0) or 0)}
                 plate_events += self.publish([rec], ts, frame_idx)
         # 人脸识别阶段：检测 → 人脸产物（同源于 crop 产物）；落盘/计数/事件尾留驱动层。
         self.last_faces = []
@@ -910,8 +944,15 @@ class Pipeline:
         return submits, self.last_events
 
     def track_needed(self) -> bool:
-        """是否需要 YOLO 跟踪（车牌阶段按 track 去重时需要）。"""
+        """是否需要 YOLO 跟踪（车牌阶段按 track 去重 / 门控按 track_id 分组时需要）。
+
+        gate_filter 联动（WO-0023 §5.4）：key=="track_id" 的门控也需要 track——
+        否则"内置去重关闭 + 独立门控"的链路 track_needed 误判 False，全链无 track_id、
+        所有记录落匿名桶，门控退化成全局限流（比无门控更差）。
+        """
         if any(getattr(p, "use_track", False) for _, p in self._stage_instances("plate_recog")):
+            return True
+        if any(getattr(g, "needs_track", False) for _, g in self._stage_instances("gate_filter")):
             return True
         return bool(getattr(self.plate, "use_track", False))
 

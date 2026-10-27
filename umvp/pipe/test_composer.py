@@ -17,6 +17,7 @@
   12. 产物全名 / 短名解析（P2-0：resolve_artifact / artifact_at / artifact_short / artifact_type）
   13. 同模块多实例（P2-0 解除单插槽：det_filter 独立生效 + 位置键 inputs + 全名产物不覆盖）
   14. infer 出口 dict 化（WO-0014.3：kind=det 契约形态 + 直传盲区——对象/dict 入口归一、缺 cls_id 跳过）
+  22. 车牌发布记录 track_id 透传 + 组合键事件收敛（WO-0026：发布记录带键 / 同 tid 异号收敛 1 事件）
 
 运行: ai 环境 python pipe/test_composer.py
 """
@@ -706,5 +707,88 @@ subs_x = p3x._submits([
 check("盲区: _submits 跳过缺 cls_id/-1 的 dict 项（其余照常分组）",
       len(subs_x) == 2 and [s.track_key for s in subs_x] == [0, 1]
       and all(len(s.dets) == 1 for s in subs_x))
+
+# ============ 22. 车牌发布记录 track_id + 组合键事件收敛（WO-0026.2） ============
+print("== 22. 车牌发布 track_id + 组合键 ==")
+from pipe.seq_filter import SeqRule
+from plate_recog.plate_recognizer import PlateResult
+
+
+def _mk_tid_crop():
+    """桩目标裁剪：按脚本 tids 产裁剪对象（忽略上游 dets，track_id 从脚本取）。"""
+    class _ScriptCrop:
+        INPUTS = {"frame": "Image", "dets": "Records"}
+        OUTPUTS = {"crops": "Records"}
+
+        def __init__(self):
+            self.tids = []   # 本帧脚本：crop track_id 列表
+
+        def run(self, frame, dets, ts=0.0):
+            return [_CropObj("IMG%d" % t, (0, 0, 8, 8), (2, 2), 2.0, track_id=t, index=i)
+                    for i, t in enumerate(self.tids)]
+    return _ScriptCrop()
+
+
+def _mk_tid_plate():
+    """桩车牌阶段：对每个 crop 产一个真 PlateResult（track_id 从 crop 透传，号按脚本）。"""
+    class _ScriptPlate:
+        INPUTS = {"frame": "Image", "crops": "Records"}
+        OUTPUTS = {"plates": "Records"}
+
+        def __init__(self):
+            self.plates = []   # 本帧脚本：与 crops 一一对应的 plate_no
+
+        def run(self, frame, crops, ts=0.0):
+            return [PlateResult(
+                plate_no=self.plates[i], plate_type=0, type_name="蓝牌", color="blue",
+                score=0.9, bbox=(0, 0, 4, 4),
+                car_bbox=tuple(int(v) for v in c.bbox),
+                track_id=int(getattr(c, "track_id", 0) or 0))
+                for i, c in enumerate(crops or [])]
+    return _ScriptPlate()
+
+
+# 22.1 发布记录带 track_id（D5 发布段）：事件 detail 直取字段验证 + 产物表透传（D1/D3）
+pub_crop, pub_plate = _mk_tid_crop(), _mk_tid_plate()
+pub_crop.tids, pub_plate.plates = [7], ["沪A111"]
+p_pub = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=pub_crop,
+                 plate=pub_plate, det_filter=fdef,
+                 event_filter=DetFilter(filter="kind == plate",
+                                        events=[{"name": "pub", "detail": ["track_id"]}]))
+_, ev_pub = p_pub.step(0, 0.0, frame=object(), force=True)
+check("发布记录带 track_id（与 content 平级，事件 detail 直取字段验证）",
+      len(ev_pub) == 1 and ev_pub[0]["name"] == "pub"
+      and ev_pub[0]["detail"]["track_id"] == 7, str(ev_pub))
+check("plate_recog.plates 产物记录带 track_id（adapter 随 to_dict 自动透传）",
+      len(p_pub.artifacts[ARTIFACT_PLATES]) == 1
+      and p_pub.artifacts[ARTIFACT_PLATES][0].get("track_id") == 7)
+check("零回归: last_plates 保持对象形态且对象带 track_id",
+      p_pub.last_plates and isinstance(p_pub.last_plates[0], PlateResult)
+      and p_pub.last_plates[0].track_id == 7)
+
+# 22.2 端到端小链：桩 YOLO(带 tid) → 裁剪 → 车牌(mock) → publish → 组合键事件尾
+scr_crop, scr_plate = _mk_tid_crop(), _mk_tid_plate()
+tail = SeqFilter([SeqRule(match="kind == plate", event="{label}",
+                          key="track_id,label", cooldown=-1.0)])
+p_e2e = Pipeline(frame=FrameManager(frame_skip=1), yolo=_mk_yolo(), crop=scr_crop,
+                 plate=scr_plate, det_filter=fdef, event_filter=tail)
+scr_crop.tids, scr_plate.plates = [7], ["沪A111"]
+_, ev0 = p_e2e.step(0, 0.0, frame=object(), force=True)
+scr_crop.tids, scr_plate.plates = [7], ["沪O236"]
+_, ev1 = p_e2e.step(1, 1.0, frame=object(), force=True)
+scr_crop.tids, scr_plate.plates = [8], ["沪O236"]
+_, ev2 = p_e2e.step(2, 2.0, frame=object(), force=True)
+scr_crop.tids, scr_plate.plates = [0], ["沪C333"]
+_, ev3 = p_e2e.step(3, 3.0, frame=object(), force=True)
+check("端到端: 同 tid 首号出事件（事件名=首号，key=tid 串）",
+      len(ev0) == 1 and ev0[0]["name"] == "沪A111"
+      and ev0[0]["detail"]["key"] == "7", str(ev0))
+check("端到端: 同 tid 异号收敛（同车异号不再各出一条）", len(ev1) == 0)
+check("端到端: 新 tid 新组再报（Q1 拍板：二次入镜再报）",
+      len(ev2) == 1 and ev2[0]["name"] == "沪O236"
+      and ev2[0]["detail"]["key"] == "8")
+check("端到端: tid=0 回退按 label（Q5 拍板：不归匿名组）",
+      len(ev3) == 1 and ev3[0]["name"] == "沪C333"
+      and ev3[0]["detail"]["key"] == "沪C333")
 
 print(f"\n全部通过: {PASS} 项断言")

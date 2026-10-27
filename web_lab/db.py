@@ -86,11 +86,15 @@ _ID_PREFIXES = {
     "face_detect": "FDET",
     "face_embed": "FEMB",
     "face_store": "FSTO",
+    "gate_filter": "GATE",
     "extract_faces": "EXTF",
     "plate_recog": "PLATE",
 }
 _PIPELINE_PREFIX = "PIPE"  # 链路（pipelines 表 / kind='pipeline' 的 preset）
-_PRESET_ID_RE = re.compile(r"^[A-Z]{2,4}\d{4}$")  # 合法业务 ID 形如 YOLO0001
+# 合法业务 ID 形如 YOLO0001（前缀取 _preset_prefix：显式表或 module_id 前 4 字母大写；
+# {2,6} 兼容 5~6 字母前缀——如 plate_recog→PLATE0002，旧 {2,4} 会误拒存量 ID，
+# 定向更新（preset_id=）路径首次踩中，WO-0024.2）
+_PRESET_ID_RE = re.compile(r"^[A-Z]{2,6}\d{4}$")
 
 # 已下线/不落库模块（不注册参数 schema、不建参数表）：init_db 时幂等清理其参数表
 # 与 presets 行。
