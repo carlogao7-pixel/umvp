@@ -35,8 +35,10 @@
 `yolo_conf`、`yolo_iou`、`yolo_imgsz`、`yolo_max_det`、`yolo_classes`
 （模块测试页用 YOLO 造车辆框；生产链路由上游 `yolo` 阶段提供）。
 
-当前库内值（PLATE0001，与 PIPE0002 的 PLATE0002 同，快照 2026-10）：
-`detect_level=high, mode=crop, margin=0.1, dedup_iou=0.6, track_dedup=true, track_cooldown=5.0`。
+当前库内值（快照 2026-10）：PLATE0001 为
+`detect_level=high, mode=crop, margin=0.1, dedup_iou=0.6, track_dedup=true, track_cooldown=5.0`；
+PIPE0002 的 PLATE0002 自 WO-0024 换装独立门控阶段后改为 `track_dedup=false`
+（`track_cooldown=5.0` 保留作回切开关），其余同。
 
 ## 3. 输入（必要字段）
 
@@ -92,6 +94,9 @@
   `mode=crop` 时**，`yolo.infer(track=True)` 才启用。
   实测：车牌识别.MP4 20–35s（90 分析帧 / 332 车辆框）→ 开启前逐帧识别，开启后
   仅 3 次（每车一次，5s 冷却刷新）。
+  **PIPE0002 现状（WO-0024 换装）**：上述 ② 按车辆去重已移交独立门控阶段
+  `gate_filter`（key=track_id, interval=5.0，匿名桶统一受门控，裁剪前拦截）；本模块内置
+  `track_dedup` 保留作回切开关（`true` 即回内置门控）。见 [门控](gate_filter.md)。
 - **端口声明（P5）**：`PlateStage.INPUTS = {"frame": "Image", "crops": "Records"}`、
   `OUTPUTS = {"plates": "Records"}`——产物 `plate_recog.plates` 即产出的车牌记录列表
   （`image` 旁路＝原分辨率车牌图）。`plate_recog.frame` / `plate_recog.crops` 本期已纳入 `inputs`

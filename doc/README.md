@@ -17,7 +17,7 @@
 | 链路 | 业务目的 | 流程 | 专篇 |
 |---|---|---|---|
 | PIPE0001 警用无人机链路 | 无人机画面警情监测 | 帧管理 → YOLO 识人车 → **检测筛选** → 标注 → VLM 研判警情 → **时序判定事件尾** | `chains/pipe0001_police_uav.md` |
-| PIPE0002 车牌识别链路 | 车辆车牌识别与存证 | 帧管理 → YOLO 识车 → **检测筛选** → **目标裁剪(裁车)** → 车牌识别（裁车牌→识别→坐标还原→原分辨率提取车牌小图）→ **时序判定事件尾** | `chains/pipe0002_plate.md` |
+| PIPE0002 车牌识别链路 | 车辆车牌识别与存证 | 帧管理 → YOLO 识车 → **检测筛选** → **门控** → **目标裁剪(裁车)** → 车牌识别（裁车牌→识别→坐标还原→原分辨率提取车牌小图）→ **时序判定事件尾** | `chains/pipe0002_plate.md` |
 | PIPE0003 人脸截取链路 | 原分辨率人脸截取归档 | 帧管理 → YOLO 识人 → **检测筛选** → **目标裁剪(裁人)** → 人脸检测（检脸+原图出脸）（无嵌入/检索/事件，截取落盘即目的） | `chains/pipe0003_face_capture.md` |
 
 ### 1.2 平台通用能力
@@ -109,13 +109,17 @@ doc/
 ├── design/          专题设计（storage_design / live_overlay＝web 已落地；
 │                    video_review_search / wemm_integration＝下期设计稿；
 │                    assembly_ports＝拼接层端口协议设计稿，P5；
-│                    graph_chain＝图编排设计稿，P2）
+│                    graph_chain＝图编排设计稿，P2；
+│                    gate_filter＝门控阶段模块设计稿，pipe-chain；
+│                    event_dedup_key＝事件尾组合/回退去重键设计稿，pipe-chain）
 ├── agent/           挂载 agent 生成物（static_prompts / full_run_record；脚本生成勿手改）
-└── research/        历史选型调研（face_search_survey / plate_recog_survey；实现现状以 modules/ 为准）
+└── research/        历史选型调研（face_search_survey / plate_recog_survey /
+                     vlm_video_embedding_survey；实现现状以 modules/ 为准）
 ```
 
-**维护归属**（多代理协作）：`modules/` + `chains/` → pipe-chain；`guides/` + `design/` 前两篇 → web；
-`agent/` → agent-builder；`requirements/` + `design/` 后三篇 + `research/` + 本页 → orchestrator。
+**维护归属**（多代理协作）：`modules/` + `chains/` + `design/gate_filter.md` + `design/event_dedup_key.md` → pipe-chain；
+`guides/` + `design/` 其余前两篇 → web；
+`agent/` → agent-builder；`requirements/` + `design/` 其余后三篇 + `research/` + 本页 → orchestrator。
 
 ### 3.1 快速上手
 
@@ -162,6 +166,8 @@ doc/
 | `design/wemm_integration.md` | WeMM-Embedding 嵌入服务对接专篇：模型机制、serving 部署、WEMMClient 请求 schema、成本与联调清单（设计稿） |
 | `design/assembly_ports.md` | 拼接层端口协议（P5 设计稿）：产物命名 / 模块自描述输入输出 / 壳内 `inputs` 连线 / 校验断言；把「阶段插槽硬编码连线」升级为「模块自描述端口 + 壳内声明」；分三步实施（WO-0002） |
 | `design/graph_chain.md` | 图编排（P2 设计稿）：节点实例身份（产物全名 `{模块}#{位置}.{产物}`）/ 同模块复用 / `pipeline_edges`+`module_ports` 两表 / 迁移与双写；P2-0+P2-1 实施中（WO-0008），拓扑驱动执行与过渡节点（merge/join/to_images/split）为其后续期 |
+| `design/gate_filter.md` | 门控阶段模块 GateFilter（设计稿，WO-0023）：「按 key + 时间间隔放行」语义收敛为独立可组合阶段（module_id `gate_filter`）；匿名桶修 tid=0 缺口（INB-0089）、物理过滤+统计旁路（`last_gate` / `gate_filter.stats`）、三处既有门控（PlateStage 内置 / check_interval / seq_filter.throttle）收编路线、PIPE0002 灰度对跑方案 |
+| `design/event_dedup_key.md` | 事件尾去重键升级：组合/回退键（设计稿，WO-0025）：`SeqRule.key` 支持逗号组合字段按序回退（`"track_id,label"`）修 INB-0089 缺口②同车异号重复事件；PlateResult/composer 发布记录 track_id 透传；单字段零回归 + 匿名桶归一化不动 + PIPE0001 VLM 记录兼容（试金石）；PIPE0002 换装 rules 与对跑验收 |
 
 ### 3.6 挂载 agent（agent/ 与 .claude/agents/）
 
@@ -177,6 +183,7 @@ doc/
 | 文件 | 内容 |
 |---|---|
 | `research/face_search_survey.md`、`research/plate_recog_survey.md` | 选型期调研（历史，实现现状以 `modules/` 分册为准） |
+| `research/vlm_video_embedding_survey.md` | 视频嵌入模型调研（2026-10，WeMM/视频回查选型参考；Qwen3-VL-Embedding 推荐） |
 | `../DEPLOYMENT.md` | 部署变更台账（只追加） |
 
 ---

@@ -38,6 +38,7 @@
 | [YOLO 识别](yolo.md) | `image` → Image | `yolo.dets` → Records | 纯推理产检测记录（dict，`kind=det`） |
 | [检测筛选](det_filter.md) | `dets` → Records | `det_filter.dets` → Records | 放行子集＋`events`（改） |
 | [时序判定](seq_filter.md) | `dets` → Records | `seq_filter.dets` → Records | 门控放行＋`events`（改） |
+| [门控](gate_filter.md) | `dets` → Records | `gate_filter.dets` → Records；`gate_filter.stats` → Records（观测专用，非连线端口） | 物理过滤（只取舍不改）＋统计旁路 |
 | [目标裁剪](target_crop.md) | `frame` → Image；`dets` → Records | `target_crop.crops` → Records（元素含 `image`） | 接检测产子图 |
 | [标注](annotate.md) | `image` → Image；`dets` → Records | `annotate.annotated` → Image | 产带框图 |
 | [VLM 研判](vlm.md) | `image` → Image；`dets` → Records | —（研判内容回写主干 `label`/`content`） | 送审在驱动层消费 |
@@ -58,7 +59,8 @@
 
 **本期连线范围**（唯一来源 `web_lab/server.py` 的 `CHAIN_RESOLVED_PORTS` ＝
 `pipe.composer.RESOLVED_PORTS` ＋ 驱动层额外解析的 `vlm.dets`）：`yolo.image`、`det_filter.dets`、
-`seq_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、`plate_recog.frame/crops`、
+`seq_filter.dets`、`gate_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、
+`plate_recog.frame/crops`、
 `face_detect.frame/crops`；**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
 `inputs.image` 不支持）。校验：未知产物 / 非法端口 / 非上游引用 /
 类型不符 / 值非字符串 → 报错；同一产物被多个下游引用 → 允许（分支留路）。
@@ -92,6 +94,7 @@
 |---|---|---|---|
 | [检测筛选](det_filter.md) | 有效性筛选（逐条条件 DSL + 聚合 count + 成组数量 + 事件标注） | `DetFilter` | DF0001+ |
 | [时序判定](seq_filter.md) | 时序门控（节流/变化）+ 窗口确认闸 + 事件尾 | `SeqFilter` / `SeqRule` | SEQ0001+ |
+| [门控](gate_filter.md) | 按 key + 时间间隔放行（匿名桶统一受门控；物理过滤 + 统计旁路 `last_gate`/`gate_filter.stats`） | `GateFilter` | 「车牌识别·门控」（PIPE0002 默认 + 可回切，WO-0024） |
 
 > 链路输出 = 链尾阶段产出的事件：以幸存记录携带的 `events` 为载体
 > （[检测筛选](det_filter.md) `events` 规格 / [时序判定](seq_filter.md) `rules`），

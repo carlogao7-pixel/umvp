@@ -120,9 +120,9 @@ CREATE TABLE `presets` (
 | PRIMARY | id | 主键 | 按 id 精确取用/删除 |
 | uk_kind_name | kind, name | 唯一索引 | 保证"同 kind 下名字唯一"，并支撑同名覆盖判断 |
 
-### 3.5 当前数据快照（2026-10-16 实测）
+### 3.5 当前数据快照（2026-10-27 实测）
 
-- 行数：**23**，全部 `kind='module'`（**无 `kind='pipeline'` 行**——链路统一走
+- 行数：**24**，全部 `kind='module'`（**无 `kind='pipeline'` 行**——链路统一走
   `pipelines` + `pipeline_steps` 引用式，见 §4/§5）：
 
 | id | name | module_id | 归属 |
@@ -136,6 +136,7 @@ CREATE TABLE `presets` (
 | FM0002 | 车牌识别·帧管理 | frame_manager | PIPE0002 |
 | YOLO0002 | 车牌识别·YOLO识车 | yolo | PIPE0002 |
 | DF0002 | 车牌识别·检测筛选 | det_filter | PIPE0002 |
+| GATE0001 | 车牌识别·门控 | gate_filter | PIPE0002 |
 | CROP0002 | 车牌识别·目标裁剪 | target_crop | PIPE0002 |
 | PLATE0002 | 车牌识别·车牌识别 | plate_recog | PIPE0002 |
 | SEQ0002 | 车牌识别·时序判定 | seq_filter | PIPE0002 |
@@ -234,12 +235,12 @@ CREATE TABLE `pipeline_steps` (
 - 删被引用的模块 preset → **拒绝**：`ON DELETE RESTRICT` 兜底 + `delete_preset` 先查引用、
   报错带引用它的链路名。
 
-### 5.4 当前数据快照（2026-10-19 实测）
+### 5.4 当前数据快照（2026-10-27 实测）
 
-- 链路步骤共 **17**：PIPE0001 的 0..5 引用 FM0001 / YOLO0001 / DF0001 / ANNO0002 /
-  VLM0001 / SEQ0001；PIPE0002 的 0..5 引用 FM0002 / YOLO0002 / DF0002 / CROP0002 /
-  PLATE0002 / SEQ0002；PIPE0003 的 0..4 引用 FM0003 / YOLO0003 / DF0003 / CROP0003 /
-  FDET0002。
+- 链路步骤共 **18**：PIPE0001 的 0..5 引用 FM0001 / YOLO0001 / DF0001 / ANNO0002 /
+  VLM0001 / SEQ0001；PIPE0002 的 0..6 引用 FM0002 / YOLO0002 / DF0002 / GATE0001 /
+  CROP0002 / PLATE0002 / SEQ0002；PIPE0003 的 0..4 引用 FM0003 / YOLO0003 / DF0003 /
+  CROP0003 / FDET0002。
 - `pipeline_edges` **0 行**：三条保留链路未显式声明连线（全走代码默认取数规则）；
   只有经设计器保存过显式连线的链路才会落行（设计稿 `design/graph_chain.md` §3.3）。
 
@@ -338,7 +339,9 @@ CREATE TABLE IF NOT EXISTS module_ports (
 服务器启动时（`main()` 里 `init_db()` 之后）自动调用 `web_lab/server.py` 的
 `_seed_pipeline()`。**幂等**：同名已存在则跳过（尊重用户在 web 端的编辑）；
 每条链路经 `_seed_chain()` 按需创建各阶段 preset，**已存在链路阶段结构变化时自动重建**
-（按模块复用旧 preset、补建缺失阶段、丢弃下线阶段）。
+（按模块复用旧 preset、补建缺失阶段、丢弃下线阶段；重建时 `_seed_chain` 的 `converge`
+参数可对被复用的 preset **强制收敛指定参数**——其余用户参数保留、定向更新 id 不变，
+用于「形态升级后旧参数语义反转」场景，见下文 PIPE0002）。
 
 播种三条保留链路（各阶段 preset 与引用）：
 
@@ -347,17 +350,32 @@ CREATE TABLE IF NOT EXISTS module_ports (
   （frame_skip=15；YOLO imgsz=1280 / conf=0.25 / classes=0,2；检测筛选人≥2、车≥1；
   annotate 把检出框画在原帧上供 VLM 看"原图+画框"；VLM 结果经 `publish` 走 seq_filter
   的 rules 事件尾——词表命中 + 按警情类型独立冷却 30s）。
-- **车牌识别链路 PIPE0002**（6 步）：帧管理→YOLO识车→检测筛选→目标裁剪(裁车)→车牌识别→时序判定，
-  引用 FM0002→YOLO0002→DF0002→CROP0002→PLATE0002→SEQ0002（YOLO 只识车 classes=2 提供车辆框；
-  检测筛选车长边≥40；target_crop 按车辆框裁车放大 2×；plate_recog 从车图裁车牌 + 识别 →
-  坐标还原 → 原分辨率提取车牌小图；时序判定 rules `kind==plate` + 同车牌一次出事件）。
+- **车牌识别链路 PIPE0002**（7 步）：帧管理→YOLO识车→检测筛选→门控→目标裁剪(裁车)
+  →车牌识别→时序判定（尾），引用 FM0002→YOLO0002→DF0002→GATE0001→CROP0002→
+  PLATE0002→SEQ0002（YOLO 只识车 classes=2 提供车辆框；检测筛选车长边≥40；
+  gate_filter 按 track_id 每 5 秒放行一次、tid 缺失归匿名桶 * 统一受控（WO-0024 换装
+  独立门控，方案A）；target_crop 按车辆框裁车放大 2×；plate_recog 从车图裁车牌 + 识别 →
+  坐标还原 → 原分辨率提取车牌小图，**`track_dedup=False`**（内置去重关，放行节流由
+  门控阶段承担；track_cooldown=5.0 保留作回切开关）；时序判定 rules `kind==plate`、
+  分组键 `key="track_id,label"`（组合键，WO-0026：tid>0 按车分组、同车异号收敛一条；
+  tid 缺失回退按号=旧行为）+ `cooldown=-1`（同组一次出事件）。
+  **存量库迁移（WO-0024.2）**：结构变更重建时 `_seed_chain(converge={"plate_recog":
+  {"track_dedup": False}})` 对被复用的 PLATE0002 强制收敛该参数（其余用户参数保留，
+  打 `[seed]` 日志），保证新库与存量库重启后生效形态一致——否则旧 preset 复用后仍
+  `track_dedup=True`，变成「独立门控 + 内置去重」叠加而非目标形态。
+  **存量库迁移（WO-0026.1，组合键）**：组合键升级未改链路阶段结构（仍 7 步），
+  `_seed_chain` 走「结构一致提前 return」不迁移 preset 参数；故另有
+  `_converge_seq_group_key()` 启动定向收敛：SEQ0002 的 rules **恰好等于旧默认**
+  （`key="label"` 那份 JSON，语义等价比较）→ 升级为组合键版（id 与其余参数不变，
+  打 `[seed]` 日志）；已是新键 → 静默（幂等）；**用户改过（≠旧默认）→ 保留不动**，
+  打一行提示告知手工换法（把 rules 的 key 改为 `"track_id,label"` 一词）。
 - **人脸截取链路 PIPE0003**（5 步）：帧管理→YOLO识人→检测筛选→目标裁剪(裁人)→人脸检测，
   引用 FM0003→YOLO0003→DF0003→CROP0003→FDET0002（YOLO 只识人 classes=0；
   检测筛选人长边≥30；target_crop 按人框裁人；face_detect 阶段（FaceStage）在子图里检脸 +
   从原图出原分辨率人脸；无嵌入/检索/告警——逐帧提取原分辨率人脸落盘即目的）。
 
 另有**独立模块默认 preset**（`_SEED_STANDALONE`，不入任何链路步骤）：人脸检测 / 人脸嵌入 /
-向量底库 / 目标裁剪 / 标注 / 车牌识别 各一份「·默认」。合计 17（链路阶段）+ 6（独立）= 23。
+向量底库 / 目标裁剪 / 标注 / 车牌识别 各一份「·默认」。合计 18（链路阶段）+ 6（独立）= 24。
 
 播种来源已收敛到这一处（原 server.py 双链路种子、tests/police_uav_config.py、
 tests/face_dedup_config.py 均已移除）。

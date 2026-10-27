@@ -47,7 +47,7 @@
 |---|---|---|---|
 | match | str | 必填 | 单条条件 DSL（语法/字段同检测筛选，含派生 w/h/short/long/area 与注入的 ts/frame_idx）；非法表达式装配期报错 |
 | event | str | 必填 | 事件名：达成时追加到记录的 `events`；支持 `{字段}` 占位（**动态事件名**，如 "{label}"、"警情-{cls_id}"） |
-| key | str | track_id | 分组键（窗口计数、冷却抑制均按它分组；值缺失/None/0 归 `"*"` 组——无跟踪的记录同一窗内一起计数） |
+| key | str | track_id | 分组键（窗口计数、冷却抑制均按它分组；值缺失/None/0 归 `"*"` 组——无跟踪的记录同一窗内一起计数）。支持**逗号组合字段**：逗号组合，按序取第一个非空（非 0/None）字段值做分组键；全部无效归匿名组。如 `"track_id,label"`：tid>0 按 track 分组，tid=0/缺失回退按 label（不归匿名组）——同车异号事件收敛即靠它（WO-0026） |
 | span | float | 0.0 | 时间窗秒数（与 window_n 二选一；两者皆 0=单条语义） |
 | window_n | int | 0 | 计数窗（最近 N 条到达；与 span 二选一） |
 | min_n | int | 1 | 窗口内命中 ≥ n 才达成（min_n>1 需 span>0 或 window_n>0） |
@@ -121,6 +121,8 @@ conda run -n ai python tests/test_det_filter.py   # 姊妹模块回归（共用 
 - **同一事件别刷屏** → 配 cooldown（按 key 抑制）；同对象只出一次用 `cooldown<0`。
 - 车牌"连续读到才采信"：key=label（车牌号），match=`kind == plate`，
   span=3、min_n=2。
+- **同车异号重复告警**（一车多条事件）→ key=`track_id,label`（组合键：tid>0 按
+  track 聚合、tid=0/缺失回退按号），配 `cooldown<0` = 一车一条（WO-0026）。
 
 ## 8. 边界与路线
 

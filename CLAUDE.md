@@ -55,7 +55,8 @@ UMVP（统一模块化视觉分析管道）独立部署包，代码 + 权重自�
 
 ```
 umvp/pipe/        分析模块 + Pipeline 装配器（FrameManager / YOLODetector / VLMAnalyzer /
-                  DetFilter / SeqFilter / TargetCrop / Annotator + cropper / conditions / records）
+                  DetFilter / SeqFilter / GateFilter / TargetCrop / Annotator + cropper /
+                  conditions / records / gate_filter）
 umvp/face_detect/ SCRFD 人脸检测 + 5 点对齐（FaceDetector / FaceStage）
 umvp/face_embed/  ArcFace 512d 嵌入 + numpy 向量底库
 umvp/face_scan/   人脸管道编排（复用 pipe.FrameManager 取帧+背压）
@@ -74,7 +75,7 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
 
 - **保留链路**：三条——
   **PIPE0001 警用无人机**（帧管理→YOLO→检测筛选→标注→VLM研判→时序判定事件尾）、
-  **PIPE0002 车牌**（帧管理→YOLO识车→检测筛选→目标裁剪(裁车)→车牌识别→时序判定事件尾）、
+  **PIPE0002 车牌**（帧管理→YOLO识车→检测筛选→门控(track 5s)→目标裁剪(裁车)→车牌识别→时序判定事件尾；事件尾组合键 track_id,label 同车异号收敛）、
   **PIPE0003 人脸截取**（帧管理→YOLO识人→检测筛选→目标裁剪(裁人)→人脸检测；截取落盘即目的）。
   链路**输出 = 事件尾产出的记录事件**（原「输出处理 OutputPolicy」已弃用删除）。
   播种幂等收敛在 `web_lab/server.py _seed_pipeline()`；各阶段引用自己的模块 preset。
@@ -143,6 +144,7 @@ $PY tests/test_target_crop.py             # 目标裁剪
 $PY tests/test_annotate.py                # 标注
 $PY tests/test_det_filter.py              # 检测筛选
 $PY tests/test_seq_filter.py              # 时序判定
+$PY tests/test_gate_filter.py             # 门控阶段（间隔门控/匿名桶，WO-0023）
 $PY tests/test_police_uav_pipeline.py     # 警用链路逻辑断言
 $PY tests/test_police_uav_video.py        # 警用链路端到端（真实 YOLO + mock VLM）
 $PY tests/test_face_extract_pipeline.py   # 人脸提取链路
@@ -187,6 +189,9 @@ bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂
   出现该字符串的任意进程（父 shell、`bash -c` 诊断命令等），造成「明明没起却报在跑」的误判；
   正确做法 `pgrep -x <进程名>` 精确取 pid 后读 `/proc/<pid>/cmdline` 核特征（INB-0055，
   `web_lab/mysql_lib.sh` 已按此实现）。
+- **`conda run -n ai python -` 不吃 heredoc/stdin 管道**：python 收到空 stdin 直接报
+  JSONDecodeError/无输出——verify 类内联断言脚本先落临时文件再
+  `conda run -n ai python <文件>` 执行（INB-0071）。
 - **已知限制（未修，待评估）**：`face_embed` 去重阈值未进 `web_lab` PARAMS（`server.py`），驱动层恒取
   默认 0.55，需按链路配阈值时要补 `thresh`（含 DB 参数表列）；另 `_chain_from_spec` 对含
   face_detect/face_embed 的 spec 在**装配期**即构造模型（即加载权重），`h_chain` 等非链路入口同样加载。
