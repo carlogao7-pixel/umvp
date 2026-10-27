@@ -70,9 +70,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def decl_checks() -> None:
     decl = server.module_port_decls()
 
-    check("decl: 9 个产品模块均有端口声明",
+    check("decl: 10 个产品模块均有端口声明（WO-0023 增 gate_filter）",
           set(decl) == {"frame_manager", "yolo", "vlm", "det_filter", "seq_filter",
-                        "target_crop", "annotate", "face_detect", "plate_recog"},
+                        "gate_filter", "target_crop", "annotate", "face_detect",
+                        "plate_recog"},
           str(sorted(decl)))
     check("decl: frame_manager 是源头（无输入，出 frame:Image）",
           decl["frame_manager"]["inputs"] == {}

@@ -681,6 +681,7 @@ let syncFrames = [];        // 已收分析帧结果（按 n 升序）
 let syncLastTs = -1;        // 最新结果时间
 let syncAutoPaused = false; // 是否由节流自动暂停
 let syncDims = null;        // 被分析视频的原始宽高（meta 下发，叠加换算兜底）
+let syncGateBlocked = 0;    // 门控拦截累计（frame.gate.blocked 求和；meta 时清零）
 const SYNC_AHEAD_EPS = 0.2; // 允许视频比最新结果超前的时间（秒），超出即判为"未分析帧"
 
 function _syncSetState(text){
@@ -733,6 +734,7 @@ function startSync(){
     syncRunId = d.run_id;
     syncFps = d.fps || 25;
     syncDims = (d.width && d.height) ? {w: d.width, h: d.height} : null;
+    syncGateBlocked = 0;  // 门控拦截累计（frame.gate 由后端在确有拦截时携带）
     video.pause();
     video.currentTime = (d.start_frame || 0) / syncFps;
     _syncSetState(`处理中… 0 帧（${syncFps.toFixed(1)}fps）`);
@@ -741,7 +743,9 @@ function startSync(){
     const d = JSON.parse(e.data);
     syncFrames.push(d);
     syncLastTs = d.ts;
-    _syncSetState(`处理中… ${syncFrames.length} 帧`);
+    if (d.gate && d.gate.blocked) syncGateBlocked += d.gate.blocked;
+    _syncSetState(`处理中… ${syncFrames.length} 帧`
+                  + (syncGateBlocked ? `｜门控拦截 ${syncGateBlocked}` : ''));
     if (syncAutoPaused){  // 有新结果，续播
       syncAutoPaused = false;
       video.play().catch(() => {});
@@ -750,7 +754,9 @@ function startSync(){
   syncES.addEventListener('done', (e) => {
     const d = JSON.parse(e.data);
     _syncSetState(`完成：${d.processed} 帧 / 检测 ${d.detections} / 车牌 ${d.plates} / `
-                  + `告警 ${d.alarms}（${d.elapsed}s）${d.stopped ? '｜已停止' : ''}`);
+                  + `告警 ${d.alarms}`
+                  + (syncGateBlocked ? ` / 门控拦截 ${syncGateBlocked}` : '')
+                  + `（${d.elapsed}s）${d.stopped ? '｜已停止' : ''}`);
     video.pause();  // 停在最后一个分析帧，避免视频继续跑而框被冻结
     _syncClose();
   });

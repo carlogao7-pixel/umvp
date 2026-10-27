@@ -206,6 +206,7 @@ class ResourceEstimator:
         "vlm": TYPE_VLM,
         "det_filter": TYPE_LOGIC,      # 检测筛选：纯逻辑
         "seq_filter": TYPE_LOGIC,      # 时序判定：纯逻辑
+        "gate_filter": TYPE_LOGIC,     # 门控：纯逻辑（零开销，显式登记自文档）
         "compose": TYPE_YOLO,          # compose 含 YOLO 主推理
         "face_detect": TYPE_SCRFD,
         "face_embed": TYPE_ARCFACE,
