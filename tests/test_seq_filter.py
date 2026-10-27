@@ -10,6 +10,7 @@
   4. 组合：DetFilter(取舍) → SeqFilter(确认) 串联
   5. 门控：throttle 整类节流 / change track 集合变化（原 Pipeline 编排迁入）
   7. dict/object 双形态等价（窗口达成 / dict 进 dict 出 / cooldown·throttle dict 路径）
+  8. 组合键/回退键（key 逗号组合字段；单字段逐字等价 / tid=0 回退 / 匿名桶不变，WO-0026）
 
 运行: conda run -n ai python tests/test_seq_filter.py
 """
@@ -253,6 +254,127 @@ def main() -> None:
     g_rec = sf_t.run([to_record(det((0, 0, 50, 50), tid=1, cls=0))], ts=0.0)
     check("throttle dict 路径：首帧放行且元素仍为 dict",
           len(g_rec) == 1 and isinstance(g_rec[0], dict))
+
+    # ---- 8. 组合键/回退键（WO-0026：key 逗号组合字段，设计稿 event_dedup_key.md §2.1） ----
+    print("== 8. 组合键/回退键 ==")
+    sf_probe = SeqFilter([SeqRule(match="cls_id == 0", event="E")])   # 探针：直测 _key_of
+
+    def _old_key_of(rec_d: dict, key: str) -> str:
+        """改动前实现（对照基准）。"""
+        v = rec_d.get(key)
+        return "*" if v is None or v == "" or v == 0 else str(v)
+
+    # 8.1 单字段逐字回归：行为等价 + _key_of 遍历对照
+    sf = SeqFilter([SeqRule(match="kind == plate", event="E", key="label", cooldown=-1)])
+    e1 = sf.run([{"kind": "plate", "label": "粤A1"}], ts=0.0)
+    e2 = sf.run([{"kind": "plate", "label": "粤A1"}], ts=1.0)
+    e3 = sf.run([{"kind": "plate", "label": "粤B1"}], ts=2.0)
+    check("组合键: 单字段 label 行为与旧实现一致（同号一次/异号新报）",
+          len(e1) == 1 and len(e2) == 0 and len(e3) == 1)
+    _eq_cases = [
+        ({"label": "粤A", "track_id": 3}, "label"),
+        ({"label": "", "track_id": 0}, "label"),
+        ({"label": None, "track_id": 0}, "label"),
+        ({"label": 0, "track_id": 1}, "label"),
+        ({}, "label"),
+        ({"track_id": 7}, "track_id"),
+        ({"track_id": 0}, "track_id"),
+        ({"track_id": None}, "track_id"),
+        ({"cls_id": 0}, "cls_id"),
+        ({"label": False, "track_id": 0}, "label"),
+    ]
+    check("组合键: _key_of 单字段路径与旧实现逐字等价（遍历对照）",
+          all(sf_probe._key_of(r, k) == _old_key_of(r, k) for r, k in _eq_cases))
+
+    # 8.2 组合键 tid>0 聚合：同 tid 异号 ×N 收敛 1 事件，事件名=首号，detail.key=tid 串
+    sf = SeqFilter([SeqRule(match="kind == plate", event="{label}",
+                            key="track_id,label", cooldown=-1)])
+    o1 = sf.run([{"kind": "plate", "track_id": 7, "label": "沪A111"}], ts=0.0)
+    o2 = sf.run([{"kind": "plate", "track_id": 7, "label": "沪O236"}], ts=1.0)
+    o3 = sf.run([{"kind": "plate", "track_id": 7, "label": "京M236"}], ts=2.0)
+    check("组合键: 同 tid 异号 ×3 收敛 1 事件（cooldown=-1）",
+          len(o1) == 1 and len(o2) == 0 and len(o3) == 0)
+    check("组合键: 事件名=首号，detail.key=tid 串",
+          o1[0]["events"][0]["name"] == "沪A111"
+          and o1[0]["events"][0]["detail"]["key"] == "7")
+
+    # 8.3 tid=0 回退 label：不归匿名组（回退发生在选字段层）
+    sf = SeqFilter([SeqRule(match="kind == plate", event="E", key="track_id,label", cooldown=-1)])
+    r1 = sf.run([{"kind": "plate", "track_id": 0, "label": "沪A"}], ts=0.0)
+    r2 = sf.run([{"kind": "plate", "track_id": 0, "label": "沪B"}], ts=1.0)
+    r3 = sf.run([{"kind": "plate", "track_id": 0, "label": "沪A"}], ts=2.0)
+    check("组合键: tid=0 回退按 label（异号各自成组、同号一次）",
+          len(r1) == 1 and len(r2) == 1 and len(r3) == 0
+          and r1[0]["events"][0]["detail"]["key"] == "沪A")
+
+    # 8.4 全字段无效归 "*" 匿名桶（语义不变）
+    sf = SeqFilter([SeqRule(match="kind == plate", event="E", key="track_id,label", cooldown=-1)])
+    m1 = sf.run([{"kind": "plate"}], ts=0.0)
+    m2 = sf.run([{"kind": "plate"}], ts=1.0)
+    check("组合键: 全字段无效归 '*'（多条终身 1 条，匿名桶语义不变）",
+          len(m1) == 1 and len(m2) == 0
+          and sf_probe._key_of({"kind": "plate"}, "track_id,label") == "*")
+
+    # 8.5 VLM 记录兼容（无 track_id 字段 → 自动退化为首个有效字段）
+    vlm_seq = [{"kind": "vlm", "label": "治安类", "text": ""},
+               {"kind": "vlm", "label": "治安类", "text": ""},
+               {"kind": "vlm", "label": "交通类", "text": ""}]
+    sf_c = SeqFilter([SeqRule(match="kind == vlm", event="{label}",
+                              key="track_id,label", cooldown=30.0)])
+    sf_s = SeqFilter([SeqRule(match="kind == vlm", event="{label}",
+                              key="label", cooldown=30.0)])
+    seq_c = [(lambda o: (len(o), o[0]["events"][0]["name"] if o else None))(sf_c.run([r], ts=t))
+             for t, r in enumerate(vlm_seq)]
+    seq_s = [(lambda o: (len(o), o[0]["events"][0]["name"] if o else None))(sf_s.run([r], ts=t))
+             for t, r in enumerate(vlm_seq)]
+    check("组合键: VLM 记录（无 track_id）组合键与单字段事件序列逐条一致",
+          seq_c == seq_s == [(1, "治安类"), (0, None), (1, "交通类")], str(seq_c))
+
+    # 8.6 key 空格容忍：'track_id, label' ≡ 'track_id,label'；纯逗号/空串全 '*'
+    sf_a = SeqFilter([SeqRule(match="kind == plate", event="E", key="track_id, label", cooldown=-1)])
+    sf_b = SeqFilter([SeqRule(match="kind == plate", event="E", key="track_id,label", cooldown=-1)])
+    sa = sf_a.run([{"kind": "plate", "track_id": 9, "label": "粤A"}], ts=0.0)
+    sb = sf_b.run([{"kind": "plate", "track_id": 9, "label": "粤A"}], ts=0.0)
+    sa2 = sf_a.run([{"kind": "plate", "track_id": 9, "label": "粤B"}], ts=1.0)
+    check("组合键: 空格容忍 'track_id, label' ≡ 'track_id,label'",
+          len(sa) == len(sb) == 1 and len(sa2) == 0)
+    check("组合键: 纯逗号/空串 → 全 '*'（不抛错，同现状匿名桶）",
+          sf_probe._key_of({"label": "x"}, ",") == "*"
+          and sf_probe._key_of({"label": "x"}, " , ,") == "*"
+          and sf_probe._key_of({"label": "x"}, "") == "*")
+
+    # 8.7 窗口规则 + 组合键：分组计数、跨组互不掺窗
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留",
+                            key="track_id,label", span=5.0, min_n=3)])
+    w1 = sf.run([{"cls_id": 0, "track_id": 1, "label": "L1"}], ts=0.0)
+    w2 = sf.run([{"cls_id": 0, "track_id": 1, "label": "L2"}], ts=1.0)   # 同 tid 异 label 仍同组
+    w3 = sf.run([{"cls_id": 0, "track_id": 1, "label": "L3"}], ts=2.0)   # 第 3 条达成
+    check("组合键: 窗口按组合键分组计数（同 tid 异 label 同窗累计）",
+          len(w1) == 0 and len(w2) == 0 and len(w3) == 1
+          and w3[0]["events"][0]["detail"]["count"] == 3)
+    w4 = sf.run([{"cls_id": 0, "track_id": 2, "label": "L1"}], ts=3.0)   # tid=2 独立窗口
+    check("组合键: 跨组互不掺窗", len(w4) == 0)
+
+    # 8.8 cooldown≥0 + 组合键：同组抑制期内扣留/到期可再报，异组不受影响
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="E",
+                            key="track_id,label", cooldown=10.0)])
+    k1 = sf.run([{"cls_id": 0, "track_id": 5, "label": "A"}], ts=0.0)
+    k2 = sf.run([{"cls_id": 0, "track_id": 5, "label": "B"}], ts=5.0)    # 同组期内扣留
+    k4 = sf.run([{"cls_id": 0, "track_id": 6, "label": "A"}], ts=5.0)    # 异组不受影响
+    k3 = sf.run([{"cls_id": 0, "track_id": 5, "label": "C"}], ts=11.0)   # 到期可再报
+    check("组合键+cooldown: 同组抑制/到期可再报/异组不受影响",
+          len(k1) == 1 and len(k2) == 0 and len(k4) == 1 and len(k3) == 1)
+
+    # 8.9 对象形态双兼容：Detection（to_record 带 track_id）与 dict 同结果
+    sf_o = SeqFilter([SeqRule(match="cls_id == 0", event="E", key="track_id,label", cooldown=-1)])
+    sf_r = SeqFilter([SeqRule(match="cls_id == 0", event="E", key="track_id,label", cooldown=-1)])
+    oo1 = sf_o.run([det((0, 0, 50, 50), tid=7), det((0, 0, 50, 50), tid=7)], ts=0.0)
+    rr1 = sf_r.run([to_record(det((0, 0, 50, 50), tid=7)),
+                    to_record(det((0, 0, 50, 50), tid=7))], ts=0.0)
+    oo2 = sf_o.run([det((0, 0, 50, 50), tid=7)], ts=1.0)
+    rr2 = sf_r.run([to_record(det((0, 0, 50, 50), tid=7))], ts=1.0)
+    check("组合键: 对象/dict 双形态同结果（同 tid 收敛 1 条、后续扣留）",
+          len(oo1) == len(rr1) == 1 and len(oo2) == len(rr2) == 0)
 
     print(f"\n全部通过: {PASS} 项断言")
 

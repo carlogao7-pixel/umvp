@@ -26,7 +26,7 @@ from pipe.composer import YOLODetector
 from pipe.det_filter import DetFilter
 from pipe.cropper import Cropper
 from pipe.target_crop import crop_targets, TargetCrop
-from plate_recog.plate_recognizer import PlateRecognizer, extract_plates
+from plate_recog.plate_recognizer import PlateRecognizer, PlateResult, extract_plates
 
 DATA = ROOT / "tests/data/pic"
 OUT = ROOT / "tests/data/out/plates"
@@ -62,6 +62,39 @@ def _draw(frame, results, tag: str):
 
 def main() -> None:
     t0 = time.time()
+
+    # ---- 0. 数据面（WO-0026.2）：PlateResult.track_id 默认值 + extract_plates 透传（纯逻辑） ----
+    pr0 = PlateResult(plate_no="粤A12345", plate_type=0, type_name="蓝牌", color="blue",
+                      score=0.9, bbox=(0, 0, 10, 10))
+    check("数据面: PlateResult 不传 track_id → 默认 0（老构造零回归）", pr0.track_id == 0)
+    check("数据面: to_dict 带 track_id 键（默认 0）", pr0.to_dict().get("track_id") == 0)
+
+    class _StubPlateRec:
+        """桩识别器：对任意子图固定读出一张车牌（不加载模型）。"""
+
+        def recognize(self, img):
+            return [PlateResult(plate_no="粤B67890", plate_type=0, type_name="蓝牌",
+                                color="blue", score=0.88, bbox=(2, 2, 10, 10))]
+
+    class _TidCrop:
+        """最小裁剪对象：带 track_id 的几何（offset=0/scale=1 → 恒等还原）。"""
+
+        def __init__(self, img, track_id):
+            self.img, self.bbox, self.offset, self.scale = img, (0, 0, 16, 16), (0, 0), 1.0
+            self.track_id = track_id
+
+        def to_original(self, bbox):
+            return tuple(int(v) for v in bbox)
+
+    tiny = np.zeros((16, 16, 3), dtype=np.uint8)
+    tid_plates = extract_plates(tiny, [_TidCrop(tiny, 7)], _StubPlateRec())
+    check("数据面: extract_plates 透传 track_id（crop tid=7 → PlateResult.track_id=7）",
+          len(tid_plates) == 1 and tid_plates[0].track_id == 7
+          and tid_plates[0].to_dict().get("track_id") == 7)
+    ntid = extract_plates(tiny, [_TidCrop(tiny, 0)], _StubPlateRec())
+    check("数据面: crop 无跟踪（tid=0）→ 结果 track_id=0（非标 crop 经 getattr 兜底）",
+          len(ntid) == 1 and ntid[0].track_id == 0)
+
     rec = PlateRecognizer(detect_level="high")
     print(f"PlateRecognizer 就绪 ({time.time()-t0:.1f}s, model_root={rec.model_root})")
 
@@ -79,6 +112,8 @@ def main() -> None:
         for p in direct:
             print(f"      {p.plate_no}  {p.type_name}/{p.color}  {p.score:.3f}  {p.bbox}")
         check(f"{stem}: 整帧读到车牌", len(direct) >= 1, f"{len(direct)} 张")
+        check(f"{stem}: 整帧直读 track_id 恒 0（direct 无 crop 来源，回退语义自洽）",
+              all(p.track_id == 0 for p in direct))
         check(f"{stem}: 整帧直读不带原分辨率图（两级裁剪专属）",
               all(p.plate_img is None for p in direct))
         if direct:
@@ -109,6 +144,8 @@ def main() -> None:
             print(f"      {p.plate_no}  {p.type_name}/{p.color}  {p.score:.3f}  "
                   f"bbox={p.bbox} car={p.car_bbox} up={p.upscale}")
         check(f"{stem}: 两级裁剪读到车牌", len(two) >= 1, f"{len(two)} 张")
+        check(f"{stem}: 纯推理无跟踪（track=False）→ 车牌 track_id 恒 0",
+              all(p.track_id == 0 for p in two))
         for p in two:
             x1, y1, x2, y2 = p.bbox
             check(f"{stem}: 还原框在图内", 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h, str(p.bbox))

@@ -17,7 +17,9 @@
 
 语义细则：规则**各自独立**（一条记录可被多条规则同时命中共标注；达成才追加事件）；
 窗口达标即清空重臂，cooldown 再按 key 额外抑制；时间取记录自带 ts（缺省用 run 的
-ts）；key 值缺失/None/0 归 "*" 组；输出保持原类型（对象进对象出、dict 进 dict 出）。
+ts）；key 值缺失/None/0 归 "*" 组；key 支持逗号组合字段（如 "track_id,label"，按序取
+第一个非 None/""/0 的字段值，全无效归 "*" 组）；输出保持原类型（对象进对象出、
+dict 进 dict 出）。
 
 门控（时序节流/变化，2026-10 自 Pipeline 迁入，与规则可并用）：
   throttle —— 整类节流：key（一般 cls_id）+ 间隔秒；同一 key 每隔 interval 秒才放行
@@ -62,7 +64,7 @@ class SeqRule:
 
     match: str                  # 条件 DSL（必填；非法表达式装配期抛错）
     event: str                  # 事件名（必填），支持 {字段} 占位
-    key: str = "track_id"       # 分组键（窗口计数与冷却抑制均按它分组）
+    key: str = "track_id"       # 分组键（窗口计数与冷却抑制均按它分组；支持逗号组合字段，取第一个有效值）
     span: float = 0.0           # 时间窗秒（与 window_n 二选一）
     window_n: int = 0           # 计数窗（最近 N 条到达；与 span 二选一）
     min_n: int = 1              # 窗口内命中 ≥ n 才达成
@@ -145,8 +147,19 @@ class SeqFilter:
 
     # ---- 内部 ----
     def _key_of(self, rec: dict, key: str) -> str:
-        v = rec.get(key)
-        return "*" if v is None or v == "" or v == 0 else str(v)
+        """分组键取值：key 支持逗号组合字段（如 "track_id,label"），按序取第一个
+        有效值（非 None/""/0）；全部字段无效 → 匿名桶 "*"。回退发生在选字段层，
+        归一化只对最终选中值生效（tid=0 + label 有效 → 按 label 分组，非匿名桶）。
+        单字段 key 与旧实现逐字等价（零回归）。（WO-0026，doc/design/event_dedup_key.md §2.1）
+        """
+        for f in key.split(","):
+            f = f.strip()
+            if not f:
+                continue
+            v = rec.get(f)
+            if not (v is None or v == "" or v == 0):
+                return str(v)
+        return "*"
 
     def _rec(self, it, ts: float, frame_idx: int) -> dict:
         """记录视图：dict 原地（事件可写回），对象转 Record 副本（只读匹配）。"""

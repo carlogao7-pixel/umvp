@@ -67,6 +67,7 @@ class PlateResult:
     index: int = 0  # 序号
     plate_img: Optional[np.ndarray] = None  # 原分辨率车牌图（从原图直接裁出，含 margin；仅两级裁剪）
     plate_crop_bbox: Optional[Tuple[int, int, int, int]] = None  # plate_img 对应的原图裁剪框
+    track_id: int = 0  # 来源检测 track_id（从 CropResult 透传；0=无跟踪/整帧直读，WO-0026）
 
     @property
     def width(self) -> int:
@@ -86,6 +87,7 @@ class PlateResult:
             "bbox": list(self.bbox),
             "size": [self.width, self.height],
             "index": self.index,
+            "track_id": int(self.track_id),
         }
         if self.car_bbox is not None:
             d["car_bbox"] = list(self.car_bbox)
@@ -220,5 +222,6 @@ def extract_plates(
                 plate_no=p.plate_no, plate_type=p.plate_type, type_name=p.type_name,
                 color=p.color, score=p.score, bbox=bbox_o,
                 car_bbox=tuple(int(v) for v in c.bbox), upscale=c.scale,
-                index=len(results), plate_img=plate_img, plate_crop_bbox=pb_final))
+                index=len(results), plate_img=plate_img, plate_crop_bbox=pb_final,
+                track_id=int(getattr(c, "track_id", 0) or 0)))
     return results
