@@ -22,4 +22,6 @@ if [ "$NO_DB" -eq 0 ]; then
   }
 fi
 
-exec "$PY" server.py "$@"
+# PYTHONUNBUFFERED=1：前台 tty 默认行缓冲无感，但输出被重定向到文件时同样块缓冲
+# 会丢/迟日志（INB-0104/WO-0027）；仅本行前缀注入，与 restart.sh 口径一致。
+PYTHONUNBUFFERED=1 exec "$PY" server.py "$@"

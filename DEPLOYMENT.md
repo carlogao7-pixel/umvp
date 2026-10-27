@@ -34,6 +34,42 @@
 
 ## 记录
 
+### 2026-10-27(二) · WO-0027：restart.sh 族 python server 启动无缓冲（修 INB-0104 [seed] 日志延迟/丢失）
+- 变更内容：`web_lab/restart.sh` 与 `web_lab/run.sh` 的 python server 启动行前缀注入 `PYTHONUNBUFFERED=1`（择此而非 `python -u`：与 vlm_env.sh 的 env 注入 setsid server 风格一致，且可传导到 server 派生的 python 子进程；仅启动行作用域，不全局 export）。restart.sh 为后台 `setsid` 拉起、stdout 直连 `out/web_lab.log` 块缓冲——`[seed]`/print 启动日志延迟落盘，进程被 stop 时缓冲整体丢弃（全历史日志 0 条 `[seed]` 即此因，INB-0098 排查播种事故时已被咬）；run.sh 前台 exec tty 下本为行缓冲，但输出重定向到文件时同病，一并统一口径。HTTP 访问日志走 stderr，不受影响。
+- 影响面：**入口**（启动脚本）
+- 部署注意：无手工步骤、无新依赖；换机拉代码即生效。WO-0026 条目的「stdout 坑观测口径」已同步改为已修（`[seed]` 行即时落盘可直接 tail；curl /api/presets 兜底保留）。
+- 验证：`bash web_lab/restart.sh` 后立即 `tail out/web_lab.log` 即见 flask 启动横幅（无延迟）；`/api/pipelines` 200；二次重启幂等（无残留进程/重复拉起）；杀进程时已落盘行不丢。
+
+### 2026-10-27(二) · WO-0026：事件尾组合/回退键（同车异号收敛，PIPE0002 换装 rules key="track_id,label"）
+- 变更内容：①数据面 track_id 透传补链（设计稿 doc/design/event_dedup_key.md D1/D2/D5）：PlateResult 增 track_id（默认 0）+ to_dict 带键、extract_plates 从 CropResult 透传、composer 车牌发布记录带 track_id（整数标量走 JSON 主干，direct 模式恒 0）；②seq_filter `_key_of` 支持逗号组合键（"track_id,label" 按序取第一个非 None/""/0 字段值，全部无效归匿名桶 "*"；**单字段路径逐字等价**，PIPE0001 VLM 记录零影响）；③web：`_SEED_PLATE_STAGES` SEQ0002 rules key "label"→"track_id,label"、存量 preset 定向收敛 `_converge_seq_group_key()`（恰等旧默认→升级打日志 / 已新键→静默 / 用户改过→保留+提示手工换法）、PARAMS rules 文案补组合键说明；④tests 基线 `test_validate_chain` BASE_PLATE 同步组合键（回切形态 BASE_PLATE_ROLLBACK 保留 key=label 仍合法）。
+- 影响面：**配置**、**DB**（存量 SEQ0002 preset 参数定向收敛，表结构零变化）
+- 部署注意：重启 web_lab 自动完成存量收敛，无手工步骤；无新依赖/模型。收敛日志形态：`[seed] 模块配置 SEQ0002（seq_filter）rules key 定向收敛 label → track_id,label`；已升级库二次重启静默（幂等）。~~注意观测坑~~**已修（WO-0027）**：restart.sh 启动行注入 `PYTHONUNBUFFERED=1`，stdout 不再块缓冲，`[seed]` 行即时落盘、可直接 `tail out/web_lab.log` 核对；`curl /api/presets` 看 SEQ0002 rules key 仍可作双保险兜底。回退：SEQ0002 rules 的 key 手工改回 `"label"` 即回旧行为（按号终身一次）。
+- 验证：全量回归绿（qa WO-0026.3）——seq 63 / composer 127 / plate 36 / det 72 / validate 46/46 / target_crop 45 / gate 62 / port_inputs 74 / police_uav / annotate 43 / cropper 26；本机存量库 restart 实测升级日志 + 二跑幂等静默 + /api/presets SEQ0002 key=track_id,label（SEQ0001 保持 key=label）；实跑对跑（INB-0089 素材 车牌识别.MP4）：key=label 基线 11 识别→9 事件 vs 组合键 11 识别→4 事件——tid=2 车沪DHH230/沪OHH236/京GMH236 异号收敛 1 条（事件名=首号，detail.key='2'），tid=0 帧回退按号行为不变；横幅1.MP4 两轮均 20 识别→5 事件（事件名逐一相同、无新增误报，识别次数/处理帧/落盘张数不缩水）。
+
+### 2026-10-27(二) · WO-0024：PIPE0002 车牌链路转正独立门控阶段（7 步形态，方案A）
+- 变更内容：①`_SEED_PLATE_STAGES` 插 `gate_filter`（"车牌识别·门控"，key=track_id / interval=5.0 / filter=""，位于 det_filter 与 target_crop 之间）→ PIPE0002 播种 6 步变 7 步；②plate_recog 链路 preset `track_dedup=True→False`（track_cooldown=5.0 保留作回切开关，置 True 即回旧行为）；③`_seed_chain` 新增 `converge` 参数：结构变更重建时对被复用的 preset 强制收敛指定参数（其余用户参数保留、定向更新 id 不变，打 `[seed]` 日志）——本链路 `converge={"plate_recog": {"track_dedup": False}}`，修复存量库重建后"独立门控+内置去重"叠加漂移；④链路 description 更新为含门控、事件尾口径；⑤db.py `_ID_PREFIXES` 显式登记 `gate_filter→GATE`（原走 module_id 前 4 字母 fallback 恰为 GATE，行为不变）；⑥**存量 bug 修复**：`_PRESET_ID_RE` 由 `[A-Z]{2,4}\d{4}` 放宽为 `[A-Z]{2,6}\d{4}`——5 字母前缀（PLATE0002 等）是 `_next_preset_id` 可生成的合法存量 ID，但定向更新入参校验曾误拒，本次迁移路径首次踩中（播种曾静默失败）。
+- 影响面：**DB**、**配置**
+- 部署注意：换机/重启 web_lab 自动完成迁移（结构变更重建 + PLATE0002 强制收敛 + 播种 GATE0001），无手工步骤；无新依赖/模型。存量库与新库重启后 PIPE0002 生效形态一致（7 步、gate_filter 开、plate_recog 内置去重关）。注意：`[seed] 播种失败不影响运行`的兜底会吞迁移失败——重启后建议 curl /api/pipelines 核对步骤数。
+- 验证：test_validate_chain 44/44（旧 6 步基线+灰度 7 步均绿）/ plate 28 / gate_filter 62 / composer 120；validate_chain CLI 正向自检新 7 步 spec 通过；本机存量库 restart 实测：`[seed] PLATE0002 强制收敛 {'track_dedup': False}` + GATE0001 播种 + 二跑幂等；/api/pipelines 步骤数=7、PLATE0002 track_dedup=False；实跑 车牌识别.MP4 200 帧门控时间线 12 条（含匿名桶明细）+ 2 车牌事件产出无回归
+
+### 2026-10-23(五) · WO-0021：标注双模式（annotate scope=frame/record）落地
+- 变更内容：①annotate 新增 scope（frame 默认零回归 / record 逐记录整帧图只画自己框，max_records=32 上限超限截断告警）；②OUTPUTS 双声明 {annotated: Image, annotated_records: Records} 按 scope 登记其一；③server.PARAMS 登记 scope(select 对象形态中文标签)/max_records(int, show_if=record)；④DB preset_params_annotate 自动补列 scope/max_records（启动 _ensure_module_table，老行 NULL=frame 语义）；⑤新增播种预设 ANNO0003「标注·逐记录示范」（_SEED_STANDALONE 幂等）；⑥validate_chain 参数白名单 + 连线产物↔scope 匹配断言（record 不产 annotated、frame 不产 annotated_records 连线期拦截）。设计稿 assembly_ports.md §9-§11。
+- 影响面：**DB**、**配置**
+- 部署注意：重启 web_lab 自动补列+播种 ANNO0003，无手工步骤；无新依赖。旧 preset（ANNO0001/0002 新列 NULL）行为不变。
+- 验证：test_annotate 43 / test_port_inputs 74 / test_validate_chain 41 / composer 120 及全量回归绿（qa 联合验证 INB-0085，含 e2e 真实模型像素级抽查）
+
+### 2026-10-22(三) · WO-0019：测试台 VLM 提供方插槽（provider 下拉）+ 本机 env 注入
+- 变更内容：①server.py 新增 VLM_PROVIDERS 插槽表（qwen_selfhost/glm/custom，新增提供方=加一个条目）+ PARAMS[vlm].vlm_provider select（默认 qwen_selfhost）；②VLM 解析优先级插为 env → provider → spec → 默认（custom/缺省/未知回落原三级，key 语义不变）；③DB preset_params_vlm 自动补列 vlm_provider VARCHAR(64)（老行 NULL=等价改前）；④本机不入仓 web_lab/vlm_env.sh（VLM_ENDPOINT/VLM_MODEL/VLM_API_KEY=智谱 glm-4v-flash，key 提取自 opencode 配置、600 权限、已进 .gitignore），run.sh/restart.sh 存在即 source。
+- 影响面：**DB**、**环境变量**、**配置**、**入口**
+- 部署注意：换机时 vlm_env.sh 不随 git 走需按 INSTALL 重建（key 取全局 opencode 配置的 Z_AI_API_KEY）；env 优先级高于页面参数（部署级强制覆盖语义）；DB 列重启自动补，无手工迁移。
+- 验证：selfcheck_vlm_env.py 57 断言；bigmodel 端点真实调用 HTTP 200；/api/schema 含 provider 三家 select；DB 列自动创建实测（qa 复验 INB-0076，commit 294bd51）
+
+### 2026-10-26(一) · WO-0023：门控通用化——新链路阶段模块 gate_filter 落地
+- 变更内容：①新增 umvp/pipe/gate_filter.py（GateFilter：按 key+interval 对记录流门控，缺失/0/None key 归匿名桶 `"*"` 统一受控——修 INB-0089 的 tid=0 绕过缺口；主路物理过滤零标记字段，拦截走统计旁路）；②composer 集成（单槽 gate_filter + gate_filters 多实例、产物 gate_filter.dets/stats、字段 Pipeline.last_gate=(进入,放行)、track_needed 联动——spec 含 key=track_id 的 gate_filter 即开 YOLO 跟踪，设计稿 §5.4）；③web_lab 注册（CHAIN_ASSEMBLED_MODULES / _build_stage_instance / PARAMS 三参数 key/interval/filter / 设计器「门控」组 / 时间线「门控 放行 N / 拦截 M」条目 / SSE gate 字段）；④DB presets 参数表启动播种自动新增 gate_filter 表（恰 3 列）；⑤umvp/resources.py 登记 TYPE_LOGIC。三条保留链路行为零变化（PlateStage 内置 track_dedup 保留为默认，独立门控为进阶配置）；设计稿 doc/design/gate_filter.md、分册 doc/modules/gate_filter.md。
+- 影响面：**结构**、**DB**、**配置**
+- 部署注意：换机/重启 web_lab 即自动播种参数表，无手工步骤；无新依赖/模型。遗留：GateFilter.reset() 接换流重启路径（INB-0093）；灰度变体暂不播种（Q4 拍板）；事件尾同车异号多事件为**有意保留**行为（用户拍板 2026-10-26，后续单独数据处理，INB-0095）。
+- 验证：tests/test_gate_filter.py 62 断言；回归 composer 120 / validate 44 / seq 50 / crop 45 / plate 28 / port_inputs 74 全绿（qa 两轮复验 INB-0092/0094）；灰度对跑 tests/data/vid/车牌识别.MP4 600 帧：独立门控版门口拦截 102→7 次、tid=0 受控、逐号产出与内置版一致（INB-0091）
+
 ### 2026-10-21(三) · web_lab 自含 MySQL 生命周期脚本改造：真实探活 + 优雅关闭凭据链（WO-0011/WO-0012）
 - 变更内容：① 新增 web_lab/mysql_lib.sh 共用片段：判活改真实探活（mysqladmin --socket ping → 无 mysqladmin 退化 ss 查 3307 → pgrep -x mysqld + /proc/<pid>/cmdline 核本实例 datadir/socket 兜底启动窗口），探活失败自动清理残留 socket/sock.lock/mysql.pid 再启动，启动后 15s 内二次握手确认，失败打印 mysql.log 末 50 行并中止；run.sh/restart.sh/stop.sh 统一 source。② stop.sh 关闭改 umvp_mysql_shutdown 凭据链：root@localhost socket（MYSQL_ROOT_PASSWORD 环境变量留口，默认空密码）→ umvp socket → 均失败 kill -TERM 兜底（MySQL 8 下同为优雅关闭），兜底消息点明权限/凭据原因；决策不补授 umvp SHUTDOWN（root 路径覆盖唯一场景 + umvp 保持最小权限 + 换机重建 data 目录后 root 路径天然成立）。背景与证据：INB-0053~0058。
 - 影响面：**入口**、**配置**
