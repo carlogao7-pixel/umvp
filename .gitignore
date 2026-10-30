@@ -20,6 +20,12 @@ tests/data/vid/
 # 人脸底库 / 视频索引（由注册/扫描生成）
 out/face_db.*
 out/video_db.*
+# 视频向量库与回顾检索运行数据（PIPE0004 重建即得；标定基线 fingerprints.json 除外）
+out/video_vecs.*
+out/video_thumbs/
+out/events/
+out/review_index.json
+out/review_video.json
 # 视频转码缓存（浏览器预览用，按需重建）
 out/transcoded/
 # 保留 out/fingerprints.json（标定基线，入库）
@@ -30,3 +36,4 @@ tests/data/out/
 
 # ---- 本地密钥/端点配置（不入库）----
 web_lab/vlm_env.sh
+wemm接口/
