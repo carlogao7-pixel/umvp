@@ -283,13 +283,23 @@ def _count_value(obj, arg, ctx):
 def _field_value(obj, name, ctx=None):
     """取对象/dict 字段；派生字段（w/h/short/long/area）从 bbox 计算；
     聚合字段 ("count", inner) 从批上下文取同帧计数；缺字段返回 None。
-    cls_id/track_id/score 走数值规整（不绑定具体来源）。"""
+    cls_id/track_id/score 走数值规整（不绑定具体来源）。
+    嵌套点路径（如 "content.result"）：仅 dict/Mapping 容器逐级下钻，
+    中途缺失或非容器 → None（WO-0029.1）；无点路径的既有行为逐字不变，
+    count/派生量/数值规整等特殊逻辑优先于点路径判断。"""
     if isinstance(name, tuple) and name and name[0] == "count":
         return _count_value(obj, name[1], ctx)
     fn = _DERIVED.get(name)
     if fn is not None:
         wh = _bbox_wh(obj)
         return fn(*wh) if wh else None
+    if isinstance(name, str) and "." in name:
+        cur = obj
+        for part in name.split("."):
+            if not isinstance(cur, Mapping):
+                return None
+            cur = cur.get(part)
+        return cur
     raw = obj.get(name) if isinstance(obj, Mapping) else getattr(obj, name, None)
     if name == "cls_id":
         return int(raw) if raw is not None else -1

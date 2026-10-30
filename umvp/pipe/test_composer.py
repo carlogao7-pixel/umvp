@@ -33,6 +33,7 @@ from pipe.composer import (
     ARTIFACT_DETS,
     ARTIFACT_FACES,
     ARTIFACT_FRAME,
+    ARTIFACT_PIPELINE_TAIL,
     ARTIFACT_PLATES,
     ARTIFACT_SEQ_FILTER_DETS,
     ARTIFACT_TYPES,
@@ -223,19 +224,22 @@ class _Boxes:
 class _Res:
     def __init__(self, boxes): self.boxes = boxes
 class _Model:
-    def __init__(self, res): self._res = res
+    def __init__(self, res): self._res = res; self.names = {0: "person", 2: "car"}
     def predict(self, frame, **kw): return [self._res]
 
-# 三个框：小目标(10x10)、正常(100x60)、低置信(200x80 @0.3)
+# 三个框：小目标(10x10)、正常(100x60)、低置信(200x80 @0.3)；末框 cls=99 不在 names
+# 表（验证 label 回退空串），cls_id 值不参与下方断言（低置信本就被 det_filter 筛掉）
 yd = YOLODetector(model_path="x.pt")
 yd._model = _Model(_Res(_Boxes([[0, 0, 10, 10], [0, 0, 100, 60], [0, 0, 200, 80]],
-                               [0, 0, 0], [0.9, 0.9, 0.3])))
+                               [0, 0, 99], [0.9, 0.9, 0.3])))
 d = yd.infer(None)
 check("infer: 纯推理输出（不过滤，3 框全出）", len(d) == 3)
-_infer_keys = {"kind", "track_id", "cls_id", "bbox", "score", "model_path"}
+_infer_keys = {"kind", "track_id", "cls_id", "label", "bbox", "score", "model_path"}
 _dkeys = _infer_keys | {"ts", "frame_idx"}  # 产物记录全契约字段（infer 集 + 时间上下文）
 check("infer: 元素是 dict 记录（kind=det 契约形态，键集齐全）",
       all(isinstance(x, dict) and _infer_keys <= set(x) and x["kind"] == "det" for x in d))
+check("infer: label=names 表类别名（取不到回退空串，WO-0033.6）",
+      [x["label"] for x in d] == ["person", "person", ""], str([x["label"] for x in d]))
 check("infer: 不注入时间上下文（ts/frame_idx 由调用方注入，infer 内无帧上下文）",
       all("ts" not in x and "frame_idx" not in x for x in d))
 check("infer: bbox 为 (x1,y1,x2,y2) int 元组",
@@ -272,6 +276,16 @@ pp = Pipeline(frame=FrameManager(frame_skip=1),
 evs = pp.publish([{"cls_id": 0, "content": {"r": 1}}, {"cls_id": 2, "content": {}}], ts=1.0)
 check("publish：外部记录经尾部出事件",
       len(evs) == 1 and evs[0]["name"] == "vlm" and evs[0]["detail"]["content"] == {"r": 1})
+# pipeline.tail：出事件时登记承载记录（WO-0029.4，供链路尾输出提炼取记录流）
+_t = pp.artifacts.get(ARTIFACT_PIPELINE_TAIL)
+check("publish：出事件时登记承载记录 pipeline.tail（记录 dict + events + 时间上下文）",
+      isinstance(_t, list) and len(_t) == 1 and isinstance(_t[0], dict)
+      and _t[0].get("content") == {"r": 1} and _t[0].get("events")
+      and _t[0].get("ts") == 1.0 and "frame_idx" in _t[0], repr(_t))
+_pp_n = len(pp.artifacts.get(ARTIFACT_PIPELINE_TAIL, []))
+pp.publish([{"cls_id": 2, "content": {}}], ts=2.0, frame_idx=3)
+check("publish：无事件（被事件尾扣留）不登记 pipeline.tail",
+      len(pp.artifacts.get(ARTIFACT_PIPELINE_TAIL, [])) == _pp_n)
 
 # ============ 12. 产物表 artifacts（P5 第 2 步端口协议） ============
 print("== 12. 产物表 artifacts ==")
@@ -605,6 +619,14 @@ try:
 except PortResolutionError as e:
     _e_at = str(e)
 check("artifact_type: 未知产物 → 报错", bool(_e_at) and "nope.dets" in _e_at, str(_e_at))
+# 运行时产物（非阶段产物）：短名即正名、原样放行静态解析；无 #position 形态（WO-0029.4）
+check("resolve_artifact: 运行时产物 pipeline.tail 原样放行（空位置表也可解析）",
+      resolve_artifact(ARTIFACT_PIPELINE_TAIL, {}) == ARTIFACT_PIPELINE_TAIL)
+check("artifact_type: pipeline.tail → Records",
+      artifact_type(ARTIFACT_PIPELINE_TAIL) == "Records")
+_e_rt = _ra_err("pipeline#1.tail")
+check("resolve_artifact: pipeline#1.tail 仍拒收（运行时产物无全名形态）",
+      bool(_e_rt), str(_e_rt))
 
 # ============ 20. 同模块多实例（P2-0 解除单插槽） ============
 print("== 20. 同模块多实例 det_filter ==")

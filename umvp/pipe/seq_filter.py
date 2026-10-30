@@ -10,6 +10,12 @@
   需求 = min_n；`hit_ratio`>0 时取 max(min_n, ceil(分母×比例))（计数窗需先凑满 window_n）
   边沿/抑制：`cooldown`≥0=达成后再触发抑制秒；`cooldown`<0=同 key **只触发一次**（不重报）
   动态事件名：`event` 支持 `{字段}` 占位（如 "{label}"、"警情-{cls_id}"）
+  事件源选择：`source`——"first"（默认=现状，达标记录即源）| "max:<字段>"（窗口达成时
+            从窗口内命中候选里选该数值字段最大者承载事件与放行；仅窗口规则有效，
+            单条规则忽略；缺字段/非数值候选不参与，全缺失回退 first）
+  字段投影：`detail_fields`——达成时把 {字段: 值} 追加进事件 detail（与固定统计
+            {key,count,span,window_n} 并存；取值经 conditions._field_value，
+            支持点路径 + 派生量，缺字段跳过该键）
 
 事件标注（不造新对象，事件跟着证据记录走；**支持一条记录多个事件**）：
   rec["events"] = [{"name": 事件名, "ts": 达成时刻, "detail": {"key","count","span"}}, ...]
@@ -47,7 +53,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple
 
-from pipe.conditions import match_obj, parse_condition
+from pipe.conditions import _field_value, _to_num, match_obj, parse_condition
 from pipe.records import add_event, get_events, to_record  # noqa: F401  (get_events 供调用方)
 
 
@@ -60,6 +66,12 @@ class SeqRule:
     需求：`min_n`（最少命中数）；`hit_ratio`>0 时取 max(min_n, ceil(窗口内到达数×比例))。
     冷却：`cooldown`≥0=达成后再触发抑制秒数；`cooldown`<0=同 key 只触发一次（不重报）。
     事件：`event` 支持 `{字段}` 占位（动态事件名），如 "{label}"、"警情-{cls_id}"。
+    事件源：`source`——"first"（默认=现状，达标记录即源）| "max:<字段>"（窗口规则达成时，
+            从窗口内**命中**候选里选该数值字段最大者作为放行+标注对象；字段经
+            _field_value 取值并数值化，缺字段/非数值候选不参与 max，全缺失回退 first；
+            仅窗口规则有效，单条规则忽略。放行语义不变：仍边沿放行一条）。
+    投影：`detail_fields`——达成时把 {字段: 值} 追加进事件 detail（与固定统计
+            {key,count,span,window_n} 并存，同名时固定统计优先；缺字段跳过该键）。
     """
 
     match: str                  # 条件 DSL（必填；非法表达式装配期抛错）
@@ -70,6 +82,8 @@ class SeqRule:
     min_n: int = 1              # 窗口内命中 ≥ n 才达成
     hit_ratio: float = 0.0      # 窗口命中比例阈值（>0 时需求=max(min_n, ceil(到达数×比例))）
     cooldown: float = 0.0       # 达成后抑制秒；<0 = 同 key 只触发一次
+    source: str = "first"       # 事件源："first"（默认）| "max:<字段>"（窗口内取最优承载事件）
+    detail_fields: tuple = ()   # 事件 detail 追加投影字段（支持点路径/派生量；缺字段跳过）
 
     def __post_init__(self) -> None:
         if not (self.match or "").strip():
@@ -89,6 +103,22 @@ class SeqRule:
             raise ValueError("hit_ratio 需在 [0,1]")
         if self.min_n > 1 and self.span <= 0 and self.window_n <= 0:
             raise ValueError("min_n>1 需要 span>0 或 window_n>0（窗口语义）")
+        # 事件源选择（WO-0029.1）：first=达标记录即源（默认=现状）；max:<字段>=窗口内取最优
+        src = str(self.source or "first").strip() or "first"
+        if src == "first":
+            self.source, self._src_field = src, None
+        elif src.startswith("max:"):
+            fld = src[4:].strip()
+            if not fld:
+                raise ValueError('source 需为 "first" 或 "max:<字段名>"（max: 后字段名非空）')
+            self.source, self._src_field = f"max:{fld}", fld
+        else:
+            raise ValueError(f'source 非法: {self.source!r}（应为 "first" 或 "max:<字段名>"）')
+        # detail_fields：统一为 tuple（字符串宽容为单字段，避免逐字符迭代）
+        if isinstance(self.detail_fields, str):
+            self.detail_fields = (self.detail_fields,)
+        else:
+            self.detail_fields = tuple(self.detail_fields or ())
         self._ast = parse_condition(self.match)  # 非法条件在装配时快速失败
 
     @property
@@ -183,16 +213,50 @@ class SeqFilter:
 
         return re.sub(r"\{([^}]+)\}", _sub, tmpl)
 
-    def _register(self, rule: SeqRule, ri: int, k: str, rts: float, matched: bool) -> None:
-        """登记一次到达（窗口用；比例阈值需要分母，故非命中到达也登记）。"""
+    def _register(self, rule: SeqRule, ri: int, k: str, rts: float, matched: bool,
+                  pair=None) -> None:
+        """登记一次到达（窗口用；比例阈值需要分母，故非命中到达也登记）。
+
+        source="max:<字段>" 的规则额外留存 (原元素, 记录视图)——达成时从中选最优
+        承载事件；留存随窗口淘汰（span 过期 / window_n 滑出）释放，内存有界。
+        """
         dq = self._win.setdefault((ri, k), deque())
-        dq.append((rts, bool(matched)))
+        if rule.source != "first":
+            it, rec = pair if pair else (None, None)
+            dq.append((rts, bool(matched), it, rec))
+        else:
+            dq.append((rts, bool(matched)))
         if rule.window_n > 0:
             while len(dq) > rule.window_n:
                 dq.popleft()
         else:
             while dq and rts - dq[0][0] > rule.span:
                 dq.popleft()
+
+    def _pick_source(self, rule: SeqRule, ri: int, k: str, cur):
+        """窗口规则达成时的**事件源**选择（source="max:<字段>"）。
+
+        在窗口内**命中**候选里选 source 字段数值最大者（严格 > 保序：并列取先到达者）；
+        字段经 _field_value 取值并数值化（_to_num），缺字段/非数值候选不参与；
+        全部候选缺失 → 回退当前到达 cur（first 语义）。返回 (原元素, 记录视图, ts)。
+        """
+        cur_it, cur_rec, cur_ts = cur
+        if rule.source == "first" or rule._src_field is None:
+            return cur
+        best = None
+        best_v = None
+        for e in self._win.get((ri, k)) or []:
+            if not e[1]:          # 只在命中候选里选（非命中到达仅作比例分母）
+                continue
+            try:
+                v = _to_num(_field_value(e[3], rule._src_field))
+            except (TypeError, ValueError):
+                v = None          # 非数值候选不参与 max（宽松，见设计稿 §2.1）
+            if v is None:
+                continue
+            if best_v is None or v > best_v:
+                best_v, best = v, (e[2], e[3], e[0])
+        return best if best is not None else (cur_it, cur_rec, cur_ts)
 
     def _window_ok(self, rule: SeqRule, ri: int, k: str) -> int:
         """窗口是否达成；达成返回窗口内命中数，未达成返回 0。
@@ -209,16 +273,28 @@ class SeqFilter:
             denom = rule.window_n
         else:
             denom = len(dq)
-        matched = sum(1 for _, m in dq if m)
+        matched = sum(1 for e in dq if e[1])
         need = rule.min_n
         if rule.hit_ratio > 0:
             need = max(need, math.ceil(denom * rule.hit_ratio))
         return matched if matched >= need else 0
 
     def _mark(self, it, rec: dict, rule: SeqRule, ri: int, k: str, count: int, rts: float) -> None:
-        """追加事件 + 状态更新（窗口重臂 / 冷却）：dict 原地 append、对象挂属性。"""
-        add_event(it, self._render_event(rule.event, rec), ts=rts,
-                  detail={"key": k, "count": count, "span": rule.span, "window_n": rule.window_n})
+        """追加事件 + 状态更新（窗口重臂 / 冷却）：dict 原地 append、对象挂属性。
+
+        detail_fields 非空时把 {字段: 值} 追加进事件 detail——与固定统计
+        {key,count,span,window_n} 并存（字段名与固定统计同名时固定统计优先）；
+        取值经 _field_value（点路径 + 派生量可用），缺字段/None 跳过该键（宽松，
+        对齐 det_filter detail 语义）。detail_fields=() 时与旧行为逐字一致。
+        """
+        detail = {"key": k, "count": count, "span": rule.span, "window_n": rule.window_n}
+        for f in rule.detail_fields:
+            if f in detail:
+                continue
+            v = _field_value(rec, f)
+            if v is not None:
+                detail[f] = v
+        add_event(it, self._render_event(rule.event, rec), ts=rts, detail=detail)
         if rule.windowed:
             self._win.pop((ri, k), None)   # 窗口重臂（清空重新计数）
         # cooldown<0 = 同 key 只触发一次
@@ -260,6 +336,8 @@ class SeqFilter:
         无规则（纯门控）时返回门控存活者；有规则时每条记录对**所有**匹配规则独立判定
         （达成即追加事件，一条记录可命中多条 → 多个事件；任一规则达成则该记录放行，
         否则窗口未凑满/冷却的命中仅作证据、扣留）。
+        source="max:<字段>" 的窗口规则达成时，放行+标注对象替换为窗口内最优候选
+        （放行语义不变：仍边沿放行一条，变的只是哪条记录承载事件与放行）。
         """
         pairs = [(it, self._rec(it, ts, frame_idx)) for it in (items or [])]
         if self.throttle is not None:
@@ -269,28 +347,38 @@ class SeqFilter:
         if not self.rules:
             return [it for it, _ in pairs]
         out: List = []
+        seen: set = set()   # 本批已放行元素（max 选优下多规则可能指向同一记录，勿重复）
+
+        def _release(x) -> None:
+            if id(x) not in seen:
+                seen.add(id(x))
+                out.append(x)
+
         for it, rec in pairs:
             rts = float(rec.get("ts") or ts)
-            fired = False
             for ri, rule in enumerate(self.rules):
                 k = self._key_of(rec, rule.key)
                 matched = bool(match_obj(rec, rule._ast))
                 if rule.windowed:
-                    self._register(rule, ri, k, rts, matched)  # 窗口需登记所有到达（比例分母）
+                    # 窗口需登记所有到达（比例分母）；max 规则同时留存候选
+                    self._register(rule, ri, k, rts, matched, (it, rec))
                 if not matched:
                     continue
                 if rts < self._cool.get((ri, k), float("-inf")):
                     continue   # 该规则冷却/一次性期内：跳过（不影响其它规则）
                 if not rule.windowed:
-                    # 单条语义：命中即达成（电平）
+                    # 单条语义：命中即达成（电平）；source 忽略（只有一条候选）
                     self._mark(it, rec, rule, ri, k, 1, rts)
-                    fired = True
+                    _release(it)
                     continue
                 cnt = self._window_ok(rule, ri, k)
-                if cnt:
+                if not cnt:
+                    continue   # 命中但窗口未凑满：仅作窗口证据
+                if rule.source == "first":
                     self._mark(it, rec, rule, ri, k, cnt, rts)
-                    fired = True
-                # 命中但窗口未凑满：仅作窗口证据（不 fired）
-            if fired:
-                out.append(it)
+                    _release(it)
+                else:
+                    s_it, s_rec, s_ts = self._pick_source(rule, ri, k, (it, rec, rts))
+                    self._mark(s_it, s_rec, rule, ri, k, cnt, s_ts)
+                    _release(s_it)
         return out

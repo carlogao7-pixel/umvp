@@ -54,6 +54,8 @@ ARTIFACT_ANNOTATED = "annotate.annotated"          # 带框图（Image；annotat
 ARTIFACT_ANNOTATED_RECORDS = "annotate.annotated_records"  # 逐记录带整帧标注图（Records；annotate scope=record，WO-0021）
 ARTIFACT_FACES = "face_detect.faces"               # 人脸检测记录（dict，含 bbox/label/image，Records）
 ARTIFACT_PLATES = "plate_recog.plates"             # 车牌识别记录（dict，含 label/text/image，Records）
+# 运行时产物（非阶段产物，见 _RUNTIME_ARTIFACTS）：publish 通路出事件时登记的事件承载记录
+ARTIFACT_PIPELINE_TAIL = "pipeline.tail"           # 链路尾承载记录（Records；publish 每出一次事件累计）
 
 # 产物名 → 类型（校验连线类型匹配；也是"可用产物清单"的唯一来源）
 ARTIFACT_TYPES: Dict[str, str] = {
@@ -68,6 +70,7 @@ ARTIFACT_TYPES: Dict[str, str] = {
     ARTIFACT_ANNOTATED_RECORDS: "Records",
     ARTIFACT_FACES: "Records",
     ARTIFACT_PLATES: "Records",
+    ARTIFACT_PIPELINE_TAIL: "Records",
 }
 
 # Pipeline.step 已纳入 inputs 解析的端口 —— **唯一来源**，与 step() 中 _port(...) 调用点一一对应。
@@ -95,6 +98,11 @@ class PortResolutionError(ValueError):
 # 短名在本链路该模块只有单实例时等效；多实例必须写全名（**不猜**）。
 # 解析逻辑集中在本节（唯一实现）——web 段 validate_chain / server 都复用，不各写一份。
 _POSITION_SEP = "#"
+
+# 运行时产物（非阶段产物）：不由任何阶段执行产出（无 {module}#{position}.{artifact} 全名
+# 形态），短名即正名。现有唯一成员 pipeline.tail——Pipeline.publish 出事件时登记的事件
+# 承载记录（WO-0029.4），供链路尾输出提炼（web output 段 from）取记录流。
+_RUNTIME_ARTIFACTS = frozenset({ARTIFACT_PIPELINE_TAIL})
 
 
 def artifact_short(name: str) -> str:
@@ -135,6 +143,7 @@ def resolve_artifact(name: str, positions_by_module: Mapping[str, Sequence[int]]
     """短名 {module}.{artifact} → 全名 {module}#{position}.{artifact}。
 
     - 已是全名 → 原样返回（校验其存在：模块与位置须在 positions_by_module 中）
+    - 运行时产物（_RUNTIME_ARTIFACTS，如 pipeline.tail）→ 原样返回（非阶段产物，无位置可解析）
     - 该模块在本链路只有一个实例 → 返回其全名
     - 多实例（歧义）→ 抛 PortResolutionError（要求写全名，不猜）
     - 未知模块 / 空名 / 非法名 → 抛 PortResolutionError
@@ -144,6 +153,10 @@ def resolve_artifact(name: str, positions_by_module: Mapping[str, Sequence[int]]
     if not isinstance(name, str) or not name.strip():
         raise PortResolutionError("产物名为空，无法解析")
     name = name.strip()
+    if name in _RUNTIME_ARTIFACTS:
+        # 运行时产物（如 pipeline.tail）：非阶段产物、无 #position 形态，短名即正名，
+        # 不参与模块/位置解析（否则"未知模块 pipeline"误报）——原样通过静态解析。
+        return name
     if _POSITION_SEP in name:
         module_id, _, tail = name.partition(_POSITION_SEP)
         pos_str, dot, artifact = tail.partition(".")
@@ -199,6 +212,9 @@ class Detection:
     **兼容形态**：保留供外部构造 / 直传（老调用、test_image_source 等导入依赖）；
     链路通用产物已是 dict 记录（Record，kind=det）——`infer()` 直接产 dict，
     直传的 Detection 在 `Pipeline.step` 入口经 `to_record` 归一为 dict。
+    无 label 字段（WO-0033.6）：to_record 是通用转换、拿不到模型 names 表，
+    故直传记录不含 label——下游读 label 缺失按契约兜底空串/回退（annotate 无
+    label 回退 COCO 类别名）；类别名以 `infer()` 产的 dict 记录为准。
     """
 
     track_id: int
@@ -454,7 +470,7 @@ class YOLODetector:
 
         输出为**纯推理结果**（不做有效性过滤）；有效性（置信/尺寸/成组数量）
         由链上的检测筛选阶段（Pipeline.det_filter）判定，对全部下游一致生效。
-        记录形态：{"kind": "det", "track_id", "cls_id", "bbox"(x1,y1,x2,y2)tuple,
+        记录形态：{"kind": "det", "track_id", "cls_id", "label", "bbox"(x1,y1,x2,y2)tuple,
         "score", "model_path"}；不含 ts/frame_idx——时间上下文由调用方注入
         （Pipeline.step 统一补，契约见 pipe.records）。
         """
@@ -474,11 +490,17 @@ class YOLODetector:
         dets: List[dict] = []
         if r.boxes is None:
             return dets
+        # 类别名表 {cls_id: label}（ultralytics 恒为 dict；异常形态兜底转 dict/空表，不抛错）
+        names = getattr(self._model, "names", None)
+        if not isinstance(names, dict):
+            names = dict(enumerate(names)) if names else {}
         for i, b in enumerate(r.boxes.xyxy.tolist()):
             tid = r.boxes.id[i].item() if (track and r.boxes.id is not None) else 0
+            cid = int(r.boxes.cls[i].item())
             dets.append({"kind": "det",
                          "track_id": int(tid),
-                         "cls_id": int(r.boxes.cls[i].item()),
+                         "cls_id": cid,
+                         "label": str(names.get(cid) or ""),  # 类别名（记录契约通用字段，WO-0033.6）；取不到空串
                          "bbox": tuple(int(v) for v in b),
                          "score": float(r.boxes.conf[i].item()),
                          "model_path": self.model_path.rsplit("/", 1)[-1]})
@@ -678,11 +700,28 @@ class Pipeline:
 
         通用：不绑定记录来源与内容；供以筛选模块收尾（无 alarm 阶段）的链路把
         VLM 的 JSON 内容等作为链路尾输出。记录用 dict 携带字段（如 content/label）。
+
+        产物登记（WO-0029.4）：**出事件时**把事件承载记录（event_filter 放行者，即
+        "末段承载记录"）登记到产物 `pipeline.tail`（Records）——下游链路尾输出提炼
+        （web output 段）按产物取记录流，不再只见事件 dict 不见承载记录。登记语义：
+          - 仅出事件的 publish 登记（无事件/被事件尾扣留 → 不登记，产物在 ⇔ 本帧出过事件）；
+          - 同帧多次 publish **累计**（如车牌事件尾逐牌 publish；artifacts 每帧重建，帧界自然）；
+          - 与既有产物登记同构：to_record 归一 + setdefault 注入 ts/frame_idx（事件尾对
+            dict 已原地注入，此处兜底覆盖对象/无 event_filter 通路）。
+        返回值 / last_events / 事件结构零变化。
         """
         items = list(records or [])
         if items and self.event_filter is not None:
             items = self.event_filter.run(items, ts=ts, frame_idx=frame_idx)
-        return collect_events(items)
+        evs = collect_events(items)
+        if evs:
+            tail = self.artifacts.setdefault(ARTIFACT_PIPELINE_TAIL, [])
+            for it in items:
+                rec = to_record(it)
+                rec.setdefault("ts", ts)
+                rec.setdefault("frame_idx", frame_idx)
+                tail.append(rec)
+        return evs
 
     def _port(self, module_id: str, module, port: str, default):
         """旧签名兼容：等价 `_port_at(位置未知, module_id, module, port, default)`。"""

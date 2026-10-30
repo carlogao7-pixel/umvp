@@ -34,6 +34,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from pipe.conditions import (
+    _field_value,
     build_count_context,
     collect_count_specs,
     match_obj,
@@ -115,11 +116,23 @@ class DetFilter:
         return self._match(rec, item, ctx)
 
     def _emit(self, item, view: dict, ts: float) -> None:
-        """按规格在放行记录上追加事件（多规格 → 多事件）。"""
+        """按规格在放行记录上追加事件（多规格 → 多事件）。
+
+        detail 取字段：顶层字段保持既有语义（键存在即带，逐字不变）；
+        含点路径的字段（如 "content.result"）经 conditions._field_value 逐级下钻
+        （缺路径/非容器 → None 跳过；WO-0029.1 单一取值来源升级）。
+        """
         for spec in self.events:
             if spec["_ast"] and not match_obj(view, spec["_ast"]):
                 continue
-            detail = {f: view.get(f) for f in spec["detail"] if f in view}
+            detail = {}
+            for f in spec["detail"]:
+                if "." in f:
+                    v = _field_value(view, f)
+                    if v is not None:
+                        detail[f] = v
+                elif f in view:
+                    detail[f] = view[f]
             add_event(item, spec["name"], ts=ts, detail=detail or None)
 
     def _group_keep(self, pairs: List[Tuple]) -> List[Tuple]:
