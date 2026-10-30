@@ -42,7 +42,9 @@ collect_events(items)                        # 链路尾汇总为输出
 - 幸存但**未带 events** 的记录语义上仍是"命中"，但没有名字/内容——要让产出可读，
   在尾部配 `events` 规格（或规则），或直接以幸存记录字段为产出。
 - 多条规格 → 同记录多个事件；dict 输入原地 append，对象输入挂 `events` 属性。
-- `detail: ["content"]` 可把 VLM 阶段塞进记录的 JSON 内容字段原样带出。
+- `detail: ["content"]` 可把 VLM 阶段塞进记录的 JSON 内容字段原样带出；
+  字段名支持**嵌套点路径**（WO-0029.1）：`detail: ["content.result"]` 逐级下钻 dict 取值
+  （中途缺失/非容器跳过该键；顶层字段行为逐字不变）。`when` 条件 DSL 同样可引用嵌套字段。
 - Pipeline 每帧 `last_events` = 末段记录的事件汇总（`collect_events`），供驱动层读取；
   `Pipeline.publish(records, ts)` 把外部产生的记录（如 VLM 结果）经本阶段/尾部处理出事件。
 - 链路终段可用本模块（`_chain_from_spec` 允许 det_filter/seq_filter 收尾）。

@@ -1,6 +1,6 @@
 # WeMM 嵌入对接（设计稿）
 
-> 状态：📐 设计稿（未实施，2026-09-29）
+> 状态：📐 客户端未实施；**服务端已上线并联调通过（2026-10-28，实测记录见 §6）**
 > 定位：WeMM-Embedding（wemm）服务对接**专篇**——模型机制、服务端部署、客户端模块
 > （`WEMMClient`）、成本与联调清单。**业务流程与链路设计不在本文**：
 > 索引链路（PIPE0004）、三级检索、两级索引精定位、存储与前端见
@@ -74,20 +74,24 @@
   "嵌入端点不可达: <地址>"；请求 `timeout=(5, N)`（连接 5s + 读取 embed_timeout）。
 - 截维 + 重新 L2 在客户端做；档位校验（不在档位直接报错，报错信息列出合法档位）。
 
-### 4.2 请求 schema
+### 4.2 请求 schema（2026-10-28 联调修正，实测为准）
 
 ```
 POST {endpoint}                          # 形如 http://<ip>:8000/v1/embeddings
+# 纯文本（可批量，input 数组 → n 向量顺序对位）：
+{"model": <模型名>, "input": <str | [str, ...]>}
+# 多模态（图文/多图/视频）：走 messages 透传，不用 input；
+# 一条请求只放一组 messages，批量靠客户端并发（1–4）：
 {"model": <模型名>,
- "input": [ {"role": "user", "content": [ ...内容项... ]}, ... ]}
+ "messages": [{"role": "user", "content": [ ...内容项... ]}]}
 ```
 
 - 内容项同 OpenAI 多模态形态：
   `{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`（帧，
-  客户端先按 max_resolution 缩放 + jpeg_quality 编码）、`{"type": "text", "text": ...}`（查询）。
-- **一条消息一个向量**：6 帧合在一条消息 = clip 向量；每帧单独成消息 = frame 向量。
-- **input 是消息数组可批量**：clip 多图消息 + 逐帧单图消息合并一次请求发出
-  （两级索引的用法见[《历史视频回顾检索》](video_review_search.md)§4.1）。
+  客户端先按 max_resolution 缩放 + jpeg_quality 编码）、`{"type": "text", "text": ...}`；
+- **一条消息一个向量**：6 帧合在一条消息 = clip 向量；每帧单独成消息 = frame 向量；
+- 服务端 MRL 截维：请求带 `"dimensions": <N>`（⚠️ 与客户端前 N 维截断**不等价**，
+  二者只能二选一全链路统一，见 §6 实测）。
 - 响应取 `data[i].embedding`，按 input 顺序对位。
 
 ### 4.3 形态选择：逐帧多图，而非 video 内容项
@@ -125,13 +129,29 @@ L2 归一）——服务未启动也能开发验证全流程，复刻 `use_real_
 - **本机**：零 GPU、零新依赖（requests 已在用）；检索为 numpy 线性（万级片段 <10ms）。
 - 跨公网部署：建议 `max_resolution` 降到 640 档 + 减少每片段帧数。
 
-## 6. 待联调确认清单（服务启动后 curl 实测，回填本文）
+## 6. 联调实测（2026-10-28，服务上线后 curl/脚本实测，12 项冒烟 11 过）
 
-1. 部署的型号与全维（本文按 **2B/2048** 假设）；
-2. serving 框架（vLLM 或 SGLang）与端口；
-3. 多图 content 的确切字段拼写与单消息帧数上限；
-4. `input` 消息数组的批量行为（一次请求多向量、顺序对位）；
-5. 端点 IP:port 与鉴权方式（免鉴权 / Bearer）。
+**端点与鉴权**（凭据在 `wemm接口/REMOTE_CLIENT.env`，**不入库**，已进 .gitignore）：
+Base `http://ca0.tail952a82.ts.net:8000`（Tailscale，备用 `http://100.96.235.67:8000`），
+`Authorization: Bearer <key>`；host 侧 wemm.sh start/status 管理，对端不部署。
+
+| 清单项 | 实测结果 |
+|---|---|
+| ① 型号与全维 | **WeMM-Embedding-2B**（vLLM），全维 **2048**（与本文假设一致）；`max_model_len=8192` |
+| ② 框架与端口 | vLLM，8000 端口，域名与备用 IP 双通 |
+| ③ 多模态字段拼写 | **修正 §4.2**：多模态**不用 `input`，用 `messages`**（OpenAI chat 风格透传，content 数组 = text/image_url/video_url，图用 data URL） |
+| ④ input 批量行为 | **纯文本** `input` 数组批量可用（n 条 → n 向量顺序对位）；**多模态一条请求只放一组 `messages`**，批量靠客户端并发（1–4，视频 1–2） |
+| ⑤ 端点与鉴权 | 见上；免 HTTPS（tailnet 内） |
+
+**附加实测结论（客户端设计必须遵守）：**
+- **服务端 MRL 截维 ≠ 客户端前 N 维截断**：`dimensions=256` 与本地「前 256 维+重归一」余弦仅 ≈0.50——**截维方式全链路必须统一**（建议统一走服务端 `dimensions`，入库/查询同参），混用=检索错乱；
+- 输出**已 L2 归一**（点积=余弦）；截维后仍归一 ✓；
+- 跨模态语义方向正确（人脸文本查询 vs 人脸图 dot=0.245 > vs 猫查询 0.125；猫狗文本对 0.92——同域文本相似度普遍偏高，阈值调优按相对排序不按绝对值）；
+- 性能限制（REMOTE_CLIENT.md §6）：上下文 8192；视频 fps=2/max_frames=768；视觉像素预算 ≈1.0MP；timeout ≥120s（视频 ≥180s）；
+- 建议：帧图长边 ≤1280（与 §4.2 的 max_resolution=896 档兼容）。
+
+> 实现注意事项：多模态走 `messages` 时 OpenAI SDK 需 `extra_body` 透传（`input` 留空串占位）；
+> 纯文本可直接 `input`。
 
 ## 7. 验证方法（客户端级，断言式）
 

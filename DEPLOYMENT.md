@@ -34,6 +34,30 @@
 
 ## 记录
 
+### 2026-10-29(四) · 混合检索存储落地：review_index/review_video 两表 + out/events 事件归档 + JSON 降级文件
+- 变更内容：db.py 新增两表 DDL（init_db 幂等建表，前缀 RVIDX/RVVID 登记进 _ID_PREFIXES）；server.py 分析链路收尾追加写 out/events/<视频名>.jsonl（同步 _done 与 SSE 快照后两处）；--no-db 或 MySQL 不可用时同构落 out/review_index.json / out/review_video.json（路径可用 UMVP_REVIEW_INDEX_JSON / UMVP_REVIEW_VIDEO_JSON 环境变量覆盖，测试隔离用）
+- 影响面：**DB**、**环境变量**、**结构**
+- 部署注意：换机拉代码重启即自动建表（两表为新建，无旧数据迁移）；out/events/ 与两个降级 JSON 均运行时生成、不入 git；MySQL 停机不影响检索（自动降级 JSON，响应 note 注明）。设计依据 doc/design/hybrid_retrieval.md §4/§12-D；结构事实见 doc/guides/database_schema.md §11
+- 验证：—
+
+### 2026-10-28(三) · WO-0032：查询层向量档——文搜视频检索闭环（/api/review/search + 回顾检索页签）
+- 变更内容：server.py 新增 POST /api/review/search（两步漏斗 clip 粗排/帧精排，底库 mtime 缓存重载）；index.html 系统组新增回顾检索页签（结果卡片+内嵌播放器 currentTime=play_ts 定位）；validate_chain 干跑补 video_embed 分支（档位/无端点校验期报错）
+- 影响面：**入口**、**配置**
+- 部署注意：查询底库默认 out/video_vecs.npz；mock/real 随端点自动，响应 note 说明；前端交互 doc/design/video_review_search.md §6 向量档部分已落地，意图解析/结构化与关键词漏斗/融合排序未实施（doc/design/hybrid_retrieval.md 设计稿待评审）
+- 验证：tests/test_review_search.py 55 / tests/test_review_search_e2e.py 74(+live4) / test_validate_chain 58
+
+### 2026-10-28(三) · WO-0031：WeMM 嵌入基础设施 + PIPE0004 视频向量化链路（第四条保留链路）
+- 变更内容：新模块目录 umvp/video_embed/（WEMMClient/EmbedStore/VideoEmbedStage，requests 已有零新依赖）；server.py 注册 video_embed（PARAMS 15 键/惰性装配）+ _seed_pipeline 幂等播种 PIPE0004（VEMB0001+FM0004）；db.py 前缀 VEMB（参数表自动建列）；validate_chain 终段扩展
+- 影响面：**结构**、**DB**、**环境变量**、**配置**
+- 部署注意：real 档依赖 env：WEMM_BASE_URL（备用 WEMM_BASE_URL_FALLBACK）/WEMM_MODEL/WEMM_API_KEY（凭据 wemm接口/REMOTE_CLIENT.env，不入库，restart.sh 前 source）；默认 use_real_embed=false mock 档零依赖可跑；产物 out/video_vecs.npz+out/video_thumbs/；换机需重跑索引，服务端对接 doc/design/wemm_integration.md §6
+- 验证：umvp/video_embed/test_video_embed.py 82(+live6) / tests/test_video_embed_e2e.py 78(+live4)
+
+### 2026-10-28(三) · WO-0028/0029：链路尾输出提炼（output 段）+ HTML 报告导出
+- 变更内容：spec 顶层新增 output 声明段（scope/from/image/image_pick/limit，运行收尾产提炼块）；链路尾 publish 承载记录登记产物 pipeline.tail；SeqRule 增 source/detail_fields、conditions 点路径；/api/test/report 报告导出端点+test.html 导出按钮
+- 影响面：**入口**、**配置**
+- 部署注意：无新依赖无 schema 变更；旧 spec 无 output 段行为逐字不变（向后兼容）；权威设计 doc/design/chain_output.md
+- 验证：tests/test_export_report.py 35 / test_output_block.py 70 / test_chain_output_e2e.py 73 断言
+
 ### 2026-10-27(二) · WO-0027：restart.sh 族 python server 启动无缓冲（修 INB-0104 [seed] 日志延迟/丢失）
 - 变更内容：`web_lab/restart.sh` 与 `web_lab/run.sh` 的 python server 启动行前缀注入 `PYTHONUNBUFFERED=1`（择此而非 `python -u`：与 vlm_env.sh 的 env 注入 setsid server 风格一致，且可传导到 server 派生的 python 子进程；仅启动行作用域，不全局 export）。restart.sh 为后台 `setsid` 拉起、stdout 直连 `out/web_lab.log` 块缓冲——`[seed]`/print 启动日志延迟落盘，进程被 stop 时缓冲整体丢弃（全历史日志 0 条 `[seed]` 即此因，INB-0098 排查播种事故时已被咬）；run.sh 前台 exec tty 下本为行缓冲，但输出重定向到文件时同病，一并统一口径。HTTP 访问日志走 stderr，不受影响。
 - 影响面：**入口**（启动脚本）

@@ -53,9 +53,12 @@
 | min_n | int | 1 | 窗口内命中 ≥ n 才达成（min_n>1 需 span>0 或 window_n>0） |
 | hit_ratio | float | 0.0 | 窗口命中比例阈值（0=关）；>0 时需求 = max(min_n, ceil(分母×比例))，计数窗需先凑满 window_n |
 | cooldown | float | 0.0 | 达成后抑制秒；**<0 = 同 key 只触发一次**（不重报，等价旧 inspection 同对象一次）；默认 0=窗口重臂即可再报 |
+| source | str | first | **事件源选择**（WO-0029.1）：`first`（默认=现状，达成记录即源）｜ `max:<字段>`——窗口规则达成时，从窗口内**命中**候选里选该数值字段最大者承载事件与放行（字段经 `_field_value` 取值并数值化；缺字段/非数值候选不参与，全缺失回退 first；并列取先到）。放行语义不变：仍边沿放行一条；仅窗口规则有效，单条规则忽略 |
+| detail_fields | list | 空 | **声明式字段投影**（WO-0029.1）：达成时把 `{字段: 值}` 追加进事件 detail，与固定统计 `{key,count,span,window_n}` 并存（同名时固定统计优先）；支持**嵌套点路径**（如 `content.result`）与派生量；缺字段跳过该键 |
 
 > 需求判定：`min_n` 为下限；`hit_ratio` 叠加比例需求（计数窗分母=window_n、时间窗分母=窗内到达数）。
 > `rules` 可为空（纯门控模式），但 `rules`/`throttle`/`change` 至少给一个，否则构造期报错。
+> `source` 取值非法（非 `first`/`max:<字段名>`）装配期报错。
 
 ### 事件标注（记录上追加 `events` 列表，支持多个事件）
 

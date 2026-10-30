@@ -61,23 +61,30 @@ umvp/face_detect/ SCRFD 人脸检测 + 5 点对齐（FaceDetector / FaceStage）
 umvp/face_embed/  ArcFace 512d 嵌入 + numpy 向量底库
 umvp/face_scan/   人脸管道编排（复用 pipe.FrameManager 取帧+背压）
 umvp/plate_recog/ 车牌识别（HyperLPR3；extract_plates 消费目标裁剪产出）
+umvp/video_embed/ WeMM 视频嵌入（WEMMClient / EmbedStore / VideoEmbedStage，
+                  PIPE0004 向量索引；底库 out/video_vecs.npz，mock/real 双档）
 umvp/resources.py P1 资源估算（静态公式 + 实测指纹两层）
 web_lab/          可视化测试台（server / db / test.html / 启停脚本 / 标定 / spec 校验）
 .claude/agents/   挂载 agent 两角色提示词 + assembler/ 组装工技术文档
 doc/              README.md 文档总览（先读）＋ requirements/ guides/ design/ agent/ research/
 doc/modules/      模块分册（每篇=module_id，入口 INDEX.md，按数据流角色分组）
-doc/chains/       保留链路专篇（pipe0001_police_uav / pipe0002_plate / pipe0003_face_capture）
+doc/chains/       保留链路专篇（pipe0001_police_uav / pipe0002_plate / pipe0003_face_capture；
+                  PIPE0004 专篇待补，暂见 doc/design/video_review_search.md + wemm_integration.md）
 models/ face_models/ plate_models/   YOLO 选择池 / 人脸模型 / 车牌模型（自包含，不入库）
 tests/            链路测试 + YOLO 参数对比 + 测试素材
 ```
 
 ## 三、设计契约（跨板块，必须共同遵守）
 
-- **保留链路**：三条——
+- **保留链路**：四条——
   **PIPE0001 警用无人机**（帧管理→YOLO→检测筛选→标注→VLM研判→时序判定事件尾）、
   **PIPE0002 车牌**（帧管理→YOLO识车→检测筛选→门控(track 5s)→目标裁剪(裁车)→车牌识别→时序判定事件尾；事件尾组合键 track_id,label 同车异号收敛）、
-  **PIPE0003 人脸截取**（帧管理→YOLO识人→检测筛选→目标裁剪(裁人)→人脸检测；截取落盘即目的）。
-  链路**输出 = 事件尾产出的记录事件**（原「输出处理 OutputPolicy」已弃用删除）。
+  **PIPE0003 人脸截取**（帧管理→YOLO识人→检测筛选→目标裁剪(裁人)→人脸检测；截取落盘即目的）、
+  **PIPE0004 视频向量化**（帧管理→视频嵌入 video_embed；离线索引链路，clip+frame 两级向量入
+  EmbedStore 库，入库即目的；WeMM 远端服务 mock/real 双档，入库即目的）。
+  链路**输出 = 事件尾产出的记录事件**（原「输出处理 OutputPolicy」已弃用删除）。spec 顶层可选
+  `output` 段做链路尾提炼（字段投影+配图落盘；publish 通路承载记录登记产物 `pipeline.tail`），
+  详见 `doc/design/chain_output.md`。
   播种幂等收敛在 `web_lab/server.py _seed_pipeline()`；各阶段引用自己的模块 preset。
 - **职责边界（改动勿越界）**：YOLO 只**纯推理**；识别有效性筛选的**唯一**来源是链路上
   独立的 `det_filter` 阶段；节流/报送编排在 Pipeline；裁剪只做机械裁剪缩放，二次裁剪
@@ -126,9 +133,10 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
 - 文档目录（2026-10-16 重整；目录与文件均英文小写＋下划线，各篇 H1 保留中文）：
   `doc/requirements/`（business 业务需求 / development 开发需求）、
   `doc/modules/`（模块分册=module_id，入口 `INDEX.md`，按数据流角色分组）、
-  `doc/chains/`（三条保留链路专篇）、
+  `doc/chains/`（保留链路专篇；PIPE0004 专篇待补）、
   `doc/guides/`（runbook 端口与启停 / database_schema 数据库结构）、
-  `doc/design/`（storage_design / live_overlay 已落地；video_review_search / wemm_integration 下期设计稿）、
+  `doc/design/`（storage_design / live_overlay / chain_output 已落地；video_review_search / wemm_integration
+  向量档已落地、其余部分待实施；hybrid_retrieval 待评审）、
   `doc/agent/`（static_prompts / full_run_record，挂载 agent 生成物）、
   `doc/research/`（历史选型调研）。
 - 完整安装 / 移植步骤见 `INSTALL.md`；部署台账见 `DEPLOYMENT.md`。
@@ -154,6 +162,13 @@ $PY tests/test_image_source.py            # 送审图像源 + 图集契约（ima
 $PY tests/test_port_inputs.py             # 端口连线（stage_inputs）端到端
 $PY tests/test_validate_chain.py          # spec 校验器（含 inputs DAG）
 $PY tests/test_video_transcode.py         # 视频转码
+$PY umvp/video_embed/test_video_embed.py  # WeMM 客户端/底库/嵌入阶段（mock；--live 真端点在线时跑）
+$PY tests/test_video_embed_e2e.py         # video_embed 注册/播种/链路级 e2e（mock；--live 同上）
+$PY tests/test_review_search.py           # 回顾检索 API（mock；--live 同上）
+$PY tests/test_review_search_e2e.py       # 检索端到端验收（mock+HTTP）
+$PY tests/test_chain_output.py            # 链路尾提炼纯逻辑（collect_output）
+$PY tests/test_output_block.py            # output 提炼块（web 驱动/报告侧）
+$PY tests/test_export_report.py           # 链路尾 HTML 报告构建
 $PY tests/test_yolo_standalone.py         # YOLO 单模块跑图（探索性，无断言计数）
 $PY tests/test_agent_runtime.py           # 挂载 agent 运行时（离线）
 $PY tests/test_yolo_params.py             # YOLO 参数对比（真实推理，较慢）
@@ -182,6 +197,14 @@ bash .opencode/tool/install_ticketd.sh    # 工单看板常驻服务安装（幂
   （取自全局 `~/.config/opencode/opencode.jsonc` 的 `Z_AI_API_KEY`）。实测可用 = 智谱
   `glm-4v-flash`（`https://open.bigmodel.cn/api/paas/v4/chat/completions`，单/多图均可，1.6~4.6 s/帧@1280×720）；
   `glm-4.5v`/`glm-4.6v` 账号无资源包、`glm-4.6v-flash` 免费池持续过载（429 code 1305），均不可用。
+- **WEMM 嵌入端点**：env `WEMM_BASE_URL`（备用 `WEMM_BASE_URL_FALLBACK`）/`WEMM_MODEL`/`WEMM_API_KEY`
+  （key 只走 env；凭据 `wemm接口/REMOTE_CLIENT.env` **不入库**，restart.sh 前 source）；`use_real_embed=false`
+  或无端点 = mock 档确定性伪向量（全流程可开发测试）；**截维全链路统一走服务端 `dimensions` 参数**
+  （与本地前 N 维截断不等价，混用=检索错乱）；请求 schema 与实测见 `doc/design/wemm_integration.md` §4/§6。
+- **模块内「输出路径」类参数必须归一项目根**：server 进程 CWD=web_lab，相对路径会落错位置
+  （thumb_dir/store_path 已按此处理，新模块照办，INB-0114）。
+- **进程内测试跑链路前须先 `db.configure_modules` 注册参数 schema**：否则参数表读不到列、
+  装配行为与 web 进程不符（INB-0109，e2e 测试先例已实现）。
 - **工单 / 记录工具的临时脚本**：`ticket.py` / `ledger.py` / `ticket_web.py` 的默认文件按**脚本自身位置**
   解析——临时脚本、差分比对、自检一律**显式** `--file`/`--deployment-file` 指向临时副本，否则会写坏真实
   工单文件（INB-0039 教训）。

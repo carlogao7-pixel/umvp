@@ -10,8 +10,9 @@
 - **用途**：web_lab 前端"命名配置暂存/取用"的后端存储，把各模块/链路的命名配置
   （preset）存下来，供以后按名字取回复用。
 - **数据库名**：`umvp`（默认，可用 `MYSQL_DB` 覆盖）
-- **表数量**：5 张主表（`presets` / `pipelines` / `pipeline_steps` /
-  `pipeline_edges` / `module_ports`，后两张为图编排 P2-1，见 §5.5/§5.6）
+- **表数量**：7 张主表（`presets` / `pipelines` / `pipeline_steps` /
+  `pipeline_edges` / `module_ports`（图编排 P2-1，见 §5.5/§5.6）/
+  `review_index` / `review_video`（回顾检索标签，WO-0033，见 §11））
   \+ 每模块一张参数表 `preset_params_<module_id>`（当前 11 张，见 §6）
 - **ID 规则**：presets.id / pipelines.id 为"前缀+4 位序号"的业务编号
   （如 `YOLO0001`、`PIPE0001`），新建时按前缀自动递增；前缀表见 §3.2
@@ -91,9 +92,10 @@ CREATE TABLE `presets` (
 | frame_manager | FM | face_store | FSTO |
 | yolo | YOLO | target_crop | CROP |
 | vlm | VLM | plate_recog | PLATE |
-| det_filter | DF | seq_filter | SEQ |
+| det_filter | DF | video_embed | VEMB |
 | face_detect | FDET | face_embed | FEMB |
 | annotate | ANNO | （链路：pipelines / kind='pipeline'） | PIPE |
+| seq_filter | SEQ | review_index / review_video（§11） | RVIDX / RVVID |
 
 > 未登记前缀的模块取 `module_id` 前 4 字符大写兜底；`extract_faces`（EXTF）为已下线模块，
 > 前缀仍登记但不再建表/播种。
@@ -408,6 +410,8 @@ tests/face_dedup_config.py 均已移除）。
 | /api/pipelines/load | POST | load_pipeline | 按 id 取回完整链路（stages 带参数） |
 | /api/pipelines/delete | POST | delete_pipeline | 按 id 删除（级联删步骤） |
 | /api/db/tables | GET | table_snapshots | 各表只读快照（presets / 各模块参数表 / pipelines / steps），DB 不可用时 `{ok:false}` |
+| /api/review/search | POST | query_review_index / list_review_videos | 回顾检索（混合检索过滤式，WO-0033）：时间窗/事件名/车牌/视频过滤 + 向量排序；标签读 §11 两表 |
+| /api/review/relabel | POST | upsert_review_index / upsert_review_video | 「仅重对齐不重嵌入」（WO-0033 §3）：事件归档按窗口重对齐 upsert §11 两表，**不动向量库** |
 
 ## 10. 扩展注意事项
 
@@ -419,3 +423,111 @@ tests/face_dedup_config.py 均已移除）。
   （未登记时按 module_id 前 4 字符大写兜底）。
 - 若要新增表（如保存测试记录、校准结果），沿用同一访问层模式：在 `db.py` 增加对应函数，
   惰性连接与 `MYSQL_*` 环境变量覆盖无需改动。
+
+## 11. 回顾检索·标签表（`review_index` / `review_video`，WO-0033）
+
+> 设计依据 `doc/design/hybrid_retrieval.md` §2.5（标签 schema 冻结）/ §2.6（采集时间视频级）/
+> §4（存储直上表）/ §12-D（契约 D：列名 = 字段名，同名同义）。标签**不进**向量库 npz meta；
+> `(video, t_start)` 与 `EmbedStore` 的 upsert 键一一对应。
+
+### 11.1 建表语句
+
+```sql
+CREATE TABLE IF NOT EXISTS review_index (
+  id VARCHAR(24) NOT NULL PRIMARY KEY,            -- RVIDX0001（前缀+4位序号）
+  video VARCHAR(255) NOT NULL,                    -- 视频名（与向量库 upsert 键一致）
+  t_start DOUBLE NOT NULL,                        -- 片段窗口起点（秒，3位小数对齐向量库键）
+  t_end DOUBLE NOT NULL DEFAULT 0,                -- 片段窗口终点（右开左闭）
+  det_stats JSON NULL,                            -- 观察层 {cls_id:{peak,avg,tracks}}（派生缓存）
+  frame_dets JSON NULL,                           -- 观察层原始记录流 [{ts, recs:[…]}]（缺省 []）
+  class_names JSON NULL,                          -- {cls_id: 标签名}
+  plate_nos JSON NULL,                            -- 观察层车牌号集合（去重）
+  plates JSON NULL,                               -- 判断层车牌事件 [{plate_no,color,type,score,ts}]
+  events JSON NULL,                               -- 判断层警情/研判 [{name,kind,ts,detail}]
+  face_count INT NOT NULL DEFAULT 0,              -- 观察层人脸计数（窗口内最大）
+  description TEXT NULL,                          -- 语义档 VLM 描述（后置，空串）
+  thumb_path VARCHAR(512) NOT NULL DEFAULT '',    -- 窗口缩略图，项目相对路径
+  vector_model VARCHAR(64) NOT NULL DEFAULT '',   -- 向量来源版本
+  clip_dim INT NULL,                              -- clip 向量维度
+  frame_dim INT NULL,                             -- frame 向量维度
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_video_tstart (video, t_start),
+  KEY idx_review_video (video)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+
+CREATE TABLE IF NOT EXISTS review_video (
+  id VARCHAR(24) NOT NULL PRIMARY KEY,            -- RVVID0001
+  video VARCHAR(255) NOT NULL,                    -- 主键（唯一）
+  video_time VARCHAR(64) NOT NULL DEFAULT '',     -- 采集时间 ISO8601 含时区；可为空
+  video_time_src VARCHAR(16) NOT NULL DEFAULT '', -- filename / tag / manual / ''（未知）
+  indexed_at VARCHAR(64) NOT NULL DEFAULT '',     -- 索引时间备注（重跑覆盖）
+  vector_model VARCHAR(64) NOT NULL DEFAULT '',
+  clip_dim INT NULL,
+  frame_dim INT NULL,
+  duration DOUBLE NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_review_video (video)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+```
+
+> **存量库迁移（frame_dets 列，WO-0033 第四轮）**：`frame_dets` 晚于表首建加入，
+> 存量库由 `db.py init_db → _ensure_review_columns`（`_REVIEW_ENSURE_COLS` 登记）
+> 启动时检测缺列自动 `ALTER TABLE ADD COLUMN`（幂等；**只加列不动行**，88 行存量
+> 标签数据原样保留，旧行该列为 NULL、读出经 `_review_index_row` 归一为 `[]`）。
+> 新列须同步登记三处：建表 DDL、`_REVIEW_ENSURE_COLS`、`_REVIEW_INDEX_FIELDS` +
+> `_REVIEW_JSON_COLS`（读写接线）。
+
+### 11.2 读写语义
+
+- **幂等键**：`review_index (video, t_start)`、`review_video video`——索引重跑/重对齐
+  覆盖（先查后 UPDATE/INSERT，业务 ID 只在首建时分配）。
+- **删除**：`delete_review_video(video)` 两侧同步清理（片段标签 + 视频级元数据）。
+- **过滤查询**：`query_review_index(video, time_start, time_end, event_name)`——
+  时间窗按 `review_video.video_time + t_start` 判定（窗口起点边界含）；**无采集时间的
+  视频不参与该过滤**（行上标 `_time_unknown`，由检索层 why 注明，不静默丢弃）；
+  `event_name` 精确匹配 `events[].name` 与 `plates[].plate_no`。
+- **写入来源**：
+  ① PIPE0004 索引收尾（`_align_and_store`）：片段记录的 `observation` 旁路键 + `out/events`
+  事件归档按窗口对齐（`umvp/video_embed/label_align.py` 契约 A）后 upsert；
+  ② `POST /api/review/relabel`：仅重对齐不重嵌入，复用同一对齐函数。
+
+### 11.2.1 `frame_dets` 列说明（观察层原始记录流，§2.5 原则 3 / §11 定案 6）
+
+- **语义**：逐帧 `{ts, recs:[…]}`，`recs` = 过质量闸后的 dict 记录主干原样
+  （`kind=det/plate/face` 多态混存，含 cls_id/track_id/bbox/score 等，剥 `model_path`）；
+  单窗 >500 条截断并附 `"truncated": true`；由 pipe 侧 `label_align.aggregate_frame_stats`
+  产出（契约 A），经片段记录 `observation` 旁路键透传落行（§12-B）；
+- **与 `det_stats` 的关系**：`det_stats` 降级为**派生缓存**（丢了对账口径变了都可靠
+  relabel 从 `frame_dets` 重算）；`frame_dets` 才是原始留存——未来任意新统计
+  （趋势/停留/共现/框重放）= relabel 重算，无需重跑 YOLO、无需重嵌向量；
+- **relabel 保留语义**：relabel 只重算判断层与聚合缓存，**旧行 `frame_dets` 原样保留**
+  （对齐 `det_stats` 旧值保留语义）；仅显式传入新观察数据（body `observations`，
+  本期无调用入口，留参数位）才覆盖；
+- **查询默认不带**：`/api/review/search` 响应 `hits[].tags` 默认**不含** `frame_dets`
+  （行可达 KB 级）；请求开关 `include_frame_dets: true` 时才附带
+  （前端时间形态可视化 / 调试用）。
+
+### 11.3 无 DB 降级（同构 JSON 替身）
+
+`--no-db` 或 MySQL 连接失败时，同结构落 `out/review_index.json` / `out/review_video.json`
+（数组形态；可用 `UMVP_REVIEW_INDEX_JSON` / `UMVP_REVIEW_VIDEO_JSON` 环境变量覆盖路径，
+测试隔离用）。查询走同一套 `db.py` 接口（SQL 路径的替身：内存过滤），检索层对后端无感
+（响应 note 注明「标签索引走无 DB 降级」）。首次探测失败即永久回落 JSON，不做逐请求重试。
+
+### 11.4 事件归档（`out/events/<视频名>.jsonl`，零 DB 依赖）
+
+分析链路收尾（同步 `_done()` 与 SSE 流式两条路径）把**链路尾事件**追加写入
+`out/events/<安全化视频名>.jsonl`，一行一次运行（契约 C）：
+
+```json
+{"run_id": "…", "pipeline": "PIPE0002", "at": "2026-10-29T10:00:00+08:00",
+ "video": "x.mp4", "events": [{"name": "斗殴", "kind": "警情", "ts": 12.3, "detail": {}}]}
+```
+
+- **只归档链路尾事件**（§9 Q1）：seq_filter 事件尾产出（警情名/车牌号/VLM 研判结论）；
+  `plate_recog` 提交与 video_embed 入库回执（clip_indexed）不算；
+- **车牌事件**附 `plate_no` 字段（kind 标「车牌」）——pipe 侧 `build_clip_tags` 按
+  plate_no 路由进 `plates[]`，车牌号不重复进 `events`（§2.5 三层分工）；
+- **detail 摘要控体积**：字符串 200 字符 / 列表 10 项 / 对象 20 键，序列化超 800 字符
+  退化为 `{"_digest": "…"}"`（阈值常量见 server.py `_EVENT_DETAIL_*`）；
+- **按 run_id 幂等**：同 run_id 重放不重复写行。
