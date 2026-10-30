@@ -89,6 +89,10 @@ _ID_PREFIXES = {
     "gate_filter": "GATE",
     "extract_faces": "EXTF",
     "plate_recog": "PLATE",
+    "video_embed": "VEMB",
+    # 回顾检索标签表（WO-0033）：片段标签 / 视频级元数据，业务 ID 前缀
+    "review_index": "RVIDX",
+    "review_video": "RVVID",
 }
 _PIPELINE_PREFIX = "PIPE"  # 链路（pipelines 表 / kind='pipeline' 的 preset）
 # 合法业务 ID 形如 YOLO0001（前缀取 _preset_prefix：显式表或 module_id 前 4 字母大写；
@@ -238,6 +242,48 @@ _DDLS = [
   KEY idx_pipe (pipeline_id),
   CONSTRAINT fk_edge_pipe FOREIGN KEY (pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    # 回顾检索·片段标签（WO-0033，doc/design/hybrid_retrieval.md §2.5/§4）：
+    # 列名 = 标签 schema 字段名（同名同义）；标签不进向量库 npz meta。
+    # (video, t_start) 唯一键与 EmbedStore 的 upsert 键一一对应。
+    # frame_dets（§11 定案 6 / §2.5 原则 3）：观察层原始记录流——逐帧
+    # {ts, recs:[…]}（过质量闸后的 dict 记录主干，kind=det/plate/face 多态混存，
+    # 剥 model_path，单窗 >500 条截断附 truncated）；det_stats 降级为可再生缓存。
+    """CREATE TABLE IF NOT EXISTS review_index (
+  id VARCHAR(24) NOT NULL PRIMARY KEY,
+  video VARCHAR(255) NOT NULL,
+  t_start DOUBLE NOT NULL,
+  t_end DOUBLE NOT NULL DEFAULT 0,
+  det_stats JSON NULL,
+  frame_dets JSON NULL,
+  class_names JSON NULL,
+  plate_nos JSON NULL,
+  plates JSON NULL,
+  events JSON NULL,
+  face_count INT NOT NULL DEFAULT 0,
+  description TEXT NULL,
+  thumb_path VARCHAR(512) NOT NULL DEFAULT '',
+  vector_model VARCHAR(64) NOT NULL DEFAULT '',
+  clip_dim INT NULL,
+  frame_dim INT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_video_tstart (video, t_start),
+  KEY idx_review_video (video)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    # 回顾检索·视频级元数据（§2.6）：采集时间只存这里（video_time 可空），
+    # 另有索引备注（indexed_at / 模型与维度版本 / duration），同一视频重跑覆盖。
+    """CREATE TABLE IF NOT EXISTS review_video (
+  id VARCHAR(24) NOT NULL PRIMARY KEY,
+  video VARCHAR(255) NOT NULL,
+  video_time VARCHAR(64) NOT NULL DEFAULT '',
+  video_time_src VARCHAR(16) NOT NULL DEFAULT '',
+  indexed_at VARCHAR(64) NOT NULL DEFAULT '',
+  vector_model VARCHAR(64) NOT NULL DEFAULT '',
+  clip_dim INT NULL,
+  frame_dim INT NULL,
+  duration DOUBLE NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_review_video (video)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
 ]
 
 
@@ -298,6 +344,7 @@ def init_db() -> None:
     先检测旧整数 ID schema：存在则 DROP 全部配置表（数据可再生）重建为前缀编号
     schema；然后为每个已注册模块 ensure 参数表（缺列自动 ALTER 补列），再把历史
     kind='module' 的 params_json 拆入对应参数表并清空（幂等）。
+    review_* 标签表为存量库追加列（只 ADD 不动行，不丢数据）。
     """
     with _cursor() as cur:
         cur.execute("SELECT 1 FROM information_schema.TABLES"
@@ -307,11 +354,42 @@ def init_db() -> None:
             print("[db] 检测到旧整数 ID schema，已 DROP 重建为前缀编号 schema")
         for ddl in _DDLS:
             cur.execute(ddl)
+        _ensure_review_columns(cur)
         for module_id, schema in _SCHEMAS.items():
             _ensure_module_table(cur, module_id, schema)
         _prune_stale_columns(cur)
         _migrate_legacy_module_params(cur)
         _prune_removed_modules(cur)
+
+
+# review_* 表存量库自动补列登记（表名 → (列名, 列声明)…）。新列同时要进
+# 上方 CREATE TABLE DDL（新库直接建全）与 _REVIEW_INDEX_FIELDS / upsert cols
+# （读写接线）。幂等：缺列才 ALTER ADD COLUMN，存量行新列取 NULL/缺省，不丢数据。
+_REVIEW_ENSURE_COLS: dict[str, tuple[tuple[str, str], ...]] = {
+    "review_index": (
+        # frame_dets（WO-0033 第四轮，§2.5 原则 3 / §11 定案 6）：观察层原始记录流
+        ("frame_dets", "JSON NULL"),
+    ),
+}
+
+
+def _ensure_review_columns(cur) -> None:
+    """存量 review_* 表缺列自动补（幂等；只加列不动行）。
+
+    新库由 _DDLS 建表时已含全部列，此处自然跳过；旧库（建表时还没有该列）
+    在此 ALTER 补齐——88 行存量标签数据原样保留。
+    """
+    for tbl, cols in _REVIEW_ENSURE_COLS.items():
+        cur.execute("SELECT 1 FROM information_schema.TABLES"
+                    " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (tbl,))
+        if not cur.fetchone():
+            continue
+        cur.execute(f"SHOW COLUMNS FROM {tbl}")
+        existing = {r[0] for r in cur.fetchall()}
+        for name, decl in cols:
+            if name not in existing:
+                cur.execute(f"ALTER TABLE `{tbl}` ADD COLUMN `{name}` {decl}")
+                print(f"[db] {tbl} 补列: {name}")
 
 
 def _ensure_module_table(cur, module_id: str, schema: dict[str, str]) -> None:
@@ -1027,3 +1105,482 @@ def table_snapshots() -> dict:
                               "module_id", "配置名"],
                   "rows": steps_rows},
     }
+
+
+# ======================================================================
+# 回顾检索·标签索引（WO-0033，doc/design/hybrid_retrieval.md §2.5/§2.6/§4/§12-D）
+#
+# 两张表：review_index（片段标签，列名=§2.5 冻结字段）与 review_video（视频级
+# 元数据，采集时间只存这里）。设计约定：
+#   - **无 DB 降级**：--no-db 或 MySQL 连接失败时，同结构落
+#     out/review_index.json / out/review_video.json，查询走同一套接口（SQL 替身）；
+#   - 业务 ID：RVIDX0001 / RVVID0001（_ID_PREFIXES 登记，前缀 + 4 位序号）；
+#   - 幂等键：review_index (video, t_start)、review_video video——重跑索引覆盖；
+#   - 删除视频两侧同步清理（delete_review_video）。
+# ======================================================================
+
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# None = 尚未探测（首次调用试 DB，失败后永久回落 JSON）；server 启动成功可显式置 True。
+_REVIEW_USE_DB: bool | None = None
+
+_REVIEW_JSON_LOCK = threading.RLock()
+
+_REVIEW_INDEX_FIELDS = (
+    "video", "t_start", "t_end", "det_stats", "frame_dets", "class_names",
+    "plate_nos", "plates", "events", "face_count", "description", "thumb_path",
+    "vector_model", "clip_dim", "frame_dim",
+)
+_REVIEW_VIDEO_FIELDS = (
+    "video", "video_time", "video_time_src", "indexed_at", "vector_model",
+    "clip_dim", "frame_dim", "duration",
+)
+# review_index 的 JSON 列（写入序列化 / 读出反序列化共用清单）。
+# frame_dets 是 JSON 数组（观察层原始记录流），缺省 []（与 plate_nos 等数组列同组）。
+_REVIEW_JSON_COLS = ("det_stats", "frame_dets", "class_names", "plate_nos",
+                     "plates", "events")
+
+
+def set_review_db_enabled(enabled: bool) -> None:
+    """server 启动时告知标签索引是否走 MySQL（--no-db / init_db 失败 → False）。"""
+    global _REVIEW_USE_DB
+    _REVIEW_USE_DB = bool(enabled)
+
+
+def review_backend_mode() -> str:
+    """当前标签索引后端："db"（MySQL）或 "json"（无 DB 降级）。"""
+    return "db" if _review_db_available() else "json"
+
+
+def _review_db_available() -> bool:
+    """标签索引是否可用 MySQL；首次探测失败即永久回落 JSON（避免每次请求等连接）。"""
+    global _REVIEW_USE_DB
+    if _REVIEW_USE_DB is not None:
+        return _REVIEW_USE_DB
+    try:
+        with _cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        _REVIEW_USE_DB = True
+    except Exception:
+        _REVIEW_USE_DB = False
+    return _REVIEW_USE_DB
+
+
+def _review_json_path(name: str) -> str:
+    """JSON 降级文件路径（可用 UMVP_REVIEW_*_JSON 环境变量覆盖，便于测试隔离）。"""
+    env = os.environ.get({"review_index": "UMVP_REVIEW_INDEX_JSON",
+                          "review_video": "UMVP_REVIEW_VIDEO_JSON"}[name])
+    if env:
+        return env if os.path.isabs(env) else os.path.join(_ROOT_DIR, env)
+    return os.path.join(_ROOT_DIR, "out", f"{name}.json")
+
+
+def _review_json_read(name: str) -> list[dict]:
+    path = _review_json_path(name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, dict):          # 宽容：{"rows": [...]} 形态
+        data = data.get("rows") or []
+    return [dict(r) for r in data if isinstance(r, dict)]
+
+
+def _review_json_write(name: str, rows: list[dict]) -> None:
+    path = _review_json_path(name)
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _jsonish(v, default):
+    """列值 → Python 结构（JSON 文本/已是结构/None → default）。"""
+    if v is None:
+        return default
+    if isinstance(v, (dict, list)):
+        return v
+    try:
+        return json.loads(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _num_or_none(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_zero(v):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _review_index_row(row: dict) -> dict:
+    """片段标签行归一（字段缺省补类型；t_start 3 位小数对齐 EmbedStore upsert 键）。
+
+    frame_dets = 观察层原始记录流（§2.5）：缺省 []；存量为 NULL 的旧行也归一为 []。
+    """
+    return {
+        "video": str(row.get("video") or ""),
+        "t_start": round(_num_or_none(row.get("t_start")) or 0.0, 3),
+        "t_end": round(_num_or_none(row.get("t_end")) or 0.0, 3),
+        "det_stats": row.get("det_stats") or {},
+        "frame_dets": _jsonish(row.get("frame_dets"), []),
+        "class_names": row.get("class_names") or {},
+        "plate_nos": row.get("plate_nos") or [],
+        "plates": row.get("plates") or [],
+        "events": row.get("events") or [],
+        "face_count": _int_or_zero(row.get("face_count")),
+        "description": str(row.get("description") or ""),
+        "thumb_path": str(row.get("thumb_path") or ""),
+        "vector_model": str(row.get("vector_model") or ""),
+        "clip_dim": _num_or_none(row.get("clip_dim")),
+        "frame_dim": _num_or_none(row.get("frame_dim")),
+        "id": row.get("id"),
+    }
+
+
+def _review_video_row(row: dict) -> dict:
+    """视频级元数据行归一（§2.6 字段）。"""
+    return {
+        "video": str(row.get("video") or ""),
+        "video_time": str(row.get("video_time") or ""),
+        "video_time_src": str(row.get("video_time_src") or ""),
+        "indexed_at": str(row.get("indexed_at") or ""),
+        "vector_model": str(row.get("vector_model") or ""),
+        "clip_dim": _num_or_none(row.get("clip_dim")),
+        "frame_dim": _num_or_none(row.get("frame_dim")),
+        "duration": _num_or_none(row.get("duration")),
+        "id": row.get("id"),
+    }
+
+
+def _next_review_id(cur, table: str, prefix: str) -> str:
+    """按前缀分配下一个业务 ID（RVIDX0001 → RVIDX0002…）。锁内调用。"""
+    if table not in ("review_index", "review_video"):
+        raise ValueError(f"非法标签表: {table!r}")
+    cur.execute(f"SELECT id FROM {table} WHERE id LIKE %s", (prefix + "%",))
+    mx = 0
+    for (v,) in cur.fetchall():
+        m = re.fullmatch(rf"{prefix}(\d+)", str(v))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return f"{prefix}{mx + 1:04d}"
+
+
+def _review_next_json_id(rows: list[dict], prefix: str) -> str:
+    mx = 0
+    for r in rows:
+        m = re.fullmatch(rf"{prefix}(\d+)", str(r.get("id") or ""))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return f"{prefix}{mx + 1:04d}"
+
+
+# ---------------- review_index 写入 / 删除 ----------------
+
+def upsert_review_index(rows: list[dict]) -> int:
+    """批量 upsert 片段标签（幂等键 (video, t_start)）；返回写入行数。"""
+    rows = [_review_index_row(r) for r in (rows or []) if str(r.get("video") or "").strip()]
+    if not rows:
+        return 0
+    if not _review_db_available():
+        with _REVIEW_JSON_LOCK:
+            cur_rows = _review_json_read("review_index")
+            by_key = {(str(r.get("video", "")), round(_num_or_none(r.get("t_start")) or 0.0, 3)): r
+                      for r in cur_rows}
+            next_id = _review_next_json_id(cur_rows, "RVIDX")
+            for r in rows:
+                key = (r["video"], r["t_start"])
+                old = by_key.get(key)
+                if old is not None:
+                    r["id"] = old.get("id") or next_id
+                else:
+                    r["id"] = next_id
+                    next_id = _increment_prefix(next_id, "RVIDX")
+                by_key[key] = r
+            out = sorted(by_key.values(), key=lambda r: (str(r.get("video", "")),
+                                                         float(r.get("t_start") or 0.0)))
+            _review_json_write("review_index", out)
+        return len(rows)
+
+    cols = ("video", "t_start", "t_end", "det_stats", "frame_dets", "class_names",
+            "plate_nos", "plates", "events", "face_count", "description", "thumb_path",
+            "vector_model", "clip_dim", "frame_dim")
+    with _LOCK:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            conn.ping(reconnect=True)
+            conn.begin()
+            for r in rows:
+                cur.execute("SELECT id FROM review_index WHERE video=%s AND t_start=%s",
+                            (r["video"], r["t_start"]))
+                hit = cur.fetchone()
+                if hit:
+                    rid = hit[0]
+                    sets = ", ".join(f"`{k}`=%s" for k in cols)
+                    vals = [_sql_json(r[k]) if k in _REVIEW_JSON_COLS else r[k]
+                            for k in cols]
+                    cur.execute(f"UPDATE review_index SET {sets} WHERE id=%s", vals + [rid])
+                else:
+                    rid = _next_review_id(cur, "review_index", "RVIDX")
+                    ph = ", ".join(["%s"] * (len(cols) + 1))
+                    vals = [rid] + [_sql_json(r[k]) if k in _REVIEW_JSON_COLS
+                                    else r[k] for k in cols]
+                    cur.execute(f"INSERT INTO review_index (id, {', '.join(cols)})"
+                                f" VALUES ({ph})", vals)
+            conn.commit()
+            return len(rows)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+def _sql_json(v) -> str:
+    """JSON 列写入值：结构 → 紧凑 JSON 文本。"""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return json.dumps(_jsonish(v, {}), ensure_ascii=False)
+
+
+def _increment_prefix(rid: str, prefix: str) -> str:
+    m = re.fullmatch(rf"{prefix}(\d+)", str(rid or ""))
+    return f"{prefix}{(int(m.group(1)) + 1) if m else 1:04d}"
+
+
+def delete_review_video(video: str) -> int:
+    """删除某视频的片段标签与视频级元数据（幂等）；返回删除的片段行数。"""
+    video = str(video or "").strip()
+    if not video:
+        return 0
+    if not _review_db_available():
+        with _REVIEW_JSON_LOCK:
+            idx = _review_json_read("review_index")
+            keep = [r for r in idx if str(r.get("video", "")) != video]
+            n = len(idx) - len(keep)
+            if n:
+                _review_json_write("review_index", keep)
+            vids = _review_json_read("review_video")
+            keep_v = [r for r in vids if str(r.get("video", "")) != video]
+            if len(keep_v) != len(vids):
+                _review_json_write("review_video", keep_v)
+        return n
+    with _LOCK:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            conn.ping(reconnect=True)
+            conn.begin()
+            cur.execute("DELETE FROM review_index WHERE video=%s", (video,))
+            n = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM review_video WHERE video=%s", (video,))
+            conn.commit()
+            return n
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+# ---------------- review_video 写入 / 读取 ----------------
+
+def upsert_review_video(rows: list[dict]) -> int:
+    """批量 upsert 视频级元数据（幂等键 video）；返回写入行数。"""
+    rows = [_review_video_row(r) for r in (rows or []) if str(r.get("video") or "").strip()]
+    if not rows:
+        return 0
+    if not _review_db_available():
+        with _REVIEW_JSON_LOCK:
+            cur_rows = _review_json_read("review_video")
+            by_video = {str(r.get("video", "")): r for r in cur_rows}
+            next_id = _review_next_json_id(cur_rows, "RVVID")
+            for r in rows:
+                old = by_video.get(r["video"])
+                if old is not None:
+                    r["id"] = old.get("id") or next_id
+                else:
+                    r["id"] = next_id
+                    next_id = _increment_prefix(next_id, "RVVID")
+                by_video[r["video"]] = r
+            out = sorted(by_video.values(), key=lambda r: str(r.get("video", "")))
+            _review_json_write("review_video", out)
+        return len(rows)
+
+    cols = ("video", "video_time", "video_time_src", "indexed_at", "vector_model",
+            "clip_dim", "frame_dim", "duration")
+    with _LOCK:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            conn.ping(reconnect=True)
+            conn.begin()
+            for r in rows:
+                cur.execute("SELECT id FROM review_video WHERE video=%s", (r["video"],))
+                hit = cur.fetchone()
+                if hit:
+                    rid = hit[0]
+                    sets = ", ".join(f"`{k}`=%s" for k in cols)
+                    cur.execute(f"UPDATE review_video SET {sets} WHERE id=%s",
+                                [r[k] for k in cols] + [rid])
+                else:
+                    rid = _next_review_id(cur, "review_video", "RVVID")
+                    ph = ", ".join(["%s"] * (len(cols) + 1))
+                    cur.execute(f"INSERT INTO review_video (id, {', '.join(cols)})"
+                                f" VALUES ({ph})", [rid] + [r[k] for k in cols])
+            conn.commit()
+            return len(rows)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+def list_review_videos(video: str | None = None) -> list[dict]:
+    """列出视频级元数据（可按视频过滤），字段名 = §2.6。"""
+    videos = None
+    if isinstance(video, str) and video.strip():
+        videos = [video.strip()]
+    if not _review_db_available():
+        with _REVIEW_JSON_LOCK:
+            rows = _review_json_read("review_video")
+        if videos:
+            rows = [r for r in rows if str(r.get("video", "")) in videos]
+        return [_review_video_row(r) for r in rows]
+
+    cols = ("id", "video", "video_time", "video_time_src", "indexed_at",
+            "vector_model", "clip_dim", "frame_dim", "duration")
+    sql = f"SELECT {', '.join(cols)} FROM review_video"
+    args: list = []
+    if videos:
+        sql += " WHERE video IN (" + ", ".join(["%s"] * len(videos)) + ")"
+        args = videos
+    sql += " ORDER BY video"
+    with _cursor() as cur:
+        cur.execute(sql, args)
+        return [_review_video_row(dict(zip(cols, r))) for r in cur.fetchall()]
+
+
+# ---------------- 过滤查询 ----------------
+
+def _as_dt(v):
+    """时间窗参数 → 带时区 datetime（None 原样；数值=epoch；无时区按本地时区）。"""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime.datetime):
+        return v if v.tzinfo else v.astimezone()
+    if isinstance(v, (int, float)):
+        return datetime.datetime.fromtimestamp(float(v)).astimezone()
+    s = str(v).strip()
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _video_time_of(video_row: dict | None):
+    """review_video 行 → 采集时间 datetime（空/解析失败 → None）。"""
+    if not video_row:
+        return None
+    return _as_dt(video_row.get("video_time"))
+
+
+def query_review_index(video: str | None = None,
+                       time_start=None, time_end=None,
+                       event_name: str | None = None) -> list[dict]:
+    """按视频 / 墙钟时间窗 / 事件名（含车牌号）过滤片段标签。
+
+    - time_start/time_end：按 review_video.video_time + t_start 判定；**无采集时间的
+      视频不参与该过滤**（保留并在行上标 `_time_unknown=True`，由 why 说明）；
+    - event_name：精确匹配 events[].name 与 plates[].plate_no（§9 Q2 定案）；
+    - 返回行 = §2.5 字段 + `_time_unknown`（仅时间窗生效时存在）。
+    """
+    t0, t1 = _as_dt(time_start), _as_dt(time_end)
+    ev = str(event_name or "").strip()
+    videos = [video.strip()] if isinstance(video, str) and video.strip() else None
+    video_map = {v["video"]: v for v in list_review_videos(video)}
+    if t0 or t1:
+        named = set(videos) if videos else set(video_map)
+        # 时间窗可用性：有采集时间的视频按区间粗筛；无采集时间的一律保留（不静默丢弃）
+        if videos:
+            keep = []
+            for v in videos:
+                vt = _video_time_of(video_map.get(v))
+                if vt is None:
+                    keep.append(v)
+                    continue
+                dur = _num_or_none((video_map.get(v) or {}).get("duration")) or 0.0
+                if ((t0 is None or vt + datetime.timedelta(seconds=dur) >= t0)
+                        and (t1 is None or vt <= t1)):
+                    keep.append(v)
+            videos = keep
+        else:
+            keep = []
+            for v in named:
+                vt = _video_time_of(video_map.get(v))
+                if vt is None:
+                    keep.append(v)
+                else:
+                    dur = _num_or_none((video_map.get(v) or {}).get("duration")) or 0.0
+                    if ((t0 is None or vt + datetime.timedelta(seconds=dur) >= t0)
+                            and (t1 is None or vt <= t1)):
+                        keep.append(v)
+            videos = sorted(keep)
+        if not videos:
+            return []
+
+    if not _review_db_available():
+        with _REVIEW_JSON_LOCK:
+            rows = [_review_index_row(r) for r in _review_json_read("review_index")]
+    else:
+        cols = ("id",) + _REVIEW_INDEX_FIELDS
+        sql = f"SELECT {', '.join(cols)} FROM review_index"
+        args: list = []
+        if videos:
+            sql += " WHERE video IN (" + ", ".join(["%s"] * len(videos)) + ")"
+            args = videos
+        sql += " ORDER BY video, t_start"
+        with _cursor() as cur:
+            cur.execute(sql, args)
+            rows = []
+            for r in cur.fetchall():
+                d = dict(zip(cols, r))
+                for k in _REVIEW_JSON_COLS:
+                    d[k] = _jsonish(d.get(k), [] if k in ("plate_nos", "plates",
+                                                          "events", "frame_dets") else {})
+                rows.append(_review_index_row(d))
+
+    out = []
+    for r in rows:
+        if videos and r["video"] not in videos:
+            continue
+        if ev:
+            names = {str(e.get("name", "")) for e in (r.get("events") or []) if isinstance(e, dict)}
+            plates = {str(p.get("plate_no", "")) for p in (r.get("plates") or []) if isinstance(p, dict)}
+            if ev not in names and ev not in plates:
+                continue
+        if t0 or t1:
+            vt = _video_time_of(video_map.get(r["video"]))
+            if vt is None:
+                r["_time_unknown"] = True
+            else:
+                abs_ts = vt + datetime.timedelta(seconds=float(r["t_start"]))
+                if (t0 is not None and abs_ts < t0) or (t1 is not None and abs_ts > t1):
+                    continue
+        out.append(r)
+    return out

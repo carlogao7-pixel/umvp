@@ -27,7 +27,9 @@ import base64
 import contextlib
 import datetime
 import hashlib
+import html
 import importlib
+import inspect
 import io
 import json
 import os
@@ -73,6 +75,7 @@ _STAGE_LABELS = {
     "gate_filter": "门控",
     "plate_recog": "车牌识别", "face_detect": "人脸检测", "face_embed": "人脸嵌入",
     "face_store": "向量底库", "extract_faces": "原分辨率提取",
+    "video_embed": "向量化",
 }
 
 
@@ -1022,6 +1025,974 @@ def h_face_store(p: dict) -> dict:
     return res(text=head + "\n" + buf.getvalue())
 
 
+# 视频嵌入模块试跑喂帧上限（≈10 片段@6 帧/片段）：mock 档瞬时完成；真档防长视频
+# 把整轮试跑拖死（真端点联调请先小视频验证连通性）
+_VEMB_TEST_MAX_FRAMES = 60
+
+
+def h_video_embed(p: dict) -> dict:
+    """视频嵌入试跑（模块测试页）：选视频 → 按标称节奏取样帧 → 片段窗口聚合 →
+    嵌入（mock/真档）→ 底库入库并落盘。对齐 face_embed 的页面形态（参数表单+试跑）；
+    查询/检索 UI 本期不做（查询层另行开单）。"""
+    video_name = str(p.get("video", "")).strip()
+    if not video_name:
+        return res(ok=False, error="请选择要索引的视频")
+    vid = _find_file(video_name, [VID_DIR])
+    if not vid:
+        return res(ok=False, error=f"找不到视频: {video_name}")
+    stage = _build_video_embed_stage(p, video=vid.name)
+    cap = cv2.VideoCapture(str(vid))
+    if not cap.isOpened():
+        cap.release()
+        return res(ok=False, error=f"无法打开视频: {vid}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    # 取样节奏：frames_per_clip/clip_seconds 帧每秒（窗口标称时间轴；等价帧管理 frame_skip）
+    stride = max(1, int(round(fps * stage.clip_seconds / stage.frames_per_clip)))
+    recs, fed, n = [], 0, 0
+    while fed < _VEMB_TEST_MAX_FRAMES:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        recs.extend(stage.run(frame, ts=n / fps, frame_idx=n))
+        fed += 1
+        n += 1
+        for _ in range(stride - 1):  # 跳帧只解码不取图
+            if not cap.grab():
+                break
+            n += 1
+    cap.release()
+    recs.extend(stage.finish())
+    store_path = _str_param(p, "store_path") or "out/video_vecs.npz"
+    sp = Path(store_path)
+    if not sp.is_absolute():
+        sp = ROOT / store_path
+    saved = stage.store.save(str(sp))
+    mode = "mock（确定性伪向量）" if stage.client.mock else \
+        f"真实端点 {stage.client._active_endpoint or '(未配置)'}"
+    lines = [f"视频: {vid.name} | 模式: {mode} | clip 维 {stage.client.clip_dimension} / "
+             f"frame 维 {stage.client.frame_dimension} | 取样 stride={stride} 喂 {fed} 帧"
+             f"（上限 {_VEMB_TEST_MAX_FRAMES}） | 片段 {len(recs)} 条 | 底库: {saved} | "
+             f"{stage.store.stats()}"]
+    for r in recs[:10]:
+        lines.append(f"  片段#{r['clip_id']} t={r['t_start']:.2f}~{r['t_end']:.2f}s "
+                     f"{r['frame_count']} 帧{'（尾段）' if r['partial'] else ''} "
+                     f"→ {r['thumb_path'] or '无缩略图'}")
+    if len(recs) > 10:
+        lines.append(f"  …（其余 {len(recs) - 10} 条见底库）")
+    images = []
+    for r in recs[:3]:
+        tp = r.get("thumb_path")
+        if tp and Path(tp).exists():
+            img = cv2.imread(tp)
+            if img is not None:
+                images.append({"title": f"片段#{r['clip_id']} 缩略图 t={r['t_start']:.1f}s",
+                               "data": _img_data_url(img, 80)})
+    return res(text="\n".join(lines), images=images)
+
+
+# ---------------- 回顾检索·查询层（WO-0032 向量档 + WO-0033 混合检索·过滤式） ----------------
+# 设计依据 doc/design/video_review_search.md §4.1（两步漏斗）/ §6（前端交互）与
+# doc/design/hybrid_retrieval.md（§2.5 标签 schema / §3 事件归档 / §4 落表 / §5 查询扩展）：
+#   query_text → WeMM embed_text（维度取底库 clip_dim，入库查询同维度）→
+#   ① store.search clip 粗排（有过滤器时先 pre-filter 幸存集）→
+#   ② 逐片段 search_frames 帧级精排 → play_ts = best_frame_ts − pre_roll_sec（下限 0）。
+# 过滤式本期落地（时间窗 / 事件名+车牌 / 视频），hybrid（RRF）只预留 mode 字段。
+
+# ---- 事件留存归档（§3 采集路径 A / §9 Q1 / §12-C）----
+# 分析链路收尾把**链路尾事件**追加到 out/events/<视频名>.jsonl，一行一次运行；
+# run_id 去重保证幂等。detail 摘要控体积：单字符串 200 字符、列表 10 项、对象 20 键，
+# 序列化后超过 800 字符退化为 {"_digest": "…"}（阈值见常量，长 VLM 文本不落全量）。
+_EVENTS_DIR = ROOT / "out" / "events"
+_EVENT_DETAIL_STR_MAX = 200
+_EVENT_DETAIL_ITEMS_MAX = 10
+_EVENT_DETAIL_KEYS_MAX = 20
+_EVENT_DETAIL_JSON_MAX = 800
+_EVENTS_LOCK = threading.Lock()
+
+
+def _event_detail_digest(detail):
+    """事件 detail → 控体积摘要（截断阈值见上方常量）。"""
+    if detail is None:
+        return {}
+    if not isinstance(detail, dict):
+        detail = {"value": detail}
+
+    def _cut(v, depth=0):
+        if isinstance(v, str):
+            return v if len(v) <= _EVENT_DETAIL_STR_MAX else \
+                v[:_EVENT_DETAIL_STR_MAX] + "…（截断）"
+        if isinstance(v, (list, tuple)):
+            items = [_cut(x, depth + 1) for x in list(v)[:_EVENT_DETAIL_ITEMS_MAX]]
+            if len(v) > _EVENT_DETAIL_ITEMS_MAX:
+                items.append(f"…（共 {len(v)} 项）")
+            return items
+        if isinstance(v, dict):
+            keys = list(v)[:_EVENT_DETAIL_KEYS_MAX]
+            out = {str(k): _cut(v[k], depth + 1) for k in keys}
+            if len(v) > _EVENT_DETAIL_KEYS_MAX:
+                out["_truncated_keys"] = len(v) - _EVENT_DETAIL_KEYS_MAX
+            return out
+        return v
+
+    d = _cut(detail)
+    try:
+        text = json.dumps(d, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(d)
+    if len(text) > _EVENT_DETAIL_JSON_MAX:
+        return {"_digest": text[:_EVENT_DETAIL_JSON_MAX] + "…（截断）"}
+    return d
+
+
+def _event_record(ev: dict, kind: str) -> dict:
+    """链路尾事件 → 归档条目（§12-C：name/kind/ts/detail；车牌事件附 plate_no）。
+
+    plate_no 为契约 C 的兼容扩展字段：pipe 侧 build_clip_tags 按 plate_no 把
+    车牌事件路由进 plates[]（§2.5 三层分工：车牌号不重复进 events）。
+    """
+    name = str(ev.get("name") or "").strip()
+    rec = {"name": name, "kind": str(ev.get("kind") or kind or "警情")}
+    ts = ev.get("ts")
+    if ts is not None:
+        try:
+            rec["ts"] = round(float(ts), 3)
+        except (TypeError, ValueError):
+            pass
+    rec["detail"] = _event_detail_digest(ev.get("detail"))
+    pn = ev.get("plate_no")
+    if kind == "车牌" and pn in (None, ""):
+        pn = name  # PIPE0002 车牌事件 name=车牌号（§2.2）
+    if pn not in (None, ""):
+        rec["plate_no"] = str(pn)
+    return rec
+
+
+def _event_record_key(rec: dict) -> tuple:
+    return (rec.get("name", ""), rec.get("kind", ""), rec.get("ts"),
+            json.dumps(rec.get("detail") or {}, ensure_ascii=False, sort_keys=True))
+
+
+def _archive_add_many(acc: list, events, kind: str = "警情", plate_nos=None) -> None:
+    """把一批事件追加进本次运行的归档累加器（同运行内去重）。
+
+    车牌分类（name 命中 plate_nos）**覆写**事件尾的泛化 kind（警情）——
+    §2.5 三层分工：车牌号归 plates[]，不与警情混口径。
+    """
+    for ev in events or []:
+        if not isinstance(ev, dict) or not str(ev.get("name") or "").strip():
+            continue
+        k = kind
+        if plate_nos is not None and str(ev.get("name")) in plate_nos:
+            k = "车牌"
+        ev2 = dict(ev)
+        if k == "车牌":
+            ev2["kind"] = "车牌"  # 覆写 seq_filter 的泛化 kind（警情）
+        rec = _event_record(ev2, k)
+        key = _event_record_key(rec)
+        if not any(_event_record_key(x) == key for x in acc):
+            acc.append(rec)
+
+
+def _safe_events_filename(video: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", str(video or "video")).strip("_") or "video"
+
+
+def _events_path_for(video: str) -> Path:
+    return _EVENTS_DIR / f"{_safe_events_filename(video)}.jsonl"
+
+
+def _archive_run_events(video: str, pipeline_id: str, events: list,
+                        run_id: str) -> int:
+    """把一次运行的链路尾事件追加到 out/events/<视频名>.jsonl（按 run_id 幂等）。
+
+    返回本次实际写入的事件数（0 = 已归档过 / 无事件 / 无视频名）。
+    """
+    video = str(video or "").strip()
+    if not video or not events:
+        return 0
+    path = _events_path_for(video)
+    with _EVENTS_LOCK:
+        seen = set()
+        if path.is_file():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        seen.add(str(json.loads(line).get("run_id") or ""))
+                    except ValueError:
+                        continue
+            except OSError:
+                pass
+        if run_id and run_id in seen:
+            return 0
+        # 归档前统一规范化（契约 C + detail 摘要控体积 + 车牌事件附 plate_no）：
+        # 生产路径 _tail_events_of_timeline 已规范化（此处幂等重入）；直调路径
+        # （qa mock / 工具脚本）在此兜底，保证落盘格式一致。
+        norm: list = []
+        _pn = {str(e.get("name")) for e in events
+               if isinstance(e, dict) and (e.get("plate_no") or e.get("kind") == "车牌")}
+        _archive_add_many(norm, events, kind="警情", plate_nos=_pn or None)
+        payload = {
+            "run_id": str(run_id or uuid.uuid4().hex[:12]),
+            "pipeline": str(pipeline_id or ""),
+            "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "video": video,
+            "events": norm,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as e:
+            print(f"[events] 归档失败（{path}）: {e}")
+            return 0
+    return len(norm)
+
+
+def _read_archived_events(video: str, events_path=None) -> list[dict]:
+    """读取某视频的事件归档（所有运行合并，按 run_id+事件去重）。"""
+    path = Path(events_path) if events_path else _events_path_for(video)
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.is_file():
+        return []
+    out, seen = [], set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        run_id = str(row.get("run_id") or "")
+        for ev in row.get("events") or []:
+            if not isinstance(ev, dict):
+                continue
+            rec = _event_record(ev, str(ev.get("kind") or "警情"))
+            key = (run_id,) + _event_record_key(rec)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+    return out
+
+
+def _tail_events_of_timeline(timeline: list) -> list:
+    """从运行时间线提取**链路尾事件**（§9 Q1：只归档链路尾事件）。
+
+    口径：kind=submit 且 data 为含非空 name 的事件 dict——seq_filter 事件尾产出
+    （警情名/车牌号/VLM 研判结论，含 publish 通路事件）。两类 submit 不算：
+      - plate_recog 提交（data 形态为 plate_no/type_name/…，无 name）；
+      - video_embed 入库回执（事件名 clip_indexed，索引产物非分析事件）。
+    同运行内重复事件经 _archive_add_many 去重；车牌号命中 plate 提交时 kind 标「车牌」
+    （PIPE0002 车牌事件 name=车牌号，§2.2）。
+    """
+    evs: list = []
+    plate_nos: set = set()
+    for it in timeline or []:
+        if not isinstance(it, dict) or it.get("kind") != "submit":
+            continue
+        d = it.get("data")
+        if not isinstance(d, dict):
+            continue
+        pn = d.get("plate_no")
+        if pn not in (None, ""):
+            plate_nos.add(str(pn))
+            continue  # 车牌识别提交不是事件
+        name = str(d.get("name") or "").strip()
+        if not name or name == "clip_indexed":
+            continue
+        evs.append(d)
+    acc: list = []
+    _archive_add_many(acc, evs, kind="警情", plate_nos=plate_nos or None)
+    return acc
+
+
+# ---- 索引收尾对齐（§3 / §4 / §12-A）----
+
+def _project_rel(path) -> str:
+    """磁盘路径 → 项目相对路径（§2.5 原则 4：换机不失效）。"""
+    s = str(path or "").strip()
+    if not s:
+        return ""
+    p = Path(s)
+    if p.is_absolute():
+        try:
+            return str(p.resolve().relative_to(ROOT))
+        except (ValueError, OSError):
+            return str(p)
+    if s.startswith("../"):  # 历史 CWD 相对形态（web_lab 基准）→ 归一项目根基准
+        try:
+            rp = (ROOT / s).resolve()
+            return str(rp.relative_to(ROOT))
+        except (ValueError, OSError):
+            pass
+    return s
+
+
+def _video_duration_of(clip_records: list) -> float:
+    ends = []
+    for r in clip_records or []:
+        try:
+            ends.append(float(r.get("t_end") or 0.0))
+        except (TypeError, ValueError):
+            pass
+    return round(max(ends), 3) if ends else 0.0
+
+
+def _window_key(win) -> tuple:
+    if isinstance(win, (tuple, list)) and len(win) >= 2:
+        return (round(float(win[0]), 3), round(float(win[1]), 3))
+    if isinstance(win, dict):
+        return (round(float(win.get("t_start") or 0.0), 3),
+                round(float(win.get("t_end") or 0.0), 3))
+    return (0.0, 0.0)
+
+
+def _build_review_rows(video: str, windows: list, observations: dict,
+                       events: list, extra: dict | None = None) -> list[dict]:
+    """调用 pipe 侧 label_align（契约 A）产 §2.5 标签行；模块缺失时返回 []。"""
+    try:
+        from video_embed import label_align as la
+    except Exception as e:  # pipe 侧未落地/导入失败：不阻断索引，记录提示
+        print(f"[review] label_align 不可用，跳过标签落表: {e}")
+        return []
+    aligned = []
+    if events:
+        try:
+            aligned = la.align_events(events, windows) or []
+        except Exception as e:
+            print(f"[review] align_events 失败: {e}")
+            aligned = []
+    grouped: dict = {}
+    for item in aligned:
+        if not isinstance(item, dict):
+            continue
+        key = None
+        for k in ("window", "t_start", "clip_window"):
+            if k in item:
+                if k == "t_start":
+                    key = (round(float(item.get("t_start") or 0.0), 3),
+                           round(float(item.get("t_end") or 0.0), 3))
+                else:
+                    key = _window_key(item.get(k))
+                break
+        if key is None and item.get("ts") is not None:
+            ts = float(item["ts"])
+            key = next((w for w in windows if w[0] <= ts < w[1]), None)
+        if key is not None:
+            grouped.setdefault(key, []).append(item)
+
+    rows = []
+    for win in windows:
+        key = _window_key(win)
+        obs = observations.get(key) or {}
+        win_events = grouped.get(key) or []
+        try:
+            tags = la.build_clip_tags(video, key, obs, win_events) or {}
+        except Exception as e:
+            print(f"[review] build_clip_tags 失败（{video} {key}）: {e}")
+            tags = {}
+        # frame_dets（§2.5 观察层原始记录流，§11 定案 6）：pipe 侧 build_clip_tags 透传
+        # （契约 A）；pipe 未交付/字段缺失时从 observation 旁路键兜底取（aggregate_frame_stats
+        # 产物同含 frame_dets），再缺省 []——观察源未接线不报错，行照常落表。
+        fd = tags.get("frame_dets") or obs.get("frame_dets") or []
+        row = {
+            "video": video, "t_start": key[0], "t_end": key[1],
+            "det_stats": tags.get("det_stats") or obs.get("det_stats") or {},
+            "frame_dets": fd if isinstance(fd, list) else [],
+            "class_names": tags.get("class_names") or obs.get("class_names") or {},
+            "plate_nos": tags.get("plate_nos") or obs.get("plate_nos") or [],
+            "plates": tags.get("plates") or [],
+            "events": tags.get("events") or [],
+            "face_count": int(tags.get("face_count") or obs.get("face_count") or 0),
+            "description": str(tags.get("description") or ""),
+            "thumb_path": _project_rel(tags.get("thumb_path") or ""),
+            "vector_model": str(tags.get("vector_model") or (extra or {}).get("vector_model") or ""),
+            "clip_dim": tags.get("clip_dim") if tags.get("clip_dim") is not None
+            else (extra or {}).get("clip_dim"),
+            "frame_dim": tags.get("frame_dim") if tags.get("frame_dim") is not None
+            else (extra or {}).get("frame_dim"),
+        }
+        rows.append(row)
+    return rows
+
+
+def _align_and_store(video: str, clip_records: list, events: list,
+                     vector_model: str = "", clip_dim=None, frame_dim=None) -> dict:
+    """PIPE0004 收尾对齐落表（review_index + review_video）；返回处理摘要。
+
+    仅落表，不动向量库（向量落盘由调用方完成）。label_align 尚不可用时 fail-soft。
+    """
+    try:
+        from video_embed import label_align as la
+    except Exception as e:
+        return {"ok": False, "rows": 0, "error": f"label_align 不可用: {e}"}
+    windows, observations = [], {}
+    frame_ts_all: list = []
+    for r in clip_records or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            win = (round(float(r.get("t_start") or 0.0), 3),
+                   round(float(r.get("t_end") or 0.0), 3))
+        except (TypeError, ValueError):
+            continue
+        windows.append(win)
+        obs = r.get("observation") or {}
+        if not obs and isinstance(r.get("frame_stats"), list):
+            try:
+                obs = la.aggregate_frame_stats(r["frame_stats"]) or {}
+            except Exception:
+                obs = {}
+        observations[win] = obs if isinstance(obs, dict) else {}
+        frame_ts_all.extend(r.get("frame_ts") or [])
+    if not windows and frame_ts_all:
+        try:
+            windows = [_window_key(w) for w in la.clip_windows(frame_ts_all)]
+        except Exception as e:
+            print(f"[review] clip_windows 失败: {e}")
+    if not windows:
+        return {"ok": True, "rows": 0, "events": len(events),
+                "note": "无可对齐的片段窗口"}
+
+    extra = {"vector_model": vector_model, "clip_dim": clip_dim, "frame_dim": frame_dim}
+    rows = _build_review_rows(video, windows, observations, events, extra=extra)
+    if not rows:
+        return {"ok": False, "rows": 0, "error": "标签构建失败（build_clip_tags 无产出）"}
+    # 缩略图/维度兜底：以片段记录（EmbedStore meta 同源）为准
+    by_win = {_window_key(w): r for w, r in zip(windows, rows)}
+    for rec in clip_records or []:
+        if not isinstance(rec, dict):
+            continue
+        key = _window_key((rec.get("t_start"), rec.get("t_end")))
+        row = by_win.get(key)
+        if row is None:
+            continue
+        row["thumb_path"] = _project_rel(rec.get("thumb_path") or row["thumb_path"])
+        for k in ("clip_dim", "frame_dim"):
+            if rec.get(k) is not None:
+                row[k] = rec.get(k)
+    n = db.upsert_review_index(rows)
+
+    try:
+        video_time, src = la.parse_video_time(video)
+    except Exception:
+        video_time, src = "", ""
+    db.upsert_review_video([{
+        "video": video,
+        "video_time": video_time, "video_time_src": src,
+        "indexed_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "vector_model": vector_model,
+        "clip_dim": clip_dim, "frame_dim": frame_dim,
+        "duration": _video_duration_of(clip_records),
+    }])
+    return {"ok": True, "rows": n, "events": len(events),
+            "backend": db.review_backend_mode()}
+
+
+def _vem_vector_meta(vem, params: dict) -> tuple:
+    """视频嵌入阶段 → (vector_model, clip_dim, frame_dim)。"""
+    client = getattr(vem, "client", None)
+    model = str(getattr(client, "model", "") or params.get("embed_model") or "")
+    cd = getattr(client, "clip_dimension", None) or params.get("embed_dimension")
+    fd = getattr(client, "frame_dimension", None) or params.get("frame_dimension")
+    return model, cd, fd
+
+
+def _vem_feed_dets(pipe, vem, position, frame, ts, n):
+    """向 video_embed 喂入本帧 + 观察源 Records（dets 第二入端口，§12-1）。
+
+    pipe-chain 的 VideoEmbedStage 契约未固定 run 的附加参数形态，这里做兼容适配：
+    优先 `run(frame, ts, n, records=...)`；否则若提供 `observe(...)` / `feed_dets(...)`
+    先喂观察记录再按原签名 run；均不支持时退化为纯帧索引入口（不报错、无观察标签）。
+    """
+    records = None
+    try:
+        records = pipe._port_at(position, "video_embed", vem, "dets", None)
+    except Exception:
+        records = None
+    if records is not None and not isinstance(records, list):
+        records = [records] if isinstance(records, dict) else None
+    run = getattr(vem, "run", None)
+    try:
+        sig = inspect.signature(run)
+    except (TypeError, ValueError):
+        sig = None
+    if records and sig is not None and "records" in sig.parameters:
+        return run(frame=frame, ts=ts, frame_idx=n, records=records)
+    if records and sig is not None and "dets" in sig.parameters:
+        return run(frame=frame, ts=ts, frame_idx=n, dets=records)
+    if records:
+        for name in ("observe", "feed_dets", "add_dets"):
+            fn = getattr(vem, name, None)
+            if fn is None:
+                continue
+            try:
+                fn(records, ts=ts, frame_idx=n)
+            except TypeError:
+                try:
+                    fn(records, ts, n)
+                except TypeError:
+                    fn(records)
+            break
+    return run(frame, ts, n)
+
+
+def _last_clip_records(vem) -> list:
+    """取视频嵌入阶段累计的片段记录（indexed，驱动层可直接读全量）。"""
+    recs = getattr(vem, "indexed", None)
+    return list(recs) if isinstance(recs, list) else []
+
+
+def _archive_and_align(video, pipeline_id, events, run_id, vem, params,
+                       store_path: str = ""):
+    """收尾：事件归档 → （有索引时）标签对齐落表。任一步失败不影响运行主流程。"""
+    saved = 0
+    try:
+        saved = _archive_run_events(video, pipeline_id, events, run_id)
+    except Exception as e:
+        print(f"[events] 归档异常: {e}")
+    if vem is None:
+        return {"events": saved}
+    try:
+        model, cd, fd = _vem_vector_meta(vem, params or {})
+        res = _align_and_store(video, _last_clip_records(vem),
+                               _read_archived_events(video),
+                               vector_model=model, clip_dim=cd, frame_dim=fd)
+        res["events_saved"] = saved
+        print(f"[review] 标签落表 {video}: {res}")
+        return res
+    except Exception as e:
+        print(f"[review] 标签对齐失败（不阻断索引）: {e}")
+        return {"events": saved, "error": str(e)}
+
+
+_REVIEW_STORE_CACHE: dict = {}   # 库绝对路径 -> (mtime_ns, EmbedStore)；mtime 变化自动重载
+_REVIEW_STORE_LOCK = threading.Lock()
+
+
+def _review_store_path(store_path) -> Path:
+    """store_path 归一：相对路径以项目根为基准。
+
+    server 进程 CWD 常为 web_lab/（run.sh），不归一会找成 web_lab/out/…（INB-0114
+    同款 CWD 坑）；前端传回的绝对路径原样保留。
+    """
+    sp = Path(str(store_path or "").strip() or "out/video_vecs.npz")
+    return sp if sp.is_absolute() else ROOT / sp
+
+
+def _review_store(store_path):
+    """加载向量底库（缓存复用，文件 mtime 变化自动重载——PIPE0004 重跑 upsert 后
+    查询侧无需重启服务）。不存在 / 为空抛可读异常（FileNotFoundError / ValueError）。"""
+    from video_embed.embed_store import EmbedStore
+    sp = _review_store_path(store_path)
+    if not sp.is_file():
+        raise FileNotFoundError(
+            f"向量底库不存在: {sp}"
+            f"（请先运行 PIPE0004「视频向量化-嵌入查询链路」索引视频建库）")
+    mtime = sp.stat().st_mtime_ns
+    key = str(sp)
+    with _REVIEW_STORE_LOCK:
+        hit = _REVIEW_STORE_CACHE.get(key)
+        if not hit or hit[0] != mtime:
+            hit = (mtime, EmbedStore().load(key))
+            _REVIEW_STORE_CACHE[key] = hit
+    if len(hit[1]) == 0:
+        raise ValueError(f"向量底库为空: {sp}（请先运行 PIPE0004 建库后再查询）")
+    return hit[1], key
+
+
+def _review_parse_dt(v):
+    """时间窗参数 → 带时区 datetime（None/空 → None；非法 → ValueError）。"""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime.datetime):
+        return v if v.tzinfo else v.astimezone()
+    if isinstance(v, (int, float)):
+        return datetime.datetime.fromtimestamp(float(v)).astimezone()
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"时间窗参数非法: {v!r}（应为 ISO8601，如 2026-10-29T10:00:00+08:00）")
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _review_video_dt(vrow: dict | None):
+    """review_video 行 → 采集时间 datetime（空/非法 → None）。"""
+    if not vrow:
+        return None
+    s = str(vrow.get("video_time") or "").strip()
+    if not s:
+        return None
+    try:
+        return _review_parse_dt(s)
+    except ValueError:
+        return None
+
+
+def h_review_search(body: dict) -> dict:
+    """文搜视频检索 handler（POST /api/review/search 的进程内入口，单测直调）。
+
+    主链路（无过滤器）与 WO-0032 逐字一致：向量粗排 + 帧精排 + pre_roll 定位。
+    WO-0033 增量：`time_start/time_end`（墙钟，按 review_video.video_time + t_start）、
+    `event_name`（精确匹配 events.name 与 plates.plate_no）、`video`、`mode`
+    （vector/hybrid——**本期两者都走过滤式**，hybrid 未实现在 note/why 说明）、
+    `include_frame_dets`（缺省 false；true 时 hits[].tags 附带观察层原始记录流
+    frame_dets——体积大，仅时间形态可视化/调试时开）。
+    `why` 逐条给命中来源；无过滤时保持旧文案「向量相似度 0.xx」向后兼容。
+
+    use_real_embed 语义对齐 WEMMClient：缺省/None = 按端点有无自动（env 无端点自动
+    落 mock，响应 note 说明）；显式 true 且无端点 → ValueError fail fast（HTTP 层
+    映射 400，与装配期 WEMMClient 行为双保险）；显式 false = mock。
+    错误约定：空查询/参数非法/维度非档位/空库 → ValueError（HTTP 400）；
+    底库不存在 → FileNotFoundError（HTTP 404）；其余异常由路由层兜底。
+    """
+    from video_embed.wemm_client import WEMMClient
+    query_text = str(body.get("query_text") or "").strip()
+    if not query_text:
+        raise ValueError("查询文本为空：query_text 必填（如「人群聚集」）")
+    top_k_clips = _int(body, "top_k_clips", 10) or 10
+    top_k_frames = _int(body, "top_k_frames", 3) or 3
+    pre_roll = _float(body, "pre_roll_sec", 1.0)
+    if top_k_clips < 1 or top_k_frames < 1:
+        raise ValueError(f"top_k 非法：top_k_clips={top_k_clips} top_k_frames="
+                         f"{top_k_frames}（均应 ≥1）")
+    if pre_roll < 0:
+        raise ValueError(f"pre_roll_sec={pre_roll} 非法（应 ≥0）")
+    _ure = body.get("use_real_embed")
+    use_real = None if _ure in (None, "") else _bool(body, "use_real_embed")
+    mode = str(body.get("mode") or "vector").strip().lower() or "vector"
+    if mode not in ("vector", "hybrid"):
+        raise ValueError(f"mode 非法: {mode!r}（应为 vector / hybrid）")
+    t_start_req = _review_parse_dt(body.get("time_start"))
+    t_end_req = _review_parse_dt(body.get("time_end"))
+    if t_start_req and t_end_req and t_start_req > t_end_req:
+        raise ValueError("时间窗非法：time_start 晚于 time_end")
+    event_name = str(body.get("event_name") or "").strip()
+    video = str(body.get("video") or "").strip()
+    # frame_dets（§2.5 观察层原始记录流）默认**不随 hits[].tags 返回**——单窗可达
+    # 数十 KB（KB 级行），全量拖回浪费带宽；include_frame_dets=true 时才附带，
+    # 供前端时间形态可视化（逐帧检出分布/框重放）与调试用。
+    include_frame_dets = _bool(body, "include_frame_dets")
+    # filters_active 决定 why 是否逐条说明命中来源：时间窗/事件名之外，video 过滤与
+    # mode=hybrid 也纳入（hybrid 本期走过滤式，why 须注明；video-only 命中须注明
+    # 视频与有无标签）。纯 vector 无过滤查询保持 WO-0032 文案（向后兼容）。
+    filters_active = bool(t_start_req or t_end_req or event_name or video
+                          or mode == "hybrid")
+
+    store, store_key = _review_store(body.get("store_path"))
+    clip_dim = int(store.clip_dim or 0)
+    frame_dim = int(store.frame_dim or clip_dim)
+    # 维度非档位（如手工造库 100 维）→ WEMMClient fail fast（ValueError 含合法档位）
+    client = WEMMClient(clip_dimension=clip_dim, frame_dimension=frame_dim,
+                        use_real_embed=use_real)
+    note = ""
+    if client.mock:
+        note = ("已按 mock 档（确定性伪向量）查询（use_real_embed=false 显式指定）"
+                if use_real is False else
+                "未配置嵌入端点（env WEMM_BASE_URL / WEMM_ENDPOINT），本次为 mock 档"
+                "确定性伪向量查询——命中仅供流程演示；配置真实端点并重建索引后才有语义检索效果")
+    if mode == "hybrid":
+        note = (note + "；" if note else "") + \
+            "hybrid 融合（RRF）本期未实现，已按过滤式执行（mode 字段预留）"
+
+    # 两步漏斗各用各维度的查询向量（WeMM 统一向量空间，MRL 同档可点积）：
+    # ① clip 粗排 = embed_text@clip_dim；② 帧精排 = embed_text@frame_dim 与
+    #   逐帧向量（入库时按 frame_dimension 嵌出）点积——维度必须两两对齐，
+    #   不能拿 clip 维查询向量比 frame 维库向量（matmul 直接维度不匹配）。
+    q_clip = client.embed_text(query_text, dimension=clip_dim)
+    q_frame = q_clip if frame_dim == clip_dim else \
+        client.embed_text(query_text, dimension=frame_dim)
+
+    # 有过滤器时先取全量（漏斗纪律：pre-filter 在排序之前，避免 Top-K 被过滤掏空）
+    search_k = max(len(store), top_k_clips) if filters_active else top_k_clips
+    raw_hits = list(store.search(q_clip, top_k=search_k, video=video or None))
+
+    tag_map: dict = {}
+    video_meta: dict = {}
+    backend = "none"
+    if filters_active:
+        rows = db.query_review_index(video=video or None, time_start=t_start_req,
+                                     time_end=t_end_req, event_name=event_name or None)
+        tag_map = {(r["video"], round(float(r["t_start"]), 3)): r for r in rows}
+        video_meta = {v["video"]: v for v in db.list_review_videos(video or None)}
+        backend = db.review_backend_mode()
+        if backend == "json":
+            note = (note + "；" if note else "") + \
+                "标签索引走无 DB 降级（out/review_index.json / review_video.json）"
+
+    hits = []
+    for h in raw_hits:
+        meta = h.meta or {}
+        vname = str(meta.get("video") or "")
+        t_start = float(meta.get("t_start") or 0.0)
+        tag = tag_map.get((vname, round(t_start, 3))) if filters_active else None
+        time_unknown = False
+        if filters_active and (t_start_req or t_end_req):
+            vt = _review_video_dt(video_meta.get(vname))
+            if vt is None:
+                time_unknown = True          # §2.6：无采集时间不参与过滤，why 注明
+            else:
+                abs_ts = vt + datetime.timedelta(seconds=t_start)
+                if ((t_start_req is not None and abs_ts < t_start_req)
+                        or (t_end_req is not None and abs_ts > t_end_req)):
+                    continue
+        if event_name:
+            # 精确匹配 events.name 与 plates.plate_no（§9 Q2）；无标签片段不参与该过滤
+            if tag is None:
+                continue
+        if filters_active and len(hits) >= top_k_clips:
+            break
+
+        frames = [{"frame_index": int(f.index), "ts": round(float(f.ts), 3),
+                   "score": round(float(f.score), 4)}
+                  for f in store.search_frames(q_frame, h.clip_id, top_k=top_k_frames)]
+        best_ts = frames[0]["ts"] if frames else None
+        # 播放定位（§4.1）：从最高相似帧回退 pre_roll 秒起播，避免从窗口头看起
+        play_ts = max(0.0, best_ts - pre_roll) if best_ts is not None else t_start
+        thumb_path = _project_rel(meta.get("thumb_path") or "")
+        thumb = ""
+        if thumb_path:
+            tp = Path(thumb_path)
+            if not tp.is_absolute():
+                tp = ROOT / tp
+            img = cv2.imread(str(tp)) if tp.is_file() else None
+            if img is not None:
+                thumb = _thumb_data_url(img)  # 浏览器取不到磁盘路径，随响应附 data URL
+        if filters_active:
+            why = _review_why(tag, video=vname if video else "", t_start=t_start,
+                              time_filter=bool(t_start_req or t_end_req),
+                              time_unknown=time_unknown, event_name=event_name,
+                              mode=mode, score=float(h.score))
+        else:
+            # 无过滤器：保持 WO-0032 文案逐字一致（向后兼容）
+            why = f"向量相似度 {h.score:.2f}"
+        hit = {
+            "video": vname,
+            "t_start": round(t_start, 3),
+            "t_end": round(float(meta.get("t_end") or t_start), 3),
+            "score": round(float(h.score), 4),
+            "clip_id": int(h.clip_id),
+            "frames": frames,
+            "best_frame_ts": best_ts,
+            "play_ts": round(float(play_ts), 3),
+            "thumb_path": thumb_path,
+            "thumb": thumb,
+            "why": why,
+        }
+        if tag is not None:
+            # 标签随命中返回（前端展示/调试；不进原有字段语义）。
+            # frame_dets 体积大（观察层原始记录流），默认不带；include_frame_dets=true
+            # 时才附带（时间形态可视化/调试）。
+            tag_keys = ("det_stats", "class_names", "plate_nos", "plates",
+                        "events", "face_count", "description")
+            if include_frame_dets:
+                tag_keys += ("frame_dets",)
+            hit["tags"] = {k: tag.get(k) for k in tag_keys}
+        hits.append(hit)
+
+    return {"ok": True, "mode": "mock" if client.mock else "real", "note": note,
+            "query_mode": mode, "query_dim": clip_dim, "query_text": query_text,
+            "store": {"path": store_key, "clips": len(store), "clip_dim": clip_dim},
+            "signals": {"filters": {"time_start": str(body.get("time_start") or ""),
+                                    "time_end": str(body.get("time_end") or ""),
+                                    "event_name": event_name, "video": video,
+                                    "mode": mode,
+                                    "include_frame_dets": include_frame_dets},
+                        "active": filters_active,
+                        "meta_hits": len(tag_map),
+                        "vec_top_n": len(raw_hits),
+                        "tag_backend": backend},
+            "hits": hits}
+
+
+def _review_why(tag: dict | None, *, video: str, t_start: float,
+                time_filter: bool, time_unknown: bool, event_name: str,
+                mode: str, score: float) -> str:
+    """过滤式 why：逐条说明命中来源（无标签/无采集时间也注明，不静默）。"""
+    bits = []
+    if video:
+        bits.append(f"视频 {video} 命中")
+    if time_filter:
+        bits.append("该视频无采集时间，未参与时间窗过滤" if time_unknown
+                    else "时间窗命中")
+    if event_name:
+        names = {str(e.get("name", "")) for e in (tag or {}).get("events") or []
+                 if isinstance(e, dict)}
+        plates = {str(p.get("plate_no", "")) for p in (tag or {}).get("plates") or []
+                  if isinstance(p, dict)}
+        if event_name in plates:
+            bits.append(f"车牌 {event_name} 命中")
+        elif event_name in names:
+            bits.append(f"事件 {event_name} 命中")
+        else:
+            bits.append(f"未命中事件/车牌 {event_name}")
+    if tag is None:
+        bits.append("该片段无标签（未参与标签过滤）")
+    if mode == "hybrid":
+        bits.append("hybrid 融合未实现，按过滤式执行")
+    bits.append(f"向量相似度 {score:.2f}")
+    return "；".join(bits)
+
+
+
+def _override_obs_get(override_obs: dict, t_start: float, t_end: float) -> dict:
+    """relabel observations 覆盖参数的宽松键匹配。
+
+    HTTP body JSON 键恒为字符串（"0.0" / "0.0,5.0"），进程内直调可用浮点键
+    （0.0 / (0.0, 5.0)）；按窗口元组 → 组合字符串 → 起点 单独键的顺序逐一尝试。
+    """
+    if not isinstance(override_obs, dict):
+        return {}
+    for k in ((t_start, t_end), f"{t_start},{t_end}", t_start, f"{t_start}"):
+        v = override_obs.get(k)
+        if isinstance(v, dict):
+            return v
+    return {}
+
+
+def h_review_relabel(body: dict) -> dict:
+    """「仅重对齐不重嵌入」入口（POST /api/review/relabel，§3 定案点）。
+
+    参数：video（必填）/ events_path（可选，缺省 out/events/<视频名>.jsonl）/
+    windows（可选 [[t_start,t_end], ...]，缺省从向量底库该视频片段窗口取）/
+    store_path（可选，缺省 out/video_vecs.npz）/
+    observations（可选 {窗口键: obs}，显式新观察数据——本期无调用入口，仅 frame_dets
+    会在传入时覆盖旧行；窗口键 "t_start,t_end" 或 "t_start" 均可）。
+    **只 upsert review_index / review_video，绝不动向量库**（不重嵌入）；复用索引收尾
+    同一套 label_align 对齐函数。返回处理行数。
+    """
+    video = str(body.get("video") or "").strip()
+    if not video:
+        raise ValueError("video 必填（要重对齐的视频名）")
+    events = _read_archived_events(video, body.get("events_path"))
+    existing = {round(float(r["t_start"]), 3): r
+                for r in db.query_review_index(video=video)}
+    windows = []
+    for w in body.get("windows") or []:
+        if isinstance(w, (list, tuple)) and len(w) >= 2:
+            windows.append((round(float(w[0]), 3), round(float(w[1]), 3)))
+        elif isinstance(w, dict):
+            windows.append((round(float(w.get("t_start") or 0.0), 3),
+                            round(float(w.get("t_end") or 0.0), 3)))
+    store_meta: dict = {}
+    vector_model, clip_dim, frame_dim = "", None, None
+    if not windows:
+        store, _key = _review_store(body.get("store_path"))
+        clip_dim, frame_dim = store.clip_dim, store.frame_dim
+        client = getattr(store, "client", None)
+        try:
+            q = np.ones(int(store.clip_dim or 1), dtype=np.float32)
+            _fts_nested = []  # (t_start, [帧ts...])：重建无缝窗口用（对齐索引时 clip_windows 口径）
+            for h in store.search(q, top_k=len(store), video=video):
+                m = h.meta or {}
+                w = (round(float(m.get("t_start") or 0.0), 3),
+                     round(float(m.get("t_end") or 0.0), 3))
+                windows.append(w)
+                store_meta[w[0]] = m  # 键=t_start：无缝窗口 t_end≠store t_end，避免查不到兜底
+                _fts_nested.append((w[0], [float(t) for t in (m.get("frame_ts") or [])]))
+            # 窗口口径统一（坑：store meta t_end=窗内末帧 ts，直接当对齐窗口会在
+            # 「末帧 ts ~ 下一窗首帧」的窗缝里丢事件——如 ts=2.502 落在 (0,2.502) 外、
+            # (3.003,…) 前。索引时对齐走 clip_windows（t_end=下一窗首帧，无缝），
+            # relabel 必须同口径：从各片段 frame_ts 重建；frame_ts 缺失（旧库）才退 store t_end。
+            _fts_nested.sort(key=lambda x: x[0])
+            try:
+                from video_embed import label_align as _la
+                _seamless = _la.clip_windows([f for _, f in _fts_nested if f])
+                if _seamless:
+                    windows = _seamless
+            except Exception:
+                pass  # label_align 不可用：退回 store t_end 口径（缝上事件可能丢，不阻断）
+        except Exception as e:
+            raise ValueError(f"从向量底库取片段窗口失败: {e}")
+        if not windows:
+            raise ValueError(f"向量底库无视频 {video!r} 的片段——请先运行 PIPE0004 建索引，"
+                             f"或显式传 windows 参数")
+    else:
+        # 只给 windows 时仍尽力从底库/旧标签取维度与缩略图（缺省不报错）
+        try:
+            store, _key = _review_store(body.get("store_path"))
+            clip_dim, frame_dim = store.clip_dim, store.frame_dim
+        except Exception:
+            pass
+    if not windows:
+        raise ValueError("没有可对齐的片段窗口（windows 为空且底库无该视频）")
+
+    # relabel 观察层重建：只回填聚合缓存（det_stats/class_names/plate_nos/face_count 旧值
+    # 保留语义）。**frame_dets 刻意不进这里**——它属观察层原始数据（分析产物），relabel
+    # 只重算判断层与聚合缓存，旧行 frame_dets 在下方落表前原样保留；仅 body.observations
+    # 显式传入新观察数据（window → obs，本期无调用入口，留参数位）时才覆盖。
+    override_obs: dict = body.get("observations") or {}
+    observations = {}
+    for w in windows:
+        old = existing.get(w[0]) or {}
+        ovr = _override_obs_get(override_obs, w[0], w[1])
+        observations[w] = {
+            "det_stats": old.get("det_stats") or {},
+            "class_names": old.get("class_names") or {},
+            "plate_nos": old.get("plate_nos") or [],
+            "face_count": old.get("face_count") or 0,
+            # 显式新观察才带 frame_dets；缺省不带（避免被误当成新原始数据）
+            "frame_dets": ovr.get("frame_dets") or [],
+        }
+    extra = {"vector_model": vector_model, "clip_dim": clip_dim, "frame_dim": frame_dim}
+    rows = _build_review_rows(video, windows, observations, events, extra=extra)
+    if not rows:
+        return {"ok": False, "video": video, "rows": 0,
+                "error": "label_align 不可用或标签构建失败（见服务日志）"}
+    for r in rows:
+        old = existing.get(round(float(r["t_start"]), 3)) or {}
+        m = store_meta.get(round(float(r["t_start"]), 3)) or {}
+        r["thumb_path"] = _project_rel(r.get("thumb_path") or old.get("thumb_path")
+                                       or m.get("thumb_path") or "")
+        r["description"] = r.get("description") or old.get("description") or ""
+        r["vector_model"] = r.get("vector_model") or old.get("vector_model") or ""
+        if r.get("clip_dim") is None:
+            r["clip_dim"] = old.get("clip_dim") or m.get("clip_dim")
+        if r.get("frame_dim") is None:
+            r["frame_dim"] = old.get("frame_dim") or m.get("frame_dim")
+        # frame_dets 保留语义（§11 定案 6）：观察层原始数据不随 relabel 重算——
+        # 新构建行无 frame_dets（relabel 的 obs 不带观察流）时旧行值原样保留；
+        # 仅 body.observations 显式传入新观察数据才覆盖（本期无此入口）。
+        ovr = _override_obs_get(override_obs, r["t_start"], r["t_end"])
+        if ovr.get("frame_dets"):
+            r["frame_dets"] = ovr["frame_dets"]
+        elif not r.get("frame_dets"):
+            r["frame_dets"] = old.get("frame_dets") or []
+    n = db.upsert_review_index(rows)
+
+    old_video = next(iter(db.list_review_videos(video)), {})
+    try:
+        from video_embed import label_align as la
+        video_time, src = la.parse_video_time(video)
+    except Exception:
+        video_time, src = "", ""
+    if not video_time and old_video.get("video_time"):
+        video_time, src = old_video["video_time"], old_video.get("video_time_src") or ""
+    db.upsert_review_video([{
+        "video": video,
+        "video_time": video_time, "video_time_src": src,
+        "indexed_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "vector_model": vector_model or old_video.get("vector_model") or "",
+        "clip_dim": clip_dim if clip_dim is not None else old_video.get("clip_dim"),
+        "frame_dim": frame_dim if frame_dim is not None else old_video.get("frame_dim"),
+        "duration": max((w[1] for w in windows), default=0.0),
+    }])
+    return {"ok": True, "video": video, "rows": n, "events": len(events),
+            "backend": db.review_backend_mode(), "note": "仅重对齐：向量库未改动"}
+
+
 def h_plate_recog(p: dict) -> dict:
     from pipe.cropper import clamp_bbox
     from plate_recog.plate_recognizer import PlateRecognizer, extract_plates
@@ -1272,6 +2243,316 @@ def h_frame_yolo(p: dict) -> dict:
     return res(text=text, images=images, tables=tables)
 
 
+# ---------------- 链路运行报告导出（自包含单文件 HTML，WO-0028） ----------------
+# 最近一次链路运行快照：同步（h_pipeline_run）/流式（h_pipeline_stream）两条路径收尾时
+# 经 _store_last_run 覆盖写入；POST /api/test/report 据此构建报告。服务重启即清空
+# （报告本身已落 output_dir/report_*.html，持久保存）。
+_LAST_RUN: dict = {}
+
+# 报告表格列的中文标签（已知键优先按此展示，其余键直接用键名——通用不绑定链路）
+_REPORT_COL_LABELS = {
+    "plate_no": "车牌号", "type_name": "类型", "color": "颜色", "score": "置信度",
+    "bbox": "车牌框", "car_bbox": "车辆框", "track_id": "track", "index": "序号",
+    "size": "尺寸", "upscale": "放大倍数", "plate_img_size": "小图尺寸",
+    "person_bbox": "人体框", "face_bbox": "人脸框", "face_size": "人脸尺寸",
+    "kps": "关键点", "best_sim": "相似度", "name": "事件名", "detail": "detail",
+}
+
+
+def _store_last_run(snap: dict) -> None:
+    """记录最近一次链路运行快照（整体替换：报告端点只认最近一次运行）。"""
+    _LAST_RUN.clear()
+    _LAST_RUN.update(snap)
+
+
+def _esc(v) -> str:
+    """HTML 转义（事件/VLM 文本可能含 <、& 等；None → 空串）。"""
+    return html.escape(str(v if v is not None else ""), quote=True)
+
+
+def _report_cell(v) -> str:
+    """报告表格单元格文本：dict/list → 紧凑 JSON，float 去 尾 0，None/空 → 空串。"""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, float):
+        return f"{v:.4f}".rstrip("0").rstrip(".")
+    return str(v)
+
+
+def _report_table(headers: list, rows: list, kv: bool = False) -> str:
+    """HTML 表格（所有单元格经 _esc 转义；kv=True 时首列作键名窄列样式）。"""
+    cls = ' class="kv"' if kv else ""
+    th = "".join(f"<th>{_esc(h)}</th>" for h in headers)
+    trs = "".join("<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in row) + "</tr>"
+                  for row in rows)
+    return (f"<table{cls}><thead><tr>{th}</tr></thead>"
+            f"<tbody>{trs}</tbody></table>")
+
+
+def _tl_rows(snap: dict, pred) -> list:
+    """按谓词筛 timeline 条目 → [(ts, frame, data), ...]（data 非 dict 的条目跳过）。"""
+    out = []
+    for it in snap.get("timeline") or []:
+        d = it.get("data")
+        if isinstance(d, dict) and pred(it, d):
+            out.append((it.get("ts"), it.get("frame"), d))
+    return out
+
+
+def _union_columns(rows_data: list, preferred: list) -> list:
+    """列 = preferred 中实际出现的键 + 数据里其余键（按首现顺序，通用不绑定字段集）。"""
+    cols = [k for k in preferred if any(k in d for _t, _f, d in rows_data)]
+    for _t, _f, d in rows_data:
+        for k in d:
+            if k not in cols:
+                cols.append(k)
+    return cols
+
+
+def _report_read_img(path: Path, max_edge: int, quality: int) -> str:
+    """读盘图 → 限最大边长 → JPEG data URL（读失败/编码失败返回空串，调用方跳过）。"""
+    img = cv2.imread(str(path))
+    if img is None:
+        return ""
+    h, w = img.shape[:2]
+    if max_edge > 0 and max(h, w) > max_edge:
+        k = max_edge / max(h, w)
+        img = cv2.resize(img, (max(1, int(w * k)), max(1, int(h * k))))
+    return _img_data_url(img, quality)
+
+
+def _build_report_html(snap: dict, max_anno: int = 60, max_plate: int = 36,
+                       max_face: int = 36, max_output: int = 60, img_edge: int = 960,
+                       quality: int = 80) -> str:
+    """链路运行快照 → 自包含单文件 HTML 报告。
+
+    纯逻辑函数（不碰服务状态，输入快照 dict 输出 HTML 字符串，可单测）。
+    通用实现不绑定链路类型：字段表全部取自 timeline 条目的 data（按数据形状识别
+    事件/VLM/车牌/人脸），图片按落盘文件名前缀分组（frame_/plate_/face_）；
+    某类内容缺失时对应小节整体省略；图片内嵌 data URL，离线双击可开。
+    快照含 output 提炼块（WO-0029 链路尾输出声明）时，新增「链路尾输出」区块且
+    **优先呈现**（事件表之前）：提炼表 + items.images 落盘图内嵌（读文件转 data URL，
+    上限 max_output）；无声明维持现状取数。
+    """
+    name = snap.get("name") or "未命名"
+    stats = snap.get("stats") or {}
+    media = snap.get("media") or {}
+    timeline = snap.get("timeline") or []
+
+    # ---- 摘要 ----
+    stage_names = " → ".join(_stage_label(s) for s in (snap.get("stages") or [])) or "—"
+    if media.get("type") == "image":
+        media_txt = f"图片 {media.get('name') or '—'}"
+        range_txt = "单帧"
+    else:
+        media_txt = f"视频 {media.get('name') or '—'}"
+        range_txt = (f"{_report_cell(media.get('start_time', 0))}s – "
+                     f"{_report_cell(media.get('end_time', 0))}s"
+                     f"（帧 {media.get('start_frame', 0)}–{media.get('end_frame', 0)}）")
+    saved = stats.get("saved_images", 0)
+    dropped = stats.get("dropped_saves", 0)
+    save_txt = (f"{saved} 张" if saved else "无（流式运行不落盘）")
+    if dropped:
+        save_txt += f"（超上限跳过 {dropped} 张）"
+    sum_rows = [
+        ("链路", f"{name}（{snap.get('pipeline_id') or '-'}）"),
+        ("阶段序列", stage_names),
+        ("媒体", media_txt),
+        ("时间范围", range_txt),
+        ("处理帧数", stats.get("processed", 0)),
+        ("检出目标", stats.get("detections", 0)),
+        ("车牌识别", stats.get("plates", 0)),
+        ("事件", stats.get("events", 0)),
+        ("VLM 状态", stats.get("vlm_state") or "—"),
+        ("图片落盘", save_txt),
+        ("运行方式", "实时播放叠加（流式）" if snap.get("mode") == "stream" else "批量运行"),
+        ("运行耗时", f"{_report_cell(stats.get('elapsed_sec', snap.get('elapsed_sec', 0)))} s"),
+        ("生成时间", snap.get("generated_at") or "—"),
+    ]
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="zh"><head><meta charset="utf-8">',
+        f"<title>UMVP 链路运行报告 · {_esc(name)}</title>",
+        "<style>",
+        "body{font-family:'PingFang SC','Microsoft YaHei',system-ui,sans-serif;margin:24px auto;"
+        "max-width:1080px;padding:0 16px;color:#1f2430;line-height:1.55}",
+        "h1{font-size:20px;border-bottom:2px solid #4f8cff;padding-bottom:8px}",
+        "h2{font-size:16px;color:#2c5cc5;margin:28px 0 8px}",
+        "h3{font-size:14px;margin:16px 0 6px}",
+        "table{border-collapse:collapse;width:100%;font-size:12.5px;margin:8px 0}",
+        "th,td{border:1px solid #ccd4e0;padding:5px 8px;text-align:left;vertical-align:top;"
+        "white-space:pre-wrap;word-break:break-all}",
+        "th{background:#eef3fc}",
+        "table.kv td:first-child{width:130px;background:#f7f9fd;font-weight:600;white-space:nowrap}",
+        ".meta{color:#5a6478;font-size:12px}",
+        ".imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}",
+        "figure{margin:0;border:1px solid #ccd4e0;border-radius:6px;overflow:hidden}",
+        "figure img{width:100%;display:block}",
+        "figcaption{font-size:10.5px;color:#5a6478;padding:4px 6px;word-break:break-all}",
+        "</style></head><body>",
+        "<h1>UMVP 链路运行报告</h1>",
+        f'<div class="meta">链路 {_esc(name)} ｜ 生成时间 '
+        f'{_esc(snap.get("generated_at") or "—")} ｜ UMVP 测试台导出'
+        f'（自包含单文件，离线可开）</div>',
+        "<h2>运行摘要</h2>",
+        _report_table(["项目", "内容"], sum_rows, kv=True),
+    ]
+
+    # ---- 链路尾输出（spec 顶层 output 声明的提炼块，WO-0029；**优先呈现**于事件表前）----
+    # items.images 为相对 output_dir 的磁盘路径 → 报告构建时读文件转 data URL 内嵌
+    # （复用 _report_read_img 与 img_edge/quality，上限 max_output；无声明无此区块）。
+    ob = snap.get("output")
+    if isinstance(ob, dict) and (ob.get("items") or ob.get("error") or ob.get("note")):
+        n_out = len(ob.get("items") or [])
+        parts.append(f"<h2>链路尾输出（{_esc(ob.get('count', n_out))} 条）</h2>")
+        if ob.get("error"):
+            parts.append(f'<div class="meta">输出块错误：{_esc(ob["error"])}</div>')
+        else:
+            bits = [f'scope={ob.get("scope", "events")}', f'from={ob.get("from") or "—"}']
+            if ob.get("truncated"):
+                bits.append("已截断（超出 limit）")
+            if ob.get("note"):
+                bits.append(str(ob["note"]))
+            parts.append(f'<div class="meta">{_esc(" ｜ ".join(bits))}</div>')
+            out_rows = []
+            for i, it in enumerate(ob.get("items") or [], 1):
+                out_rows.append([
+                    i, _report_cell(it.get("ts")), it.get("frame_idx"),
+                    _report_cell(it.get("label")), _report_cell(it.get("track_id")),
+                    _report_cell(it.get("score")),
+                    _report_cell(it.get("events")) or "—",
+                ])
+            parts.append(_report_table(
+                ["#", "时间(s)", "帧", "label", "track", "score", "events（明细）"],
+                out_rows))
+            out_dir_o = snap.get("output_dir")
+            if out_dir_o and n_out:
+                all_imgs = [str(p) for it in ob.get("items") or []
+                            for p in (it.get("images") or [])]
+                figs = []
+                for p in all_imgs[:max_output] if max_output > 0 else all_imgs:
+                    url = _report_read_img(Path(out_dir_o) / p, img_edge, quality)
+                    if not url:
+                        continue
+                    figs.append(f'<figure><img src="{url}" alt="{_esc(p)}">'
+                                f"<figcaption>{_esc(p)}</figcaption></figure>")
+                if figs:
+                    note = (f"（内嵌 {len(figs)}/{len(all_imgs)} 张，超出上限未嵌入）"
+                            if len(all_imgs) > len(figs) else f"（{len(figs)} 张）")
+                    parts.append(f"<h3>提炼配图{note}</h3>")
+                    parts.append(f'<div class="imgs">{"".join(figs)}</div>')
+
+    # ---- 事件列表（timeline 条目 data 含 name 键 = 事件；通用按数据形状识别）----
+    ev_rows = _tl_rows(snap, lambda it, d: "name" in d)
+    parts.append(f"<h2>事件列表（{len(ev_rows)} 条）</h2>")
+    if ev_rows:
+        rows = []
+        for ts, fr, d in ev_rows:
+            extra = {k: v for k, v in d.items() if k not in ("name", "detail")}
+            rows.append([
+                _report_cell(ts), fr, d.get("name"),
+                _report_cell(d.get("detail")) or "—",
+                _report_cell(extra) if extra else "",
+            ])
+        parts.append(_report_table(
+            ["时间(s)", "帧", "事件名", "detail", "其他字段"], rows))
+    else:
+        parts.append('<div class="meta">（本次运行无事件）</div>')
+
+    # ---- VLM 研判（kind=vlm 且 data 含 action 键）----
+    vlm_rows = _tl_rows(snap, lambda it, d: it.get("kind") == "vlm" and "action" in d)
+    parts.append(f"<h2>VLM 研判（{len(vlm_rows)} 条）</h2>")
+    if vlm_rows:
+        rows = []
+        for ts, fr, d in vlm_rows:
+            content = d.get("content")
+            content_txt = (json.dumps(content, ensure_ascii=False, indent=2)
+                           if isinstance(content, (dict, list)) else _report_cell(content))
+            rows.append([_report_cell(ts), fr, d.get("action"),
+                         _report_cell(d.get("description")), content_txt])
+        parts.append(_report_table(
+            ["时间(s)", "帧", "action", "description", "content（原始 JSON）"], rows))
+    else:
+        parts.append('<div class="meta">（本次运行无 VLM 研判记录）</div>')
+
+    # ---- 车牌识别（data 含 plate_no 键）----
+    plate_rows = _tl_rows(snap, lambda it, d: "plate_no" in d)
+    parts.append(f"<h2>车牌识别（{len(plate_rows)} 条）</h2>")
+    if plate_rows:
+        cols = _union_columns(plate_rows, ["plate_no", "type_name", "color",
+                                           "score", "bbox", "car_bbox"])
+        rows = [[_report_cell(ts), fr] + [_report_cell(d.get(c)) for c in cols]
+                for ts, fr, d in plate_rows]
+        headers = ["时间(s)", "帧"] + [_REPORT_COL_LABELS.get(c, c) for c in cols]
+        parts.append(_report_table(headers, rows))
+    else:
+        parts.append('<div class="meta">（本次运行无车牌识别记录）</div>')
+
+    # ---- 人脸截取（kind=face 条目；含嵌入链路的重复人脸行不计入）----
+    face_rows = _tl_rows(snap, lambda it, d: it.get("kind") == "face")
+    parts.append(f"<h2>人脸截取（{len(face_rows)} 张）</h2>")
+    if face_rows:
+        cols = _union_columns(face_rows, ["index", "face_bbox", "person_bbox",
+                                          "face_size", "score", "best_sim"])
+        rows = [[_report_cell(ts), fr] + [_report_cell(d.get(c)) for c in cols]
+                for ts, fr, d in face_rows]
+        headers = ["时间(s)", "帧"] + [_REPORT_COL_LABELS.get(c, c) for c in cols]
+        parts.append(_report_table(headers, rows))
+    else:
+        parts.append('<div class="meta">（本次运行无人脸截取记录）</div>')
+
+    # ---- 重要图片：从落盘目录按前缀分组内嵌（限量防文件超长；无图省略该分组）----
+    # saved_files 清单存在时只嵌本次运行落盘的文件（目录里常累积多次运行的历史图，
+    # 不按清单过滤会把旧的车牌/人脸/标注帧全嵌进来，报告虚胖）；键缺失（旧快照/
+    # 手工构造）回退扫目录全量，保持兼容。
+    parts.append("<h2>重要图片</h2>")
+    out_dir = snap.get("output_dir")
+    n_groups = 0
+    if out_dir:
+        out_path = Path(out_dir)
+        groups = [
+            ("标注帧", "frame_", ("_det", "_annotated"), max_anno),
+            ("车牌小图", "plate_", None, max_plate),
+            ("人脸截图", "face_", None, max_face),
+        ]
+        own = snap.get("saved_files")
+        own_set = set(own) if own is not None else None
+        for gtitle, prefix, keywords, limit in groups:
+            if limit <= 0 or not out_path.is_dir():
+                continue
+            files = sorted(
+                f for f in out_path.iterdir()
+                if f.is_file() and f.suffix.lower() in _IMG_SUFFIX
+                and f.name.startswith(prefix)
+                and (keywords is None or any(k in f.name for k in keywords))
+                and (own_set is None or f.name in own_set))
+            if not files:
+                continue
+            figs = []
+            for fp in files[:limit]:
+                url = _report_read_img(fp, img_edge, quality)
+                if not url:
+                    continue
+                figs.append(f'<figure><img src="{url}" alt="{_esc(fp.name)}">'
+                            f"<figcaption>{_esc(fp.name)}</figcaption></figure>")
+            if not figs:
+                continue
+            n_groups += 1
+            if len(files) > limit:
+                note = f"（共 {len(files)} 张，超出上限仅嵌入前 {limit} 张）"
+            else:
+                note = f"（{len(figs)} 张）"  # 按实际嵌入数（不可读的坏图已跳过）
+            parts.append(f"<h3>{_esc(gtitle)}{note}</h3>")
+            parts.append(f'<div class="imgs">{"".join(figs)}</div>')
+    if not n_groups:
+        parts.append('<div class="meta">（本次运行无落盘图片）</div>')
+
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
 def h_pipeline_run(p: dict) -> dict:
     """链路运行测试：支持视频片段截取、图片按帧保存等功能。
 
@@ -1289,11 +2570,19 @@ def h_pipeline_run(p: dict) -> dict:
 
     注意：取图节奏由链路内部 FrameManager 的 frame_skip 控制（见链路设计器帧管理模块），
     测试台不再提供独立的 frame_skip 参数，避免重复控制。
+
+    链路尾输出（WO-0029.2，doc/design/chain_output.md §3-§6）：spec 顶层（或 meta）声明
+    output 段时，逐帧按 scope 粗筛累积末段记录流 + 配图预对位（内存安全 MVP），收尾
+    collect_output 统一提炼、配图落盘（命名 output_*，共用 max_saved_images 计数与
+    saved_files 清单），结果与 _LAST_RUN 快照附 "output" 提炼块；Image 帧级产物（MVP）
+    从 saved_files 按帧号引用不新落盘；无声明时行为与现状逐字一致。
     """
+    t0 = time.time()
     # 获取链路配置（业务 ID，如 PIPE0001）
     pipeline_id = str(p.get("pipeline_id", "") or "").strip()
     if not pipeline_id:
         return res(ok=False, error="请指定测试链路（pipeline_id）")
+    run_id = uuid.uuid4().hex[:12]  # 本次运行标识（事件归档 jsonl 按 run_id 幂等，§12-C）
     
     if not _DB_ENABLED:
         return res(ok=False, error="数据库未启用（--no-db）")
@@ -1317,7 +2606,18 @@ def h_pipeline_run(p: dict) -> dict:
         pipe = _chain_from_spec(spec)
     except ValueError as e:
         return res(ok=False, error=str(e))
-    
+
+    # ---- 链路尾输出声明（WO-0029.2，doc/design/chain_output.md §3-§4）----
+    # 解析失败 fail-soft：运行照常，收尾附 {"output": {"error": ...}}（validate_chain 硬拦）；
+    # 无声明（out_plan/out_err 均 None）→ 行为与现状逐字一致（不产生 output 键）。
+    out_plan, out_err = _resolve_output_plan(spec)
+    if out_plan is not None and out_plan.get("from_deferred"):
+        # 链路有事件尾（seq_filter rules → Pipeline.event_filter）= publish 通路在位：
+        # 缺省 from 空结果视为「通路跑过但无事件」（count=0 + note），非「取不到」。
+        out_plan["publish_wired"] = getattr(pipe, "event_filter", None) is not None
+    out_acc = _make_output_accumulator(out_plan) if out_plan else None
+    out_block: list = [None]  # _done() 收尾填充；各 return 经 _res_with_output 附带
+
     # 测试参数
     feedback = _bool(p, "vlm_feedback")
     vlm_action = str(p.get("vlm_action", "fire")).strip() or "fire"
@@ -1367,6 +2667,7 @@ def h_pipeline_run(p: dict) -> dict:
     # 超限后跳过写盘只记结果，防止长视频把磁盘写爆；可用参数 max_saved_images 覆盖。
     max_saved_images = _int(p, "max_saved_images", 200)
     saved_images, dropped_saves = [0], [0]
+    saved_files: list = []  # 本次运行实际落盘的文件名（报告只嵌这些，不掺历史运行）
 
     def _save_image(path: Path, img) -> bool:
         if saved_images[0] >= max_saved_images:
@@ -1374,6 +2675,7 @@ def h_pipeline_run(p: dict) -> dict:
             return False
         cv2.imwrite(str(path), img)
         saved_images[0] += 1
+        saved_files.append(path.name)
         return True
 
     def _save_summary() -> str:
@@ -1409,6 +2711,80 @@ def h_pipeline_run(p: dict) -> dict:
             log.append(f"{prefix}{tag}帧#{frame_no} {text}")
         return item
 
+    # ---- 运行快照（报告导出）：各分支 return 前调 _done()，统一收尾避免两处漂移 ----
+    media_info: dict = {}   # 各测试分支填（image/video 名与范围）
+
+    def _done():
+        if feedback:
+            if use_real_vlm:
+                vs = "端点不可达，已跳过" if vlm_unreachable else "真实调用"
+                if vlm_fail:
+                    vs += f"（失败 {vlm_fail} 次）"
+            else:
+                vs = f"模拟回填({vlm_action})"
+        else:
+            vs = "未开启研判回填"
+        # 链路尾输出提炼块（WO-0029.2）：收尾统一在此产出（res 附带与快照共用同块）
+        if out_plan is not None:
+            out_block[0] = _finish_output(
+                out_plan, out_acc, output_dir, image_format, _save_image,
+                start_frame=start_frame, saved_files=saved_files)
+        elif out_err:
+            out_block[0] = {"error": out_err}
+        _store_last_run({
+            "name": spec.get("name") or "未命名",
+            "pipeline_id": pipeline_id,
+            "stages": list(_stage_order),
+            "media": dict(media_info),
+            "stats": {
+                "processed": processed_count, "detections": detection_count,
+                "plates": plate_count, "events": event_count,
+                "vlm_state": vs, "vlm_fail": vlm_fail,
+                "saved_images": saved_images[0], "dropped_saves": dropped_saves[0],
+                "elapsed_sec": round(time.time() - t0, 2),
+            },
+            "timeline": timeline,
+            "output_dir": str(output_dir),
+            "saved_files": list(saved_files),
+            "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": "sync",
+            **({"output": out_block[0]} if out_block[0] is not None else {}),
+        })
+        # 事件留存归档（WO-0033 §3，契约 C）：只归档链路尾事件 → 追加
+        # out/events/<视频名>.jsonl（run_id 幂等）；链路含视频嵌入阶段时顺带标签
+        # 对齐落表（PIPE0004 收尾对齐，§3/§4）。任一步失败不影响运行主流程。
+        _vid = str(media_info.get("name") or "") if media_info.get("type") == "video" else ""
+        if _vid:
+            _archive_and_align(_vid, pipeline_id, _tail_events_of_timeline(timeline),
+                               run_id, _vem, _vem_params, store_path=_vem_store_path)
+
+    def _res_with_output(**kw) -> dict:
+        """res(...) 结果附带链路尾输出块（无声明/未产出时不带 output 键，零回归）。"""
+        r = res(**kw)
+        if out_block[0] is not None:
+            r["output"] = out_block[0]
+        return r
+
+    def _output_accumulate_frame():
+        """本帧尾记录流 → 累积器（scope 粗筛 + 同帧配图预对位；内存安全见工厂 docstring）。
+
+        from 产物本帧未登记（如 rules-only 事件尾无 dets 产物、无事件帧无 pipeline.tail）
+        → 该帧跳过；缺省 from 每帧运行时裁决（_output_pick_from），空块解释收尾统一给。
+        """
+        if out_acc is None:
+            return
+        frm = _output_pick_from(out_plan, pipe.artifacts)
+        if frm is None:
+            return
+        recs = pipe.artifacts.get(frm)
+        if not isinstance(recs, list):
+            return
+        imgs = None
+        if out_plan.get("image_type") == "Records":
+            v = pipe.artifacts.get(out_plan["image_full"])
+            imgs = v if isinstance(v, list) else None
+        out_acc["add"](recs, imgs)
+
     # ---- 人脸链（装配层已注入 Pipeline.face；落盘/计数/身份去留在驱动层）----
     # ① 含 face_embed 阶段 → 视频人脸去重提取模式（嵌入 + 身份去重）；
     # ② 仅 face_detect 阶段（无嵌入/检索）→ 人脸截取模式：逐帧提取原分辨率人脸并落盘。
@@ -1419,6 +2795,15 @@ def h_pipeline_run(p: dict) -> dict:
     face_dedup_thresh = getattr(pipe, "face_dedup_thresh", 0.55)
     face_vecs = []       # 已收集身份的归一化嵌入
     face_count = face_dup = 0
+
+    # ---- 视频嵌入（PIPE0004 向量档索引；驱动层逐帧 run，收尾 finish + 底库落盘）----
+    _vem = getattr(pipe, "video_embed_stage", None)
+    _vem_pos = next((i for i, s in enumerate(spec.get("stages") or [])
+                     if s.get("module_id") == "video_embed"), -1)  # dets 端口连线解析位
+    _vem_params = next((s.get("params") or {} for s in spec.get("stages") or []
+                        if s.get("module_id") == "video_embed"), {})
+    _vem_store_path = str(_vem_params.get("store_path") or "").strip()
+    _vem_saved = ""  # 收尾落盘后的底库路径（结果头展示用）
 
     def _step_out(frame_no, ts, tag, dets, subs, al, frame=None):
         """逐模块展示本帧各自处理的内容（不管是否向下传递），每条带帧序数。"""
@@ -1524,10 +2909,6 @@ def h_pipeline_run(p: dict) -> dict:
                             materials = [_vlm_material(im, payload, s) for im in sent]
                             base = materials[0] if len(materials) == 1 else materials
                             action, description, raw = _vlm_real(vlm_cfg, payload, base)
-                            _emit("vlm", f"研判 {action}"
-                                  + (f" — {description}" if description else "")
-                                  + f"（真实调用{src_tag}）",
-                                  ts, stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
                         except Exception as e:
                             vlm_fail += 1
                             _emit("fail", f"调用失败({vlm_fail}): {e}", ts, stage="vlm",
@@ -1542,12 +2923,24 @@ def h_pipeline_run(p: dict) -> dict:
                                 _emit("info", "真实 VLM 连续失败≥3，本轮后续改用素材包", ts,
                                       stage="vlm", frame_no=frame_no, log_line=True, prefix="    ")
                             continue
-                    else:
-                        action, description, raw = vlm_action, "", ""
-                        _emit("vlm", f"研判 {action}（模拟回填）", ts, stage="vlm",
+                        # content（VLM 原始 JSON）先算好：timeline 条目挂 data 供报告导出
+                        # （except 分支已 continue，走到这里必是调用成功）
+                        content = _vlm_content(raw) if raw else {"result": action, "description": description}
+                        _emit("vlm", f"研判 {action}"
+                              + (f" — {description}" if description else "")
+                              + f"（真实调用{src_tag}）",
+                              ts, stage="vlm",
+                              data={"action": action, "description": description,
+                                    "content": content},
                               frame_no=frame_no, log_line=True, prefix="    ")
-                    # VLM 结果作为记录经事件尾（event_filter）出事件；content 落 VLM 原始 JSON
-                    content = _vlm_content(raw) if raw else {"result": action, "description": description}
+                    else:
+                        action, description = vlm_action, ""
+                        content = {"result": action, "description": description}
+                        _emit("vlm", f"研判 {action}（模拟回填）", ts, stage="vlm",
+                              data={"action": action, "description": description,
+                                    "content": content},
+                              frame_no=frame_no, log_line=True, prefix="    ")
+                    # VLM 结果作为记录经事件尾（event_filter）出事件（content 已在上方计算）
                     rec = {"kind": "vlm", "label": action, "text": description,
                            "content": content}
                     for ev in pipe.publish([rec], ts, frame_no):
@@ -1555,7 +2948,8 @@ def h_pipeline_run(p: dict) -> dict:
                         nm = ev.get("name", "事件")
                         det = ev.get("detail") or {}
                         _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), ts,
-                              stage="seq_filter", frame_no=frame_no, log_line=True, prefix="    ")
+                              stage="seq_filter", frame_no=frame_no, data=ev,
+                              log_line=True, prefix="    ")
 
         # 车牌识别：本帧识别结果 + 原分辨率车牌小图落盘
         if "plate_recog" in _stage_order:
@@ -1574,6 +2968,25 @@ def h_pipeline_run(p: dict) -> dict:
             else:
                 _emit("info", f"识别 0 张（传入车图 {len(plate_in)} 张）", ts,
                       stage="plate_recog", frame_no=frame_no, log_line=True, prefix="    ")
+
+        # 视频嵌入（向量化）：本帧片段产出入库明细与缓冲进度（展示层；记录已 publish 进事件流）
+        if "video_embed" in _stage_order:
+            vem = getattr(pipe, "video_embed_stage", None)
+            if vem is not None:
+                _clips = getattr(pipe, "last_clips", None) or []
+                for r in _clips:
+                    _emit("submit", f"片段#{r.get('clip_id')} 入库 "
+                                    f"t={float(r.get('t_start') or 0):.2f}"
+                                    f"~{float(r.get('t_end') or 0):.2f}s"
+                                    f"（{r.get('frame_count')} 帧"
+                                    f"{'，尾段' if r.get('partial') else ''}）",
+                          ts, stage="video_embed", frame_no=frame_no,
+                          data={k: v for k, v in r.items() if k != "embedding"},
+                          log_line=True, prefix="    ")
+                if not _clips:
+                    _emit("info", f"片段缓冲 {len(vem._buf)}/{vem.frames_per_clip} 帧",
+                          ts, stage="video_embed", frame_no=frame_no,
+                          log_line=True, prefix="    ")
 
         # 人脸检测：从 pipe.last_faces（Pipeline 人脸插槽产出）做落盘/计数/身份去重
         # （检测本身已在 pipe.step 里跑；此处只做展示层。无 face_embed 时=人脸截取模式）
@@ -1619,7 +3032,8 @@ def h_pipeline_run(p: dict) -> dict:
             nm = ev.get("name", "事件")
             det = ev.get("detail") or {}
             _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), ts,
-                  stage="seq_filter", frame_no=frame_no, log_line=True, prefix="    ")
+                  stage="seq_filter", frame_no=frame_no, data=ev,
+                  log_line=True, prefix="    ")
         log.append("")  # 帧块之间空行，多换行更易读
     
     # 初始化计数器
@@ -1628,10 +3042,14 @@ def h_pipeline_run(p: dict) -> dict:
     event_count = 0
     plate_count = 0
     plate_saved = [0]  # 已落盘原分辨率车牌小图数（文件名编号用）
+    start_frame = 0    # 视频分支按起始时间重算；图片分支恒 0（_done 收尾帧号映射用）
     
     # 图片测试模式
     image_name = str(p.get("image", "")).strip()
     if image_name:
+        if "video_embed" in _stage_order:
+            return res(ok=False, error="视频向量化链路仅支持视频输入"
+                                       "（索引按片段窗口切分，请选择视频测试）")
         img_path = _find_file(image_name, [PIC_DIR, TEST_IMGS])
         if not img_path:
             return res(ok=False, error=f"找不到图片: {image_name}")
@@ -1640,6 +3058,7 @@ def h_pipeline_run(p: dict) -> dict:
             return res(ok=False, error="该链路无 YOLO/车牌阶段，图片测试仅适用于含检测的链路")
 
         img_path, frame = _load_frame({"image": image_name})
+        media_info = {"type": "image", "name": img_path.name}
 
         # 保存原图
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1651,6 +3070,7 @@ def h_pipeline_run(p: dict) -> dict:
         subs, al = pipe.step(0, 0.0, dets, frame=frame)
         subs = _apply_vlm_inputs(pipe, subs)
         _step_out(0, 0.0, f"图片测试: {img_path.name}", dets, subs, al, frame=frame)
+        _output_accumulate_frame()  # 链路尾输出：单帧图片测试同样参与提炼累积
 
         if is_face_chain:
             # 人脸链图片测试：与普通链同走 pipe.step；结果头沿用「新身份/人脸」文案
@@ -1662,7 +3082,9 @@ def h_pipeline_run(p: dict) -> dict:
             if femb is not None:
                 head += f"（阈值 {face_dedup_thresh}）"
             head += f" | 输出到: {output_dir}" + _save_summary()
-            return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
+            _done()
+            return _res_with_output(text=head + "\n" + "\n".join(log),
+                                    images=images, timeline=timeline)
 
         # 保存标注图（检出框 + 车牌框）
         canvas = frame.copy()
@@ -1680,8 +3102,9 @@ def h_pipeline_run(p: dict) -> dict:
         head = f"链路: {spec.get('name') or '未命名'} | 图片: {img_path.name}"
         head += f" | 检出 {detection_count} 个 | 事件 {event_count} 个"
         head += " | 输出到: " + str(output_dir) + _save_summary()
-        
-        return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
+        _done()
+        return _res_with_output(text=head + "\n" + "\n".join(log),
+                                images=images, timeline=timeline)
 
     # 视频测试模式
     video_name = str(p.get("video", "")).strip()
@@ -1704,7 +3127,14 @@ def h_pipeline_run(p: dict) -> dict:
     start_frame = int(start_time * fps)
     end_frame = int(end_time * fps) if end_time > 0 else total_frames
     end_frame = min(end_frame, total_frames)
-    
+    media_info = {"type": "video", "name": vid.name, "start_time": start_time,
+                  "end_time": end_time, "start_frame": start_frame,
+                  "end_frame": end_frame}
+
+    # 视频嵌入：片段 upsert 键 (video, t_start) 用真实文件名（未显式配置时），重跑幂等覆盖
+    if _vem is not None and str(_vem.video) in ("", "video"):
+        _vem.video = vid.name
+
     # 跳到起始帧
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
@@ -1731,11 +3161,33 @@ def h_pipeline_run(p: dict) -> dict:
 
         dets = None
         if pipe.yolo is not None:
-            dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed()))
+            # WO-0033.9：喂管道保留 infer() 原始 dict 记录（带 label）——曾用
+            # _as_detections 强转 Detection（无 label 字段，见 composer），label 在
+            # 进 pipe.step 前即被剥，det_filter/video_embed（dets 端口连线源）拿到
+            # 的记录无 label → review_index.class_names 恒空。step 入口 to_record
+            # 对 dict 直通；下方展示消费点（_step_out/_draw_tracks 读对象属性）各自
+            # 局部转换，不再在喂管道前统一强转。
+            dets = list(pipe.yolo.infer(frame, track=pipe.track_needed()))
 
         subs, al = pipe.step(n, ts, dets, frame=frame, force=True)
         subs = _apply_vlm_inputs(pipe, subs)
-        _step_out(n, ts, tag, dets, subs, al, frame=frame)
+
+        # 视频嵌入：逐帧推入片段缓冲（含观察源 dets 第二入端口，§12-1）；满窗产出的
+        # 片段记录经 publish 进事件流（clip_indexed 事件 → 事件计数 / 链路尾输出提炼
+        # pipeline.tail 可取）
+        if _vem is not None:
+            pipe.last_clips = _vem_feed_dets(pipe, _vem, _vem_pos, frame, ts, n)
+            for ev in pipe.publish(pipe.last_clips, ts, n):
+                event_count += 1
+                nm = ev.get("name", "事件")
+                det = ev.get("detail") or {}
+                _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), ts,
+                      stage="video_embed", frame_no=n, data=ev,
+                      log_line=True, prefix="    ")
+
+        # 展示消费点局部转 Detection（WO-0033.9：dets 已是原始 dict 记录）
+        _step_out(n, ts, tag, _as_detections(dets), subs, al, frame=frame)
+        _output_accumulate_frame()  # 链路尾输出：本帧尾记录流按 scope 粗筛+配图预对位累积
 
         # 保存关键帧图片（检出框 + 车牌框）；人脸链只落人脸图（在 _step_out 里），不回灌关键帧
         if not is_face_chain:
@@ -1743,7 +3195,7 @@ def h_pipeline_run(p: dict) -> dict:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             if (dets and len(dets) > 0) or plates:
                 canvas = frame.copy()
-                _draw_tracks(canvas, dets or [])
+                _draw_tracks(canvas, _as_detections(dets or []))
                 for p in plates:
                     px1, py1, px2, py2 = p.bbox
                     cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 255, 0), 2)
@@ -1763,6 +3215,22 @@ def h_pipeline_run(p: dict) -> dict:
 
     cap.release()
 
+    # 视频嵌入收尾：冲刷尾段（partial）→ publish → 底库落盘（PIPE0004「入库即目的」）
+    if _vem is not None:
+        _tail_ts = (n / fps) if fps else 0.0
+        pipe.last_clips = _vem.finish()
+        for ev in pipe.publish(pipe.last_clips, _tail_ts, n):
+            event_count += 1
+            nm = ev.get("name", "事件")
+            det = ev.get("detail") or {}
+            _emit("submit", f"事件 {nm}" + (f" {det}" if det else ""), _tail_ts,
+                  stage="video_embed", frame_no=n, data=ev, log_line=True, prefix="    ")
+        if _vem_store_path:
+            _sp = Path(_vem_store_path)
+            if not _sp.is_absolute():
+                _sp = ROOT / _vem_store_path
+            _vem_saved = _vem.store.save(str(_sp))
+
     if is_face_chain:
         head = f"链路: {spec.get('name') or '未命名'} | 视频: {vid.name}"
         head += f" | 范围: {start_time}s-{end_time}s ({start_frame}-{end_frame}帧)"
@@ -1772,11 +3240,17 @@ def h_pipeline_run(p: dict) -> dict:
         else:
             head += f" | 截取人脸 {face_count} 张"
         head += f" | 输出到: {output_dir}" + _save_summary()
-        return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
+        _done()
+        return _res_with_output(text=head + "\n" + "\n".join(log),
+                                images=images, timeline=timeline)
 
     head = f"链路: {spec.get('name') or '未命名'} | 视频: {vid.name}"
     head += f" | 范围: {start_time}s-{end_time}s ({start_frame}-{end_frame}帧)"
     head += f" | 处理 {processed_count} 帧 | 检出 {detection_count} 个 | 车牌 {plate_count} 次 | 事件 {event_count} 个"
+    if _vem is not None:
+        head += f" | 向量化片段 {len(_vem.indexed)} 条"
+        if _vem_saved:
+            head += f"（底库 {_vem_saved}）"
     if vlm_unreachable:
         vlm_state = "端点不可达，已跳过"
     elif use_real_vlm:
@@ -1789,7 +3263,9 @@ def h_pipeline_run(p: dict) -> dict:
     head += f" | 输出到: {output_dir}"
     head += _save_summary()
 
-    return res(text=head + "\n" + "\n".join(log), images=images, timeline=timeline)
+    _done()
+    return _res_with_output(text=head + "\n" + "\n".join(log),
+                            images=images, timeline=timeline)
 
 
 # ---------------- 模块链路运行器（runner=chain，模块链路模式） ----------------
@@ -1802,6 +3278,7 @@ def h_pipeline_run(p: dict) -> dict:
 CHAIN_ASSEMBLED_MODULES = {
     "frame_manager", "yolo", "det_filter", "seq_filter", "gate_filter", "target_crop",
     "annotate", "vlm", "plate_recog", "face_detect", "extract_faces", "face_embed",
+    "video_embed",
 }
 
 
@@ -1818,6 +3295,12 @@ _CHAIN_DRIVER_PORTS: dict = {
     # 取检测记录构造送审（见 _apply_vlm_inputs）；vlm.image 不开放（图片源统一由
     # image_source 管，避免双机制——校验器对其报错）。
     "vlm": ("dets",),
+    # video_embed.frame：web 驱动层逐帧喂入（stage.run(frame, ts, frame_idx)，不经
+    # Pipeline.step 解析——对齐 vlm.dets 的 driver 解析定位）；
+    # video_embed.dets（WO-0033 §12-1）：第二入端口（观察源 Records，可缺省），
+    # 驱动层经 _vem_feed_dets 按 stage_inputs 连线取上游产物（yolo.dets /
+    # det_filter.dets / plate_recog.plates / face_detect.faces，单观察源直连）
+    "video_embed": ("frame", "dets"),
 }
 CHAIN_RESOLVED_PORTS: dict = {**{m: tuple(p) for m, p in _COMPOSER_RESOLVED_PORTS.items()},
                               **{m: tuple(p) for m, p in _CHAIN_DRIVER_PORTS.items()}}
@@ -1834,6 +3317,7 @@ _PORT_DECL_SOURCES = {
     "annotate": ("pipe.annotate", "Annotator"),
     "face_detect": ("face_detect.face_pipeline", "FaceStage"),
     "plate_recog": ("plate_recog.plate_pipeline", "PlateStage"),
+    "video_embed": ("video_embed.video_embed_stage", "VideoEmbedStage"),
 }
 _PORT_DECL_CACHE: dict = {}
 
@@ -1919,6 +3403,294 @@ def _positions_by_module(module_ids) -> dict:
     return out
 
 
+# ---------------- 链路尾输出提炼（spec 顶层 output 段，WO-0029.2） ----------------
+# 设计：doc/design/chain_output.md（v2）§3-§7。驱动层在每帧 pipe.step 后按 scope 粗筛 +
+# 同帧配图预对位累积（内存安全 MVP），运行收尾调 pipe.chain_output.collect_output 统一
+# 提炼、配图落盘并产出提炼块（同步 res/_LAST_RUN 快照 + SSE done 三处消费；
+# 报告导出 _build_report_html 优先呈现）。
+
+def _output_decl_of(spec: dict) -> dict | None:
+    """spec 的 output 声明段：顶层优先，回落 meta.output（DB 往返只持久化 meta，
+    直传 spec / validate_chain 校验的是顶层段）。非 dict 或空 dict → None
+    （=未声明，行为与现状逐字一致）。"""
+    if not isinstance(spec, dict):
+        return None
+    out = spec.get("output")
+    if not isinstance(out, dict) or not out:
+        meta = spec.get("meta")
+        out = meta.get("output") if isinstance(meta, dict) else None
+    return out if isinstance(out, dict) and out else None
+
+
+def _default_from_candidates(spec_stages: list) -> list:
+    """缺省 from 的**静态候选**（按声明序）：末段阶段的所有 Records 产物短名。
+
+    静态声明只是「预报」——rules-only 事件尾等形态运行时并不登记该产物
+    （INB-0109 根因②），故缺省 from 的真取值由 _output_pick_from 逐帧按
+    「运行时实际登记 → pipeline.tail」裁决（WO-0029.5），本清单只作 ① 级候选。
+    末段无 Records 产物声明（如 face_embed）→ 空列表（只剩 ② pipeline.tail 一条路）。
+    """
+    from pipe.composer import ARTIFACT_TYPES
+    last = next((s.get("module_id") for s in reversed(spec_stages or [])
+                 if s.get("module_id")), None)
+    outs = (module_port_decls().get(last) or {}).get("outputs") or {}
+    return [f"{last}.{art}" for art, typ in outs.items()
+            if typ == "Records" and f"{last}.{art}" in ARTIFACT_TYPES]
+
+
+def _resolve_output_plan(spec: dict) -> tuple:
+    """解析 output 声明 → (执行计划, 错误)。计划含解析后的产物全名/类型与规整 decl。
+
+    显式 from 非法（产物名未知或歧义 / 类型非 Image|Records / scope/image_pick/limit
+    非法）→ (None, 原因)：驱动层 **fail-soft**——运行照常完成，结果附
+    {"output": {"error": ...}} 而非中断测试（spec 层另有 validate_chain 硬拦）。
+    from 缺省 → **运行时解析**（WO-0029.5）：静态候选（末段 Records 产物）只是
+    ① 级预报，逐帧由 _output_pick_from 按「实际登记 → pipeline.tail」裁决，
+    全程取不到才在收尾提炼块报 error（不再静默空块），此路径不再于计划期报错。
+    """
+    decl = _output_decl_of(spec)
+    if decl is None:
+        return None, None
+    from pipe.composer import ARTIFACT_TYPES, artifact_short
+    stages = spec.get("stages") or []
+    positions = _positions_by_module([s.get("module_id") for s in stages])
+    plan: dict = {}
+    # from：显式声明优先；缺省 = 运行时解析（tail_froms 为 ① 级候选全名展开，
+    # ② 级 pipeline.tail 在 _output_pick_from 内置）
+    frm = str(decl.get("from") or "").strip()
+    if not frm:
+        plan["from_deferred"] = True
+        plan["from_full"] = None
+        last = next((s.get("module_id") for s in reversed(stages)
+                     if s.get("module_id")), None)
+        last_pos = positions.get(last) or []
+        tail_froms: list = []
+        for short in _default_from_candidates(stages):
+            tail_froms.append(short)  # 短名（单实例别名 / 位置未知形态）
+            tail_froms += [f"{last}#{p}.{short.partition('.')[2]}" for p in last_pos]
+        plan["tail_froms"] = tail_froms
+    else:
+        plan["from_deferred"] = False
+        try:
+            from_full = resolve_artifact(frm, positions)
+        except PortResolutionError as e:
+            return None, f"output.from={frm!r} 无法解析: {e}"
+        from_type = ARTIFACT_TYPES.get(artifact_short(from_full))
+        if from_type is None:
+            return None, (f"output.from={frm!r} 未知产物"
+                          f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
+        if from_type not in ("Image", "Records"):
+            return None, f"output.from={frm!r} 类型 {from_type} 非法（须为 Image/Records）"
+        plan["from_full"], plan["from_type"] = from_full, from_type
+    # image：可选；Records=逐记录读旁路图（collect_output 对位），
+    # Image=帧级图（MVP：收尾从 saved_files 落盘清单按帧号引用，见 _output_frame_image_index）
+    img = str(decl.get("image") or "").strip()
+    if img:
+        try:
+            img_full = resolve_artifact(img, positions)
+        except PortResolutionError as e:
+            return None, f"output.image={img!r} 无法解析: {e}"
+        img_type = ARTIFACT_TYPES.get(artifact_short(img_full))
+        if img_type is None:
+            return None, (f"output.image={img!r} 未知产物"
+                          f"（可用产物: {sorted(ARTIFACT_TYPES)}）")
+        if img_type not in ("Image", "Records"):
+            return None, f"output.image={img!r} 类型 {img_type} 非法（须为 Image/Records）"
+        plan["image_full"], plan["image_type"] = img_full, img_type
+    # scope / image_pick / limit：此处规整校验（fail-soft 早报），收尾传干净 decl
+    plan["scope"] = str(decl.get("scope") or "events").strip().lower() or "events"
+    if plan["scope"] not in ("events", "records"):
+        return None, f'output.scope={decl.get("scope")!r} 非法（应为 "events" 或 "records"）'
+    plan["image_pick"] = str(decl.get("image_pick") or "all").strip().lower() or "all"
+    if plan["image_pick"] not in ("first", "all"):
+        return None, f'output.image_pick={decl.get("image_pick")!r} 非法（应为 "first" 或 "all"）'
+    try:
+        limit = int(decl.get("limit") if decl.get("limit") is not None else 100)
+    except (TypeError, ValueError):
+        return None, f"output.limit={decl.get('limit')!r} 需为正整数"
+    if limit <= 0:
+        return None, f"output.limit={decl.get('limit')!r} 需为正整数"
+    plan["limit"] = limit
+    return plan, None
+
+
+def _output_pick_from(plan: dict, artifacts: dict) -> str | None:
+    """本帧 from 产物名裁决（缺省 from 运行时解析，WO-0029.5；同步/流式共用）。
+
+    显式 from → 原样返回 plan["from_full"]（运行时缺该产物即本帧取不到，现状语义）。
+    缺省 from → 逐帧优先级：
+      ① 末段阶段**实际登记**的 Records 产物（tail_froms，运行时真相——静态声明
+        ≠ 运行时登记，rules-only 事件尾从不登记 seq_filter.dets 即此类）；
+      ② pipeline.tail（publish 通路承载记录，事件尾链路主路径；无事件帧该键不存在）；
+      都没有 → None（本帧无可提炼，跳过不报错；是否「取不到」由收尾统一裁决）。
+    命中即回写 plan["_used_from"]（最近一次实际来源，收尾块头呈现）与
+    plan["_used_publish"]（用过 publish 通路，收尾加来源 note）。
+    """
+    if not plan.get("from_deferred"):
+        return plan.get("from_full")
+    for name in plan.get("tail_froms") or ():
+        if isinstance(artifacts.get(name), list):
+            plan["_used_from"] = name
+            return name
+    if isinstance(artifacts.get("pipeline.tail"), list):
+        plan["_used_from"] = "pipeline.tail"
+        plan["_used_publish"] = True
+        return "pipeline.tail"
+    return None
+
+
+def _make_output_accumulator(plan: dict) -> dict:
+    """逐帧累积器工厂（内存安全 MVP，实现决策见 WO-0029.2 回报）。
+
+    add(records, image_records) 在每帧 pipe.step 之后调用：
+      - 先按 scope 粗筛（events=只留带事件记录——事件是边沿语义天然少量）；
+      - 再做**同帧 consume-on-use 配图预对位**（与 collect_output 同策略：一条配图记录
+        只配一条主流记录）；对不上的主流记录占位 {"frame_idx": f}——占位无旁路图，
+        收尾 collect_output 再对位时结果与本帧预对位逐条一致（同帧桶 consume-on-use
+        保序，占位吸收配额且产出空图）；
+      - 攒「已配对 (记录, 配图记录)」**对齐列表**（imgs[i] 与 recs[i] 一一对应）。
+    Image 帧级产物**不在循环内累积**：帧级图历史不留内存，收尾经 saved_files 落盘
+    清单按帧号建引用映射（_output_frame_image_index）。
+    records 硬上限 = max(10×limit, 200) 条：超出置 truncated 并停止累积（MVP 语义：
+    截断点之后的内容不进提炼块，count 只反映已累积部分；事件边沿语义下正常远达不到）。
+    """
+    from pipe.records import get_events
+    cap = max(10 * plan["limit"], 200)
+    st: dict = {"recs": [], "imgs": [], "truncated": False, "cap": cap}
+
+    def add(records, image_records=None):
+        if st["truncated"] or not records:
+            return
+        kept = [r for r in records
+                if not (plan["scope"] == "events" and not get_events(r))]
+        if not kept:
+            return  # 本帧无贡献：其配图流一并丢弃（省内存关键——图不进无贡献帧）
+        img_iter = iter(image_records or [])
+        for r in kept:
+            if len(st["recs"]) >= cap:
+                st["truncated"] = True
+                return
+            st["recs"].append(r)
+            ir = next(img_iter, None)
+            st["imgs"].append(ir if ir is not None
+                              else {"frame_idx": r.get("frame_idx")})
+    st["add"] = add
+    return st
+
+
+def _output_frame_image_index(saved_files: list, start_frame: int = 0) -> dict:
+    """saved_files 落盘清单 → {frame_idx: 文件名}（Image 帧级产物 MVP 引用映射）。
+
+    Image 帧级产物（frame_manager.frame / annotate.annotated）每帧至多一张且随帧处理
+    即时落盘（文件名 frame_{frame_num:04d}_...，同步路径 frame_num = 帧号 - start_frame）。
+    **只引用已落盘文件**——不新落盘、不攒内存（同帧共用依赖帧级图历史留存，当前驱动层
+    只有 last_annotated 一张在内存，此为 MVP 约束，见设计稿 §4.2）；同帧多张取清单中
+    **最后**一张（落盘顺序 orig → annotated/det，标注图优先）。解析不到的帧无图。
+    """
+    out: dict = {}
+    for name in saved_files or []:
+        m = re.match(r"^frame_(\d{1,8})_", str(name))
+        if not m:
+            continue
+        out[int(m.group(1)) + int(start_frame or 0)] = name  # 后者覆盖前者 = 最后一张
+    return out
+
+
+def _thumb_data_url(img, max_edge: int = 360, quality: int = 70) -> str:
+    """缩略 data URL（提炼块随块返回，test.html 免读盘展示缩略图；失败返回空串）。"""
+    try:
+        h, w = img.shape[:2]
+    except Exception:
+        return ""
+    if max_edge > 0 and max(h, w) > max_edge:
+        k = max_edge / max(h, w)
+        img = cv2.resize(img, (max(1, int(w * k)), max(1, int(h * k))))
+    return _img_data_url(img, quality)
+
+
+def _finish_output(plan: dict, acc: dict, output_dir, image_format: str = "jpg",
+                   save_image=None, start_frame: int = 0, saved_files: list | None = None,
+                   note: str | None = None) -> dict:
+    """运行收尾产出提炼块：collect_output 统一提炼 → 配图落盘 → 相对路径 + thumbs。
+
+    - 落盘命名 output_{序号:03d}_{tid或label}_{ts:.1f}s_{图序}.{ext}，落 output_dir，
+      **共用** max_saved_images 计数（save_image 闭包）与 saved_files 清单；落盘成功
+      才进 item.images（相对 output_dir 的文件名），并同步生成缩略 data URL 附
+      item.thumbs（浏览器展示用，磁盘路径浏览器取不到）；
+    - Image 帧级产物：不新落盘，从 saved_files 按帧号引用（_output_frame_image_index），
+      解析不到的帧 images 为空列表；
+    - 流式（output_dir=None）：不落盘，items.images 恒空列表，块附 note；
+    - truncated = collect_output 的 limit 截断 或 累积器硬上限截断（两者取或）。
+    """
+    from pipe.chain_output import collect_output
+    out = collect_output(
+        acc["recs"], acc["imgs"] if plan.get("image_type") == "Records" else None,
+        {"scope": plan["scope"], "image_pick": plan["image_pick"], "limit": plan["limit"]})
+    items = out["items"]
+    if plan.get("image_type") == "Image":
+        idx = _output_frame_image_index(saved_files, start_frame) if saved_files else {}
+        for it in items:
+            ref = idx.get(it.get("frame_idx"))
+            it["images"] = [ref] if ref else []
+            if ref and output_dir is not None:
+                # 引用文件读盘出缩略（条目数 ≤ limit，代价可控）；读失败无缩略不影响块
+                thumb = _report_read_img(Path(output_dir) / ref, 360, 70)
+                if thumb:
+                    it["thumbs"] = [thumb]
+    elif output_dir is not None and save_image is not None:
+        for i, it in enumerate(items, 1):
+            tid = it.get("track_id")
+            if isinstance(tid, (int, float)) and not isinstance(tid, bool) and tid:
+                tag = f"tid{int(tid)}"
+            else:
+                tag = re.sub(r'[\\/:*?"<>|\s]+', "", str(it.get("label") or ""))[:24] or "item"
+            ts = float(it.get("ts") or 0.0)
+            paths, thumbs = [], []
+            for j, img in enumerate(it.get("images") or [], 1):
+                fname = f"output_{i:03d}_{tag}_{ts:.1f}s_{j}.{image_format}"
+                if save_image(Path(output_dir) / fname, img):
+                    paths.append(fname)
+                    thumb = _thumb_data_url(img)
+                    if thumb:
+                        thumbs.append(thumb)
+            it["images"] = paths
+            if thumbs:
+                it["thumbs"] = thumbs
+    else:
+        for it in items:
+            it["images"] = []
+    # 块头/空块解释（WO-0029.5）：from 呈现运行时实际来源（缺省裁决 _used_from 优先）；
+    # 来源为 pipeline.tail（publish 通路，显式或缺省裁决命中均算）加来源 note——有事件
+    # 说明出处，无事件区分「没有」（count=0 不报 error）；缺省 from 全程取不到（末段
+    # 无实际登记产物且链路无事件尾通路）→ error，不再静默空块。
+    used_from = plan.get("_used_from")
+    # 是否真用过 publish 通路：缺省裁决命中 pipeline.tail，或（显式 from=pipeline.tail）
+    # 累积器实际取到承载记录——两者任一即「用到了」，来源 note 才不失真
+    used_tail = bool(used_from) or bool(acc["recs"])
+    shown_from = used_from or plan.get("from_full")
+    if plan.get("from_deferred") and not used_from and plan.get("publish_wired"):
+        shown_from = "pipeline.tail"  # 通路在位（事件尾已装配）：空结果按 publish 通路解释
+    block = {"scope": plan["scope"], "from": shown_from, "count": len(items),
+             "truncated": bool(out["truncated"] or acc["truncated"]), "items": items}
+    notes = [note] if note else []
+    if shown_from == "pipeline.tail":
+        src_note = ("事件由链路尾 publish 产出，来源产物 pipeline.tail"
+                    if plan["scope"] == "events"
+                    else "记录由链路尾 publish 通路产出（来源产物 pipeline.tail）")
+        if used_tail:
+            notes.append(src_note)
+        elif plan.get("publish_wired"):
+            notes.append(src_note + "（本次运行无事件）")
+    if plan.get("from_deferred") and not used_from and shown_from is None:
+        block["error"] = ("末段无可用记录产物：缺省 from 运行时末段无实际登记的 "
+                          "Records 产物，链路也无 publish 事件尾通路；"
+                          "请显式声明 from（如 plate_recog.plates / "
+                          "face_detect.faces / pipeline.tail）")
+    if notes:
+        block["note"] = "；".join(notes)
+    return block
+
+
 # 本期普通模块端口 fan_in 均为 0（fan-in 端口留 P2-3 过渡节点）；新增 fan-in 端口在此登记。
 PORT_FAN_IN: dict = {}
 
@@ -1961,6 +3733,67 @@ def _build_face_stage(p: dict):
     margin = _float(p, "margin", 0.0) or 0.15
     dedup_iou = _float(p, "dedup_iou", 0.0) or 0.6
     return FaceStage(fdet, Cropper(upscale=1.0, margin=margin), dedup_iou=dedup_iou)
+
+
+def _build_video_embed_stage(p: dict, video: str = "video"):
+    """按参数构造视频嵌入阶段（WEMMClient + EmbedStore + VideoEmbedStage）。
+
+    **惰性/零副作用**（INB-0109 装配期约束）：mock 档（use_real_embed=false 或无端点）
+    构造零网络零模型加载；real 档构造也只解析 env/URL（探测与请求推迟到首帧嵌入）。
+    key 只走 env（WEMM_API_KEY），不落 preset/DB/日志。维度非法由 WEMMClient
+    fail fast（ValueError 含合法档位清单）。
+
+    store_path 已有向量库 → 装配期先 load（WO-0033.12）：运行收尾 save() 是整库覆盖，
+    空构造不加载 = last-writer-wins，会把库里其它视频的向量清掉（违背 hybrid_retrieval
+    §4「多视频共存 + (video,t_start) upsert」契约）。对齐 FaceStore 先例
+    （h_face_store：db.exists() → store.load）。已载库的 clip_dim/frame_dim 与本次
+    preset 配置不一致 → 装配期明确报错（禁止静默混维，运行中才炸难定位）。
+    """
+    from video_embed.wemm_client import WEMMClient
+    from video_embed.embed_store import EmbedStore
+    from video_embed.video_embed_stage import VideoEmbedStage
+    client = WEMMClient(
+        endpoint=_str_param(p, "embed_endpoint") or None,
+        model=_str_param(p, "embed_model") or None,
+        timeout=_float(p, "embed_timeout", 120.0) or 120.0,
+        clip_dimension=_int(p, "embed_dimension", 1024),
+        frame_dimension=_int(p, "frame_dimension", 256),
+        max_resolution=_str_param(p, "max_resolution") or "896,896",
+        jpeg_quality=_int(p, "jpeg_quality", 85),
+        use_real_embed=_bool(p, "use_real_embed"))
+    store = EmbedStore()
+    # store_path 归一（与运行收尾 save 点 L~3232/4171 同规则；补 .npz 后缀对齐
+    # EmbedStore.save/load 的内部补全，避免「存 xxx.npz、查 xxx」漏检）
+    _sp = Path(_str_param(p, "store_path") or "out/video_vecs.npz")
+    if not _sp.is_absolute():
+        _sp = ROOT / _sp
+    if _sp.suffix != ".npz":
+        _sp = _sp.with_name(_sp.name + ".npz")
+    if _sp.exists():
+        store.load(str(_sp))
+        for _what, _lib, _cfg in (("clip", store.clip_dim, client.clip_dimension),
+                                  ("frame", store.frame_dim, client.frame_dimension)):
+            if _lib is not None and _cfg is not None and int(_lib) != int(_cfg):
+                raise ValueError(
+                    f"video_embed 装配失败: 已有向量库 {_sp} 的 {_what} 维度为 {_lib}，"
+                    f"与本次配置 {_cfg} 不一致（入库与查询必须同维度，禁止混维）——"
+                    f"请换 store_path 或删除旧库重建")
+    # thumb_dir 相对路径 → 项目根（server 进程 CWD=web_lab，不归一会落进 web_lab/out/；
+    # 对齐 face_store db_path 的归一约定。构造期纯字符串处理，零副作用）
+    thumb_dir = _str_param(p, "thumb_dir") or None
+    if thumb_dir and not Path(thumb_dir).is_absolute():
+        thumb_dir = str(ROOT / thumb_dir)
+    # flush_partial 缺省=True（PARAMS 默认档；显式空值回落默认，False 才关）
+    _fp = p.get("flush_partial")
+    flush_partial = True if _fp is None or _fp == "" else _bool(p, "flush_partial")
+    return VideoEmbedStage(
+        client, store, video=str(video),
+        frames_per_clip=_int(p, "frames_per_clip", 6),
+        clip_seconds=_float(p, "clip_seconds", 5.0) or 5.0,
+        thumb_dir=thumb_dir,
+        thumb_long=_int(p, "thumb_long", 320),
+        flush_partial=flush_partial,
+        root=str(ROOT))  # thumb_path 转项目相对的基准（缺省退 CWD=web_lab 会出 ../out/...）
 
 
 def _build_stage_instance(mid: str, p: dict):
@@ -2029,6 +3862,8 @@ def _build_stage_instance(mid: str, p: dict):
     if mid == "face_embed":
         from face_embed.face_embedder import FaceEmbedder
         return FaceEmbedder(device=_str_param(p, "device", "auto"))
+    if mid == "video_embed":
+        return _build_video_embed_stage(p, video=(_str_param(p, "video") or "video"))
     return None
 
 
@@ -2065,9 +3900,9 @@ def _chain_from_spec(spec: dict):
     if "frame_manager" not in ids:
         raise ValueError("链路缺少必需阶段: frame_manager")
     if not any(k in ids for k in ("face_embed", "face_detect", "plate_recog",
-                                  "det_filter", "seq_filter")):
+                                  "det_filter", "seq_filter", "video_embed")):
         raise ValueError("链路缺少必需阶段: 终段需为 det_filter / seq_filter / "
-                         "face_embed / face_detect / plate_recog 之一")
+                         "face_embed / face_detect / plate_recog / video_embed 之一")
 
     # ---- 每阶段按位置构造实例（同模块多实例各自构造，装配进 Pipeline 容器）----
     instances: dict = {}
@@ -2106,6 +3941,10 @@ def _chain_from_spec(spec: dict):
     # face_embed 身份去重（驱动层读 last_faces 后处理）；人脸去重阈值同源。
     face_embedder = _first("face_embed")
     face_dedup_thresh = _float(_params_at("face_embed"), "thresh", 0.55) or 0.55
+
+    # video_embed（PIPE0004 向量档索引）：驱动层逐帧 run/finish 消费，
+    # 片段记录经 publish 进事件流（clip_indexed 事件）；非 dataclass 字段附挂
+    video_embed_stage = _first("video_embed")
 
     # 兼容旧 extract_faces 形态：链路未配「目标裁剪」/「YOLO」阶段时按 extract_faces 参数补齐
     if face is not None and "extract_faces" in ids:
@@ -2173,6 +4012,8 @@ def _chain_from_spec(spec: dict):
     # face_embed 身份去重所需（驱动层读 pipe.last_faces 后处理）：非 dataclass 字段，装配层附挂
     pipe.face_embedder = face_embedder
     pipe.face_dedup_thresh = face_dedup_thresh
+    # video_embed（PIPE0004）：驱动层逐帧喂帧 + 收尾冲刷/落盘（face_embedder 同款附挂方式）
+    pipe.video_embed_stage = video_embed_stage
     # 完整位置映射（供驱动层按位置读 stage_inputs，如 _apply_vlm_inputs；调试同样有用）
     pipe.module_positions = positions_by_module
     return pipe
@@ -2214,6 +4055,13 @@ def h_pipeline_stream(write, params: dict) -> None:
         write("error", {"message": f"装配链路失败: {e}"})
         return
 
+    # ---- 链路尾输出声明（WO-0029.2）：fail-soft 同步路径；流式不落盘 → items.images 恒空
+    out_plan, out_err = _resolve_output_plan(spec)
+    if out_plan is not None and out_plan.get("from_deferred"):
+        # 同步路径：事件尾在位 = publish 通路在位（空结果「没有」≠「取不到」，WO-0029.5）
+        out_plan["publish_wired"] = getattr(pipe, "event_filter", None) is not None
+    out_acc = _make_output_accumulator(out_plan) if out_plan else None
+
     cap = cv2.VideoCapture(str(vid))
     if not cap.isOpened():
         cap.release()
@@ -2244,6 +4092,16 @@ def h_pipeline_stream(write, params: dict) -> None:
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     processed = detection_count = plate_count = event_total = 0
+    # 视频嵌入（PIPE0004）：驱动层逐帧 run（含观察源 dets 端口），收尾 finish + 底库落盘
+    vem = getattr(pipe, "video_embed_stage", None)
+    vem_pos = next((i for i, s in enumerate(spec.get("stages") or [])
+                    if s.get("module_id") == "video_embed"), -1)  # dets 端口连线解析位
+    vem_params = next((s.get("params") or {} for s in spec.get("stages") or []
+                       if s.get("module_id") == "video_embed"), {})
+    vem_store_path = str(vem_params.get("store_path") or "").strip()
+    if vem is not None and str(vem.video) in ("", "video"):
+        vem.video = vid.name  # upsert 键 (video, t_start) 用真实文件名
+    tl_stream: list = []  # 轻量时间线（车牌/事件条目带 data，报告导出用；流式不落盘）
     t0 = time.time()
     n = start_frame
     try:
@@ -2259,24 +4117,53 @@ def h_pipeline_stream(write, params: dict) -> None:
             if not pipe.frame.wants_frame(n, ts):  # 帧管理取图节奏
                 n += 1
                 continue
-            dets = _as_detections(pipe.yolo.infer(frame, track=pipe.track_needed())) \
+            # WO-0033.9：同 h_pipeline_run——保留 infer() 原始 dict 记录（带 label）
+            # 喂管道，SSE 路径 video_embed 落表 class_names 才有值；下方 write("frame")
+            # 叠加快照处对象形态消费点局部转换（本路径 dets 仅 step/快照两用）。
+            dets = list(pipe.yolo.infer(frame, track=pipe.track_needed())) \
                 if pipe.yolo is not None else []
             subs, evs = pipe.step(n, ts, dets, frame=frame, force=True)
             subs = _apply_vlm_inputs(pipe, subs)
             if vlm_feedback and pipe.vlm is not None:
                 for s in subs:  # 模拟回填（真实 VLM 见函数说明）
                     evs += pipe.publish([{"kind": "vlm", "label": vlm_action, "text": ""}], ts, n)
+            if vem is not None:  # 视频嵌入：满窗片段记录经 publish 进事件流（叠加侧 alarms）
+                evs += pipe.publish(_vem_feed_dets(pipe, vem, vem_pos, frame, ts, n),
+                                    ts, n)
+            if out_acc is not None:
+                # 链路尾输出：流式不落盘 → 配图记录不累积（配额用占位，images 恒空）。
+                # 置于 VLM publish **之后**：publish 登记的 pipeline.tail 承载记录须本帧
+                # 取（产物表逐帧重建，publish 前读会漏本帧事件，WO-0029.5）；缺省 from
+                # 同样逐帧运行时裁决（_output_pick_from），空块解释收尾统一给。
+                _of = _output_pick_from(out_plan, pipe.artifacts)
+                _os_recs = pipe.artifacts.get(_of) if _of else None
+                if isinstance(_os_recs, list):
+                    out_acc["add"](_os_recs, None)
             plates = list(getattr(pipe, "last_plates", []))
             processed += 1
             detection_count += len(dets or [])
             plate_count += len(plates)
             event_total += len(evs)
+            # 轻量时间线：只记带结构化数据的条目（车牌/事件），报告导出消费
+            for _pl in plates:
+                tl_stream.append({
+                    "kind": "submit", "stage": "plate_recog",
+                    "stage_label": _stage_label("plate_recog"),
+                    "text": f"识别 {_pl.plate_no} {_pl.type_name}/{_pl.color}",
+                    "ts": ts, "frame": n, "data": _pl.to_dict()})
+            for _ev in evs:
+                tl_stream.append({
+                    "kind": "submit", "stage": "seq_filter",
+                    "stage_label": _stage_label("seq_filter"),
+                    "text": f"事件 {_ev.get('name', '事件')}",
+                    "ts": ts, "frame": n, "data": _ev})
             _gi = getattr(pipe, "last_gate", None)  # 门控统计旁路（叠加展示；确有拦截才带）
             write("frame", {
                 "n": n, "ts": round(ts, 3),
                 "dets": [{"cls": d.cls_id, "bbox": list(d.bbox),
                           "score": round(float(d.score), 3),
-                          "track": int(getattr(d, "track_id", 0) or 0)} for d in (dets or [])],
+                          "track": int(getattr(d, "track_id", 0) or 0)}
+                         for d in _as_detections(dets or [])],  # 快照消费点局部转换（WO-0033.9）
                 "plates": [{"plate_no": p.plate_no, "type_name": p.type_name, "color": p.color,
                             "score": round(float(p.score), 3), "bbox": list(p.bbox),
                             "car_bbox": list(p.car_bbox) if p.car_bbox else None}
@@ -2290,9 +4177,62 @@ def h_pipeline_stream(write, params: dict) -> None:
     finally:
         cap.release()
         _STREAMS.pop(run_id, None)
-    write("done", {"run_id": run_id, "processed": processed, "detections": detection_count,
-                   "plates": plate_count, "alarms": event_total,
-                   "elapsed": round(time.time() - t0, 2), "stopped": stop_evt.is_set()})
+    # 视频嵌入收尾：冲刷尾段（partial）publish + 底库落盘（事件计入 done.alarms 与报告时间线）
+    if vem is not None:
+        _tail_ts = (n / fps) if fps else 0.0
+        for _ev in pipe.publish(vem.finish(), _tail_ts, n):
+            event_total += 1
+            tl_stream.append({"kind": "submit", "stage": "video_embed",
+                              "stage_label": _stage_label("video_embed"),
+                              "text": f"事件 {_ev.get('name', '事件')}",
+                              "ts": _tail_ts, "frame": n, "data": _ev})
+        if vem_store_path:
+            _p = Path(vem_store_path)
+            if not _p.is_absolute():
+                _p = ROOT / vem_store_path
+            vem.store.save(str(_p))
+    # 链路尾输出提炼块（WO-0029.2）：流式无落盘 → items.images 恒空 + note（与快照一致）
+    out_block = None
+    if out_plan is not None:
+        out_block = _finish_output(out_plan, out_acc, None,
+                                   note="流式运行不落盘，提炼项不产出配图（需配图请用批量运行）")
+    elif out_err:
+        out_block = {"error": out_err}
+    # 运行快照（报告导出）：流式无落盘图片，时间线仅车牌/事件条目
+    _store_last_run({
+        "name": spec.get("name") or "未命名",
+        "pipeline_id": pipeline_id,
+        "stages": [s.get("module_id") for s in spec.get("stages") or []],
+        "media": {"type": "video", "name": vid.name, "start_time": start_time,
+                  "end_time": end_time, "start_frame": start_frame,
+                  "end_frame": end_frame},
+        "stats": {"processed": processed, "detections": detection_count,
+                  "plates": plate_count, "events": event_total,
+                  "vlm_state": (f"模拟回填({vlm_action})"
+                                if (vlm_feedback and pipe.vlm is not None)
+                                else "未开启研判回填"),
+                  "vlm_fail": 0, "saved_images": 0, "dropped_saves": 0,
+                  "elapsed_sec": round(time.time() - t0, 2)},
+        "timeline": tl_stream,
+        "output_dir": None,
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": "stream",
+        **({"output": out_block} if out_block is not None else {}),
+    })
+    # 事件留存归档（WO-0033 §3，契约 C；流式路径与同步路径同语义）：
+    # 只归档链路尾事件；含视频嵌入阶段时顺带标签对齐落表。失败不影响 done 推送。
+    try:
+        _archive_and_align(vid.name, pipeline_id, _tail_events_of_timeline(tl_stream),
+                           run_id, vem, vem_params, store_path=vem_store_path)
+    except Exception as e:
+        print(f"[events] 流式归档/对齐异常（不阻断推送）: {e}")
+    done_payload = {"run_id": run_id, "processed": processed,
+                    "detections": detection_count, "plates": plate_count,
+                    "alarms": event_total, "elapsed": round(time.time() - t0, 2),
+                    "stopped": stop_evt.is_set()}
+    if out_block is not None:
+        done_payload["output"] = out_block
+    write("done", done_payload)
 
 
 def h_chain(p: dict) -> dict:
@@ -2696,6 +4636,48 @@ PARAMS = {
                  "test_only": True,
                  "help": "注册到库里的身份名字"},
     },
+    "video_embed": {
+        # ---- 嵌入端点（wemm_integration.md §4.5 参数表；key 只走 env WEMM_API_KEY，勿入库）----
+        "embed_endpoint": {"label": "嵌入端点（/v1/embeddings）", "type": "str", "default": "",
+                           "help": "OpenAI 兼容 /v1/embeddings 地址（base 地址自动拼路径）；"
+                                   "环境变量 WEMM_BASE_URL（别名 WEMM_ENDPOINT）优先；"
+                                   "留空且未导出 env = mock 档，无端点也能跑全流程"},
+        "embed_model": {"label": "嵌入模型名", "type": "str", "default": "",
+                        "help": "服务端 /v1/models 返回的模型名（env WEMM_MODEL 优先，默认 wemm-embedding）"},
+        "embed_dimension": {"label": "clip 向量维度", "type": "int", "default": 1024,
+                            "help": "片段向量维度（Matryoshka 档位 64~2048，默认 1024）；"
+                                    "入库与查询必须同维度，换维度=新建库"},
+        "frame_dimension": {"label": "frame 向量维度", "type": "int", "default": 256,
+                            "help": "帧向量维度（精排只比相对远近，低维足够，默认 256）"},
+        "use_real_embed": {"label": "真实嵌入调用", "type": "bool", "default": False,
+                           "help": "true=真发 HTTP（需端点在线，无端点直接报错）；"
+                                   "false=确定性伪向量（mock 档，零网络零模型，服务不在线也能全流程）"},
+        "embed_timeout": {"label": "读取超时（秒）", "type": "int", "default": 120,
+                          "help": "含图请求较慢，默认 120；连接阶段恒 5s 快速失败"},
+        "max_resolution": {"label": "送审帧缩放上限（宽,高）", "type": "str", "default": "896,896",
+                           "help": "嵌入不需原分辨率，压带宽；跨公网可降到 640,640"},
+        "jpeg_quality": {"label": "帧 JPEG 质量", "type": "int", "default": 85,
+                         "help": "帧编码质量（1~100）"},
+        # ---- 片段窗口 / 底库 / 缩略图（video_review_search.md §3.3/§5）----
+        "frames_per_clip": {"label": "每片段帧数", "type": "int", "default": 6,
+                            "help": "片段窗口切分唯一依据（默认 6 帧；时间由帧 ts 承载）"},
+        "clip_seconds": {"label": "标称窗口秒数", "type": "float", "default": 5.0,
+                         "help": "仅写入片段元数据供展示/排查，不影响切分（默认 5s 窗）"},
+        "thumb_dir": {"label": "缩略图目录（空=不落盘）", "type": "str",
+                      "default": "out/video_thumbs",
+                      "help": "窗口首帧缩略图落盘目录；路径写记录与底库元数据"},
+        "thumb_long": {"label": "缩略图长边（像素）", "type": "int", "default": 320,
+                       "help": "等比缩放、只缩不放（默认 320）"},
+        "flush_partial": {"label": "尾段余帧出片段", "type": "bool", "default": True,
+                          "help": "true=结束时不足一窗的余帧也出一个 partial 片段；false=丢弃"},
+        "store_path": {"label": "向量底库路径（.npz）", "type": "str",
+                       "default": "out/video_vecs.npz",
+                       "help": "片段向量底库存到哪（npz+json）；同视频重跑按 (video,t_start) 幂等覆盖"},
+        # ---- 测试页脚手架（test_only，不落库、不进链路）----
+        "video": {"label": "测试视频（试跑索引用）", "type": "file", "src": "vid",
+                  "test_only": True,
+                  "help": "模块试跑：从下拉选视频，按标称节奏取样喂入片段窗口（上限 60 帧≈10 片段）"},
+    },
     "target_crop": {
         "out_size": {"label": "输出分辨率（空=原图；640=长边；640,480=严格；×2=倍数）",
                      "type": "str", "default": "",
@@ -2894,6 +4876,12 @@ MODULES = {
         "name": "向量底库 FaceStore", "group": "向量比对",
         "desc": "复用 face_embed.face_store：注册 / 检索 / 自检 / 持久化。",
         "params": PARAMS["face_store"], "handler": h_face_store},
+    "video_embed": {
+        "name": "视频嵌入 VideoEmbedStage", "group": "向量比对",
+        "desc": "PIPE0004「视频向量化-嵌入查询」核心阶段：片段聚帧 → WeMM 嵌入"
+                "（clip+frame 双层向量）→ 底库入库（入库即目的，无 YOLO 无告警）。"
+                "mock 档（use_real_embed=false 或无端点）零网络零模型，全流程可跑。",
+        "params": PARAMS["video_embed"], "handler": h_video_embed},
     "face_monitor": {
         "name": "视频人脸检索 FaceMonitor", "group": "已完成链路", "hidden": True,
         "desc": "视频/摄像头人脸监控链路：抽帧 + 检测 + 嵌入 + 检索（在「已完成链路」中选择并运行）。",
@@ -3473,6 +5461,66 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
+        # ---- 回顾检索·查询层（向量档，WO-0032；轻查询不占 _TEST_LOCK，可与索引并行）----
+        if self.path == "/api/review/search":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self._json({"ok": False, "error": "请求体不是合法 JSON"})
+                return
+            t0 = time.time()
+            try:
+                result = h_review_search(body)
+            except FileNotFoundError as e:   # 底库不存在 → 404（可读指引建库）
+                self._send(404, json.dumps(
+                    {"ok": False, "error": str(e)}, ensure_ascii=False
+                ).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            except ValueError as e:          # 空查询/参数非法/维度非档位/空库 → 400
+                self._send(400, json.dumps(
+                    {"ok": False, "error": str(e)}, ensure_ascii=False
+                ).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            except Exception as e:           # 其余（如 real 档端点错误）→ 200 + ok:false
+                tb = traceback.format_exc()
+                print(tb)
+                result = {"ok": False, "error": f"{type(e).__name__}: {e}",
+                          "traceback": tb[-1800:]}
+            result.setdefault("elapsed_sec", round(time.time() - t0, 2))
+            print(f"[review] search {time.time() - t0:.1f}s ok={result.get('ok')}")
+            self._json(result)
+            return
+
+        # ---- 回顾检索·仅重对齐不重嵌入（WO-0033 §3 定案点；轻操作不占 _TEST_LOCK）----
+        if self.path == "/api/review/relabel":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                self._json({"ok": False, "error": "请求体不是合法 JSON"})
+                return
+            try:
+                result = h_review_relabel(body)
+            except FileNotFoundError as e:   # 底库不存在（需从底库取窗口）→ 404
+                self._send(404, json.dumps(
+                    {"ok": False, "error": str(e)}, ensure_ascii=False
+                ).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            except ValueError as e:          # video 缺失 / 底库无该视频 → 400
+                self._send(400, json.dumps(
+                    {"ok": False, "error": str(e)}, ensure_ascii=False
+                ).encode("utf-8"), "application/json; charset=utf-8")
+                return
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(tb)
+                result = {"ok": False, "error": f"{type(e).__name__}: {e}",
+                          "traceback": tb[-1800:]}
+            print(f"[review] relabel ok={result.get('ok')} rows={result.get('rows')}")
+            self._json(result)
+            return
+
         # ---- 链路资源估算（P1）----
         if self.path == "/api/pipeline/estimate":
             try:
@@ -3493,6 +5541,31 @@ class Handler(BaseHTTPRequestHandler):
                             "back_calc": reco})
             except Exception as e:  # spec 不合法时给出明确报错
                 self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        # ---- 链路运行报告导出（自包含单文件 HTML，WO-0028）----
+        if self.path == "/api/test/report":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                body = {}
+            if not _LAST_RUN:
+                self._json({"ok": False,
+                            "error": "暂无可导出的运行，请先完成一次链路测试"})
+                return
+            # 可选参数：各分组图片上限（默认标注帧 60 / 车牌 36 / 人脸 36 / 链路尾输出 60）
+            html_doc = _build_report_html(
+                _LAST_RUN, max_anno=_int(body, "max_anno", 60),
+                max_plate=_int(body, "max_plate", 36), max_face=_int(body, "max_face", 36),
+                max_output=_int(body, "max_output", 60))
+            out_dir = Path(_LAST_RUN.get("output_dir")
+                           or (ROOT / "tests/data/out/test_pipeline"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = out_dir / f"report_{ts}.html"
+            path.write_text(html_doc, encoding="utf-8")
+            self._json({"ok": True, "path": str(path), "html": html_doc})
             return
 
         # ---- 实时播放叠加：停止流式运行 ----
@@ -3715,6 +5788,40 @@ _SEED_FACE_STAGES = [
         "max_num": 0, "use_crop": False, "margin": 0.15, "dedup_iou": 0.6}),
 ]
 
+# 第四条链路：视频向量化-嵌入查询（帧管理 → YOLO观察 → 检测筛选 → 视频嵌入；
+# 观察段定案 doc/design/hybrid_retrieval.md §12-2：YOLO 观察源插 det_filter，
+# 只过有效性筛选、不过时序收敛，det_stats 口径 = det_filter 放行后的检出统计；
+# 观察记录经 dets 第二入端口进 video_embed，纯产观察不影响索引，入库即目的）
+_SEED_VEMB_NAME = "视频向量化-嵌入查询链路"
+_SEED_VEMB_STAGES = [
+    # 帧管理：稀疏抽帧（设计稿建议 frame_skip≈15；5s 窗 × 6 帧 → 每 15 帧取 1 的节奏下
+    # 25fps 视频约 10s 一窗，窗口时间由帧 ts 承载，可按素材密度调整）
+    ("frame_manager", "视频向量化·帧管理", {
+        "sampling": "analysis", "frame_skip": 15, "interval_sec": 3.0,
+        "interval_frames": 30, "backpressure": "standard"}),
+    # YOLO 观察源（§12-2）：为 video_embed 的 dets 端口产观察记录（经驱动层
+    # _vem_feed_dets 连线）。classes 不限（""=全类别都进 det_stats，观察场景默认
+    # 最宽口径；只想统计特定类别改此一词，如 "0,2"）；模型与 conf 用现有播种默认
+    ("yolo", "视频向量化·YOLO观察", {
+        "model_path": "models/yolov8n.pt", "conf": 0.25, "iou": 0.6,
+        "imgsz": 1280, "max_det": 300, "classes": "", "device": ""}),
+    # 检测筛选（§12-2）：观察层质量闸——只过有效性筛选、不过时序收敛。
+    # 播种用模块默认（空条件+空上下限=不筛选，det_stats 即 YOLO 原始检出统计）；
+    # 素材有明确尺寸下限时可加有效性条件（如 filter="long >= 30"，参考人脸/车牌链路）
+    ("det_filter", "视频向量化·检测筛选", {
+        "filter": "", "group_limits": ""}),
+    # 视频嵌入：默认参数 + use_real_embed=false（mock 档确定性伪向量，无端点也能全流程；
+    # 真端点联调时改 use_real_embed=true 并配 embed_endpoint 或导出 WEMM_BASE_URL——
+    # key 只走 env WEMM_API_KEY，不入 preset）
+    ("video_embed", "视频向量化·视频嵌入", {
+        "embed_endpoint": "", "embed_model": "", "embed_dimension": 1024,
+        "frame_dimension": 256, "use_real_embed": False, "embed_timeout": 120,
+        "max_resolution": "896,896", "jpeg_quality": 85,
+        "frames_per_clip": 6, "clip_seconds": 5.0,
+        "thumb_dir": "out/video_thumbs", "thumb_long": 320,
+        "flush_partial": True, "store_path": "out/video_vecs.npz"}),
+]
+
 # 链路未使用、但产品保留的模块（人脸识别链）：每模块同样恰播种一份参数（不入链路步骤）
 _SEED_STANDALONE = [
     ("face_detect", "人脸检测·默认", {
@@ -3742,7 +5849,8 @@ _SEED_STANDALONE = [
 
 
 def _seed_chain(name: str, stages: list, description: str, have: dict,
-                converge: dict | None = None) -> None:
+                converge: dict | None = None,
+                stage_inputs: dict | None = None) -> None:
     """幂等播种一条链路：先保各阶段模块 preset，再建链路引用。
 
     已存在同名链路时：阶段结构一致则原样保留（不动用户改动）；结构变化则按模块复用
@@ -3753,6 +5861,10 @@ def _seed_chain(name: str, stages: list, description: str, have: dict,
     强制收敛指定参数（其余用户参数保留；定向更新 id 不变）。用于「形态升级后旧参数
     语义反转」的场景：如 PIPE0002 换装独立门控后 plate_recog 的 track_dedup 必须关，
     否则旧库复用 preset 仍 True，生效形态变成「叠加」而非目标形态。
+
+    stage_inputs（WO-0033.5）：链路级连线声明（save_pipeline meta 双写 pipeline_edges，
+    位置键）。驱动层解析的端口（如 video_embed.dets）不经 Pipeline.step、设计器默认
+    不连线，播种形态要生效观察段必须显式声明（§12-1 单观察源直连）。
     """
     expected = [mid for mid, _s, _p in stages]
     existing = next((p for p in db.list_pipelines() if p["name"] == name), None)
@@ -3794,7 +5906,9 @@ def _seed_chain(name: str, stages: list, description: str, have: dict,
                 have[key] = pid
         stage_ids.append(pid)
     pid, _created = db.save_pipeline(name, stage_ids, streams=1, budget={},
-                                     meta={"description": description})
+                                     meta={"description": description,
+                                           **({"stage_inputs": stage_inputs}
+                                              if stage_inputs else {})})
     print(f"[seed] 链路「{name}」已播种（{pid}）")
 
 
@@ -3871,6 +5985,16 @@ def _seed_pipeline() -> None:
         _seed_chain(_SEED_FACE_NAME, _SEED_FACE_STAGES,
                     "人脸截取链路：帧管理→YOLO识人→原分辨率人脸提取"
                     "（无嵌入/检索/告警，截取落盘即目的）", have)
+        # 观察段连线（hybrid_retrieval §12-1 单观察源直连）：video_embed.dets ←
+        # 紧邻上游 det_filter.dets（位置键 stage_inputs，随 save_pipeline 双写
+        # pipeline_edges；帧主入口 frame 由驱动层逐帧喂入，不经连线声明）。
+        # 不声明则驱动层 _vem_feed_dets 取不到观察记录、det_stats 恒空——
+        # 观察段结构（§12-2）与连线必须成对播种。
+        _vemb_pos = [mid for mid, _n, _p in _SEED_VEMB_STAGES].index("video_embed")
+        _vemb_src = _SEED_VEMB_STAGES[_vemb_pos - 1][0]
+        _seed_chain(_SEED_VEMB_NAME, _SEED_VEMB_STAGES,
+                    "视频向量化-嵌入查询（离线索引，向量档）", have,
+                    stage_inputs={f"#{_vemb_pos}": {"dets": f"{_vemb_src}.dets"}})
     except Exception as e:
         print(f"[seed] 播种链路失败（不影响运行）: {e}")
 

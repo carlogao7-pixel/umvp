@@ -111,6 +111,10 @@
   .video-info{font-size:12px;color:var(--dim);padding:6px 10px;margin-top:4px;
               background:rgba(127,127,127,.08);border-radius:6px;line-height:1.7}
   .video-info b{color:var(--accent);font-weight:600}
+  .output-table{border-collapse:collapse;font-size:11px;width:100%}
+  .output-table th,.output-table td{border:1px solid var(--line);padding:3px 6px;text-align:left;
+    vertical-align:top;white-space:pre-wrap;word-break:break-all;max-width:260px}
+  .output-table th{background:rgba(79,140,255,.12);color:var(--accent);white-space:nowrap}
 </style>
 </head>
 <body>
@@ -208,6 +212,7 @@
       <button id="sync_btn" onclick="startSync()">同步播放运行</button>
       <button class="stop" id="sync_stop_btn" onclick="stopSync()" disabled>停止同步</button>
       <button onclick="clearResults()">清空结果</button>
+      <button id="report_btn" onclick="exportReport()" style="display:none">导出报告</button>
     </div>
   </section>
 
@@ -229,6 +234,15 @@
         <h3>输出图片</h3>
         <div class="image-grid" id="image_container"></div>
       </div>
+    </div>
+  </section>
+
+  <section class="section" id="output_section" style="display:none">
+    <h2 class="section-title">链路尾输出 <span id="output_meta" style="color:var(--dim);font-weight:400;font-size:11px"></span></h2>
+    <div class="log-panel" style="height:auto;max-height:420px">
+      <div id="output_error" class="log-entry error" style="display:none"></div>
+      <div style="overflow-x:auto"><table id="output_table" class="output-table"></table></div>
+      <div class="image-grid" id="output_images" style="margin-top:8px"></div>
     </div>
   </section>
 </main>
@@ -465,7 +479,9 @@ async function startTest() {
     if (result.ok) {
       addLogEntry('测试完成: ' + result.text, 'frame');
       renderTimeline(result.timeline);
-      
+      renderOutputBlock(result.output);  // 链路尾输出提炼块（无声明则隐藏区块）
+      showReportBtn();
+
       if (result.images) {
         result.images.forEach(img => {
           addResultImage(img.data, img.title);
@@ -523,7 +539,8 @@ async function runSingleImageTest(imageName) {
     
     if (result.ok) {
       addLogEntry('图片测试完成: ' + result.text, 'frame');
-      
+      renderOutputBlock(result.output);
+
       if (result.images) {
         result.images.forEach(img => {
           addResultImage(img.data, img.title);
@@ -544,6 +561,44 @@ function addLogEntry(text, type = '') {
   entry.textContent = text;
   container.appendChild(entry);
   container.scrollTop = container.scrollHeight;
+}
+
+// ---- 导出报告（WO-0028）：取最近一次链路运行快照 → 自包含单文件 HTML ----
+// 后端把报告落盘 output_dir/report_*.html，同时返回 HTML 文本；
+// 前端 Blob 下载 + 新标签预览（离线双击可开、可直接发人）。
+function showReportBtn() {
+  document.getElementById('report_btn').style.display = '';
+}
+
+async function exportReport() {
+  const btn = document.getElementById('report_btn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/test/report', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      addLogEntry('报告导出失败: ' + (data.error || '未知错误'), 'error');
+      return;
+    }
+    const blob = new Blob([data.html], {type: 'text/html;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');               // 新标签预览
+    const a = document.createElement('a');    // 同时触发下载
+    a.href = url;
+    a.download = (data.path || 'report.html').split('/').pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    addLogEntry('报告已导出: ' + data.path, 'det');
+  } catch (e) {
+    addLogEntry('报告导出失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // 结构化逐条渲染（来自后端 result.timeline）：统一按"阶段→下一级"标签展示，
@@ -609,6 +664,66 @@ function applyLogFilter() {
   if (lastTimeline.length) renderTimeline(lastTimeline);
 }
 
+// ---- 链路尾输出区块（WO-0029.2）：结果/流式 done 附带 output 提炼块时渲染；无则隐藏 ----
+// items.images 是相对 output_dir 的磁盘路径（浏览器取不到），展示用随块返回的 thumbs
+// data URL（落盘时同步生成）；无 output 块不显示区块（向后兼容，静默）。
+function _escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function _cellText(v) {
+  if (v === null || v === undefined || v === '') return '';
+  return (typeof v === 'object') ? JSON.stringify(v) : String(v);
+}
+function renderOutputBlock(ob) {
+  const sec = document.getElementById('output_section');
+  if (!ob || typeof ob !== 'object' || !Array.isArray(ob.items)) {
+    sec.style.display = 'none';
+    return;
+  }
+  sec.style.display = '';
+  const bits = ['scope=' + (ob.scope || 'events'), 'from=' + (ob.from || '-'),
+                'count=' + (ob.count !== undefined && ob.count !== null
+                            ? ob.count : ob.items.length)];
+  if (ob.truncated) bits.push('已截断（超出 limit）');
+  if (ob.note) bits.push(ob.note);
+  document.getElementById('output_meta').textContent = '  ' + bits.join(' ｜ ');
+  const errEl = document.getElementById('output_error');
+  if (ob.error) { errEl.style.display = ''; errEl.textContent = '输出块错误: ' + ob.error; }
+  else errEl.style.display = 'none';
+  // 字段表：通用字段并集 + events 明细列（detail_fields 投影键已在 events[].detail 内）
+  const skip = new Set(['images', 'thumbs', 'events']);
+  const cols = [];
+  for (const it of ob.items) {
+    for (const k of Object.keys(it)) {
+      if (!skip.has(k) && !cols.includes(k)) cols.push(k);
+    }
+  }
+  let html = '<thead><tr><th>#</th>'
+    + cols.map(c => '<th>' + _escHtml(c) + '</th>').join('')
+    + '<th>events</th></tr></thead><tbody>';
+  ob.items.forEach((it, i) => {
+    html += '<tr><td>' + (i + 1) + '</td>';
+    for (const c of cols) html += '<td>' + _escHtml(_cellText(it[c])) + '</td>';
+    html += '<td>' + _escHtml(_cellText(it.events) || '—') + '</td></tr>';
+  });
+  html += '</tbody>';
+  document.getElementById('output_table').innerHTML = html;
+  // 缩略图：thumbs 为落盘时同步生成的 data URL
+  const grid = document.getElementById('output_images');
+  grid.innerHTML = '';
+  ob.items.forEach((it, i) => {
+    (it.thumbs || []).forEach(src => {
+      const item = document.createElement('div');
+      item.className = 'image-item';
+      item.innerHTML = '<img src="' + src + '" alt="output">'
+        + '<div class="label">#' + (i + 1) + ' '
+        + _escHtml(_cellText(it.label) || _cellText(it.track_id) || '') + '</div>';
+      grid.appendChild(item);
+    });
+  });
+}
+
 function addResultImage(dataUrl, title) {
   const container = document.getElementById('image_container');
   const item = document.createElement('div');
@@ -625,6 +740,8 @@ function addResultImage(dataUrl, title) {
 function clearResults() {
   document.getElementById('log_container').innerHTML = '';
   document.getElementById('image_container').innerHTML = '';
+  document.getElementById('output_section').style.display = 'none';
+  document.getElementById('report_btn').style.display = 'none';
   lastTimeline = [];
   processedCount = 0;
   detectionCount = 0;
@@ -757,6 +874,8 @@ function startSync(){
                   + `告警 ${d.alarms}`
                   + (syncGateBlocked ? ` / 门控拦截 ${syncGateBlocked}` : '')
                   + `（${d.elapsed}s）${d.stopped ? '｜已停止' : ''}`);
+    renderOutputBlock(d.output);  // 链路尾输出（流式不落盘：images 恒空 + note）
+    showReportBtn();  // 流式运行同样可导出报告（摘要 + 车牌/事件表，无落盘图片）
     video.pause();  // 停在最后一个分析帧，避免视频继续跑而框被冻结
     _syncClose();
   });

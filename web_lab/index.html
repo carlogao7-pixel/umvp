@@ -145,6 +145,34 @@
   .agent-input button{background:var(--accent);color:#fff;border:none;border-radius:6px;
     padding:0 18px;cursor:pointer;font-weight:600}
   .agent-input button:disabled{opacity:.5;cursor:wait}
+  /* ---- 回顾检索（向量档查询层，WO-0032） ---- */
+  .review-bar{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;max-width:960px;
+    background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px}
+  .review-bar .rv-q{flex:1;min-width:240px;max-width:none}
+  .review-bar label{font-size:12px;color:var(--dim);display:flex;flex-direction:column;gap:4px}
+  .review-bar input[type=number]{width:80px}
+  .review-bar select{width:auto;max-width:220px}
+  .review-bar button{background:var(--accent);color:#fff;border:none;border-radius:6px;
+    padding:8px 24px;cursor:pointer;font-size:13px;font-weight:600}
+  .review-bar button:disabled{opacity:.6;cursor:wait}
+  #rv-store-bar{max-width:960px;margin-bottom:12px}
+  #rv-store-bar .fields{padding:2px 12px 10px}
+  #rv-note{max-width:960px;font-size:12px;color:var(--warn);margin:0 0 10px;white-space:pre-wrap}
+  .rv-meta{font-size:12px;color:var(--dim);margin:0 0 10px}
+  .rv-card{display:flex;gap:12px;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:10px;margin-bottom:10px;max-width:960px;cursor:pointer}
+  .rv-card:hover{border-color:var(--accent);background:var(--panel2)}
+  .rv-card img,.rv-thumb-empty{width:168px;height:96px;flex:none;border-radius:6px}
+  .rv-card img{object-fit:cover;background:#0a0e18}
+  .rv-thumb-empty{background:#0a0e18;display:flex;align-items:center;justify-content:center;
+    color:var(--dim);font-size:11px}
+  .rv-card .rv-main{flex:1;min-width:0;font-size:12.5px;line-height:1.75}
+  .rv-card .rv-title{color:var(--accent);font-weight:600;font-size:13.5px}
+  .rv-card .rv-dim{color:var(--dim);font-size:11.5px}
+  #rv-player-box{position:sticky;top:0;z-index:5;background:var(--panel);
+    border:1px solid var(--accent);border-radius:8px;padding:10px;margin-bottom:14px;max-width:960px}
+  #rv-player{width:100%;max-height:420px;border-radius:6px;background:#000;display:block}
+  #rv-player-info{font-size:12px;color:var(--dim);margin-top:6px}
 </style>
 </head>
 <body>
@@ -156,6 +184,7 @@
   <button id="nav-designer" onclick="openDesigner()">链路设计器</button>
   <div class="grp">系统</div>
   <button id="nav-test" onclick="openTestPage()">链路测试台</button>
+  <button id="nav-review" onclick="openReview()">回顾检索</button>
   <button id="nav-db" onclick="openDb()">数据浏览</button>
 </aside>
 <main>
@@ -214,6 +243,63 @@
     <div id="db-summary"></div>
     <div class="tabs" id="db-tabs"></div>
     <div id="db-content"></div>
+  </section>
+  <section id="view-review" hidden>
+    <h2>回顾检索</h2>
+    <p class="desc">向量档文搜视频（视频向量化-嵌入查询链路 PIPE0004 的索引库）：输入一句自然语言描述 →
+      片段粗排 + 帧级精定位 → 点击卡片跳转播放。可展开「过滤器」按采集时间窗 / 事件名 / 车牌号硬过滤
+      （混合检索 WO-0033 过滤式）。目标视频未命中时，请先在链路测试台运行「视频向量化-嵌入查询链路」建索引。</p>
+    <div class="review-bar">
+      <input id="rv-query" class="rv-q" type="text" placeholder="例如：人群聚集 / 有人倒地挥手呼救 / 路边车辆违停…">
+      <label>粗排片段数 top_k_clips<input id="rv-topk-clips" type="number" value="10" min="1"></label>
+      <label>精排帧数 top_k_frames<input id="rv-topk-frames" type="number" value="3" min="1"></label>
+      <label>回退秒 pre_roll<input id="rv-preroll" type="number" value="1.0" step="0.1" min="0"></label>
+      <select id="rv-video"><option value="">（全部视频）</option></select>
+      <button id="rv-search-btn" onclick="rvSearch()">查询</button>
+    </div>
+    <details class="param-group" id="rv-filters">
+      <summary>过滤器（留空=不启用；视频过滤用上方下拉）</summary>
+      <div class="fields">
+        <div class="field">
+          <label>时间窗·从（采集时间）</label>
+          <input type="datetime-local" id="rv-time-start">
+          <div class="help">按视频采集时间 + 片段起点判定（墙钟硬过滤）；无采集时间的视频不参与该过滤并在 why 注明。</div>
+        </div>
+        <div class="field">
+          <label>时间窗·到</label>
+          <input type="datetime-local" id="rv-time-end">
+        </div>
+        <div class="field">
+          <label>事件名 / 车牌号（精确匹配）</label>
+          <input type="text" id="rv-event" placeholder="如：斗殴 / 沪DHH230">
+          <div class="help">精确匹配片段标签里的事件名（警情/研判结论）与车牌号。</div>
+        </div>
+        <div class="field">
+          <label>检索模式</label>
+          <select id="rv-mode">
+            <option value="vector">向量（过滤式）</option>
+            <option value="hybrid">混合 hybrid（本期按过滤式执行）</option>
+          </select>
+          <div class="help">hybrid（RRF 融合排名）本期未实现，选它仍走过滤式，note/why 会注明。</div>
+        </div>
+      </div>
+    </details>
+    <details class="param-group" id="rv-store-bar">
+      <summary>高级（向量底库路径）</summary>
+      <div class="fields">
+        <div class="field">
+          <label>store_path（.npz，相对项目根或绝对路径）</label>
+          <input type="text" id="rv-store" value="out/video_vecs.npz">
+          <div class="help">PIPE0004 默认落盘 out/video_vecs.npz；换库查询改这里（文件变化自动重载，无需重启）。</div>
+        </div>
+      </div>
+    </details>
+    <div id="rv-note"></div>
+    <div id="rv-player-box" hidden>
+      <video id="rv-player" controls></video>
+      <div id="rv-player-info"></div>
+    </div>
+    <div id="rv-result"></div>
   </section>
 </main>
 <div class="agent-overlay" id="agent-overlay" hidden>
@@ -324,6 +410,8 @@ function setNavActive(id){
   if (db) db.classList.toggle("active", id === "db");
   const test = document.getElementById("nav-test");
   if (test) test.classList.toggle("active", id === "test");
+  const rv = document.getElementById("nav-review");
+  if (rv) rv.classList.toggle("active", id === "review");
 }
 
 function select(id){
@@ -604,7 +692,15 @@ function switchView(name){
   document.getElementById("view-module").hidden = name !== "module";
   document.getElementById("view-designer").hidden = name !== "designer";
   document.getElementById("view-db").hidden = name !== "db";
+  document.getElementById("view-review").hidden = name !== "review";
   if (name === "db") loadDbTables();
+  if (name === "review") rvInitOnce();
+}
+
+function openReview(){
+  switchView("review");
+  setNavActive("review");
+  document.getElementById("rv-query").focus();
 }
 
 // ---- 数据库数据浏览（只读快照，见 doc/design/storage_design.md 第一部分）----
@@ -1120,6 +1216,174 @@ async function sendAgent(){
     btn.disabled = false;
     inp.focus();
   }
+}
+
+// ---- 回顾检索·向量档（查询层 WO-0032，后端 POST /api/review/search） ----
+// 播放器实现说明：链路测试台（test.html）虽有现成 video_player，但那是另一个页面，
+// DOM 元素无法跨页共享；本页**内嵌迷你播放器**（体验最简：不跳页、不丢查询结果），
+// 复用的是后端既有视频服务基础设施——/api/video/prepare 按需转码 H.264 →
+// /media/videos 播放（Range 206 已支持拖动定位），点击卡片直接 currentTime=play_ts。
+
+let rvInited = false;      // 视频过滤下拉只装一次
+let rvPlaying = null;      // 播放器当前已装载的视频名（避免重复 prepare）
+
+function rvInitOnce(){
+  if (rvInited) return;
+  rvInited = true;
+  const sel = document.getElementById("rv-video");
+  for (const f of ((SCHEMA.files || {}).vid || [])){
+    const op = document.createElement("option");
+    op.value = f; op.textContent = f;
+    sel.appendChild(op);
+  }
+  document.getElementById("rv-query").addEventListener("keydown", e => {
+    if (e.key === "Enter") rvSearch();
+  });
+}
+
+async function rvSearch(){
+  const q = document.getElementById("rv-query").value.trim();
+  const btn = document.getElementById("rv-search-btn");
+  if (!q){ alert("请输入查询文本"); return; }
+  const body = {
+    query_text: q,
+    store_path: document.getElementById("rv-store").value.trim() || "out/video_vecs.npz",
+    top_k_clips: parseInt(document.getElementById("rv-topk-clips").value) || 10,
+    top_k_frames: parseInt(document.getElementById("rv-topk-frames").value) || 3,
+    pre_roll_sec: parseFloat(document.getElementById("rv-preroll").value) || 0
+  };
+  const video = document.getElementById("rv-video").value;
+  if (video) body.video = video;
+  // WO-0033 过滤器（留空=不启用）：时间窗转 ISO8601（带时区，后端按绝对时刻判定）、
+  // 事件名精确匹配、mode 预留（本期 vector/hybrid 均走过滤式）
+  const ts = document.getElementById("rv-time-start").value;
+  const te = document.getElementById("rv-time-end").value;
+  if (ts) body.time_start = new Date(ts).toISOString();
+  if (te) body.time_end = new Date(te).toISOString();
+  const ev = document.getElementById("rv-event").value.trim();
+  if (ev) body.event_name = ev;
+  body.mode = document.getElementById("rv-mode").value || "vector";
+  btn.disabled = true; btn.textContent = "查询中…";
+  const box = document.getElementById("rv-result");
+  const note = document.getElementById("rv-note");
+  box.innerHTML = '<div class="loading">⏳ 检索中…</div>';
+  note.textContent = "";
+  try{
+    const resp = await fetch("/api/review/search", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body)});
+    rvRender(await resp.json());
+  }catch(e){
+    box.innerHTML = '<pre class="err">请求失败: ' + esc(String(e)) + '</pre>';
+  }
+  btn.disabled = false; btn.textContent = "查询";
+}
+
+function rvRender(d){
+  const box = document.getElementById("rv-result");
+  const note = document.getElementById("rv-note");
+  box.innerHTML = "";
+  if (d.note) note.textContent = "ℹ️ " + d.note;
+  if (!d.ok || d.error){
+    box.innerHTML = '<pre class="err">❌ ' + esc(d.error || "检索失败") + '</pre>';
+    return;
+  }
+  if (!(d.hits || []).length){
+    box.innerHTML = '<div class="loading">未命中任何片段——换更具体的画面描述，' +
+      '或先运行「视频向量化-嵌入查询链路」为目标视频建索引。</div>';
+    return;
+  }
+  const meta = document.createElement("div");
+  meta.className = "rv-meta";
+  const st = d.store || {};
+  meta.textContent = "底库 " + st.path + "（" + st.clips + " 片段 · clip 维 " + st.clip_dim +
+    "）· 嵌入模式 " + (d.mode || "?") + " · 命中 " + d.hits.length + " 段";
+  box.appendChild(meta);
+  d.hits.forEach((h, i) => box.appendChild(rvCard(h, i)));
+}
+
+function rvCard(h, i){
+  const card = document.createElement("div");
+  card.className = "rv-card";
+  card.onclick = () => rvPlay(h);
+  if (h.thumb){
+    const img = document.createElement("img");
+    img.src = h.thumb; img.alt = h.video || ""; img.loading = "lazy";
+    card.appendChild(img);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "rv-thumb-empty"; empty.textContent = "无缩略图";
+    card.appendChild(empty);
+  }
+  const main = document.createElement("div");
+  main.className = "rv-main";
+  const t0 = (h.t_start ?? 0).toFixed(1), t1 = (h.t_end ?? 0).toFixed(1);
+  const bf = (h.best_frame_ts != null) ? h.best_frame_ts.toFixed(2) : "—";
+  const framesTxt = (h.frames || [])
+    .map(f => f.ts.toFixed(2) + "s(" + f.score.toFixed(2) + ")").join(" · ");
+  // 片段标签随命中返回时（有过滤器查询才有）展示车牌/事件/人脸计数（WO-0033）
+  let tagsTxt = "";
+  const tg = h.tags || {};
+  const plates = (tg.plates || []).map(p => p.plate_no).filter(Boolean);
+  const evts = (tg.events || []).map(e => e.name).filter(Boolean);
+  const bits = [];
+  if (plates.length) bits.push("车牌 " + plates.join("、"));
+  if (evts.length) bits.push("事件 " + evts.join("、"));
+  if (tg.face_count > 0) bits.push("人脸 " + tg.face_count);
+  if (bits.length) tagsTxt = '<div class="rv-dim">标签: ' + esc(bits.join(" ｜ ")) + "</div>";
+  main.innerHTML =
+    '<div class="rv-title">#' + (i + 1) + " " + esc(h.video || "(未知视频)") + "</div>" +
+    "<div>时间段 <b>" + t0 + " – " + t1 + " s</b> ｜ 最高相似帧 <b>" + bf + " s</b>" +
+    "（" + (h.play_ts ?? 0).toFixed(2) + " s 起播）</div>" +
+    "<div>" + esc(h.why || ("相似度 " + h.score)) + "</div>" +
+    tagsTxt +
+    (framesTxt ? '<div class="rv-dim">帧精排: ' + esc(framesTxt) + "</div>" : "");
+  card.appendChild(main);
+  return card;
+}
+
+// 转码适配（test.html prepareVideo 的精简版）：ready 返回可播 URL；transcoding 轮询
+// （上限 ~2.5 分钟防挂死）；error 返回 null，由调用方展示
+async function rvPrepare(name, tries){
+  tries = tries || 0;
+  try{
+    const resp = await fetch("/api/video/prepare?name=" + encodeURIComponent(name));
+    const data = await resp.json();
+    if (data.ok && data.status === "ready"){ rvPlaying = name; return data.url; }
+    if (data.ok && data.status === "transcoding" && tries < 100){
+      await new Promise(r => setTimeout(r, 1500));
+      return rvPrepare(name, tries + 1);
+    }
+    if (!data.ok || data.status === "error") console.warn("视频准备失败:", data.error);
+  }catch(e){ console.warn("视频准备请求失败:", e); }
+  return null;
+}
+
+async function rvPlay(h){
+  const box = document.getElementById("rv-player-box");
+  const v = document.getElementById("rv-player");
+  const info = document.getElementById("rv-player-info");
+  box.hidden = false;
+  info.textContent = h.video + " · 定位 " + (h.play_ts ?? 0).toFixed(2) + " s（准备视频…）";
+  let url;
+  if (rvPlaying === h.video){
+    url = v.src;                       // 已装载同一视频，直接定位
+  } else {
+    url = await rvPrepare(h.video);
+    if (!url){ info.textContent = "⚠️ " + h.video + " 视频准备失败（浏览器不可播且转码未就绪）"; return; }
+    if (v.getAttribute("src") !== url) v.src = url;
+  }
+  // Range 206 拖动定位：等元数据就绪再设 currentTime，避免加载中被重置
+  const seek = () => {
+    v.currentTime = Math.max(0, h.play_ts || 0);
+    v.play().catch(() => {});
+    info.textContent = h.video + " · " + (h.why || "") + " · 从 " +
+      (h.play_ts ?? 0).toFixed(2) + " s 起播（最高相似帧 " +
+      (h.best_frame_ts != null ? h.best_frame_ts.toFixed(2) : "—") + " s）";
+  };
+  if (v.readyState >= 1) seek();
+  else v.addEventListener("loadedmetadata", seek, {once: true});
+  box.scrollIntoView({behavior: "smooth", block: "nearest"});
 }
 
 // ---- 命名配置：链路暂存 ----

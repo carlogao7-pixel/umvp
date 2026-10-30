@@ -8,7 +8,7 @@
 
 校验 web_lab 模块链路 spec（{"stages": [{"module_id","params"}, ...]}）是否满足硬性规则：
   1) stages 非空；frame_manager 存在且恰一段（惯例首位）
-  2) 终段 ∈ {det_filter, seq_filter, plate_recog, face_detect, face_embed}
+  2) 终段 ∈ {det_filter, seq_filter, plate_recog, face_detect, face_embed, video_embed}
      （**同模块多实例已放行**——节点身份 = stages 数组下标，见 P2-0/设计稿 §3.1）
   3) 每个 module_id 是已注册产品模块；params 键在其参数白名单内；select 取值合法
      （含 vlm.image_source：annotated/frame/crops，非法取值即报错）
@@ -25,15 +25,23 @@
       max_records ≥ 1；连线产物与该 annotate 实例 scope 匹配（record 实例不产
       annotated、frame 实例不产 annotated_records，连线期拦截）。
       未声明 inputs 的旧 spec 不报错不警告。
-  6) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
-     - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
-       （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
-     - target_crop/annotate 的 filter → pipe.conditions.parse_condition 干跑
-     - yolo 的 model_path → models/ 权重池文件存在性
-     - yolo 的 conf/iou ∈ (0,1]、frame_manager.frame_skip 为正整数
-  7) vlm.image_source 一致性（非致命警告，经 warnings 列表返回）：显式声明 annotated 但
-     上游无 annotate / 声明 crops 但上游无 target_crop → 运行时静默回退，提示但不算错。
-  退出码：0=通过（含仅有警告）；1=有 error（逐条打印）。
+   6) 参数值语义干跑（复用权威解析器，防 LLM 编造值"侥幸过闸"）：
+      - det_filter / seq_filter 全参数 → server._det_filter_of/_seq_filter_of 构造干跑
+        （条件 DSL 语法、group_limits/events/rules JSON 规则、SeqRule 参数越界）
+      - target_crop/annotate 的 filter → pipe.conditions.parse_condition 干跑
+      - yolo 的 model_path → models/ 权重池文件存在性
+      - yolo 的 conf/iou ∈ (0,1]、frame_manager.frame_skip 为正整数
+      - video_embed（WO-0032）：embed_dimension/frame_dimension ∈ WEMM_MRL_DIMS
+        （非法报错列出档位）；use_real_embed=true 且 spec 与 env 均无端点 → 校验报错
+        提示 env 配置（与装配期 WEMMClient fail fast 双保险）
+   7) vlm.image_source 一致性（非致命警告，经 warnings 列表返回）：显式声明 annotated 但
+      上游无 annotate / 声明 crops 但上游无 target_crop → 运行时静默回退，提示但不算错。
+   8) spec 顶层 output 段（链路尾输出声明，WO-0029 设计 §7）：缺失=合法；scope ∈
+      {events,records}；image_pick ∈ {first,all}；limit 正整数；from/image 产物名经
+      resolve_artifact 解析（歧义/未知报错）且类型 ∈ {Image,Records}；from 缺省（末段
+      Records 产物）不可解析时报错要求显式声明。seq_filter rules 的 source（"first" 或
+      "max:<非空字段名>"）与 detail_fields（字符串列表，支持点路径）同批校验。
+   退出码：0=通过（含仅有警告）；1=有 error（逐条打印）。
 """
 from __future__ import annotations
 
@@ -62,7 +70,8 @@ from server import (  # noqa: E402
 from pipe.composer import ARTIFACT_TYPES, PortResolutionError, artifact_short  # noqa: E402
 from pipe.conditions import parse_condition  # noqa: E402
 
-TERMINAL_OK = {"det_filter", "seq_filter", "plate_recog", "face_detect", "face_embed"}
+TERMINAL_OK = {"det_filter", "seq_filter", "plate_recog", "face_detect", "face_embed",
+               "video_embed"}
 
 # 轻量数值范围检查（键级；条件见 _num_check）
 _NUM_RULES = {
@@ -74,6 +83,13 @@ _NUM_RULES = {
 
 def _module_params(mid: str) -> dict:
     return (MODULES.get(mid) or {}).get("params") or {}
+
+
+def _as_bool(v) -> bool:
+    """spec 参数布尔解析（对齐 server._bool：bool 原样；字符串 true/1/yes/on）。"""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on") if v else False
 
 
 def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
@@ -89,6 +105,8 @@ def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             errs.append(f"stages[{i}] det_filter 参数无法装配: {e}")
     elif mid == "seq_filter":
+        # source / detail_fields 静态校验（WO-0029 设计 §7；JSON 语法错由干跑报）
+        errs.extend(_validate_seq_rule_extras(i, params))
         if any(_s(k) for k in ("throttle", "change", "rules")):
             try:
                 _seq_filter_of(params, what="all")
@@ -106,6 +124,27 @@ def _semantic_dry_run(i: int, mid: str, params: dict) -> list:
         if mp and _find_file(mp, [MODELS_DIR]) is None:
             errs.append(f"stages[{i}] yolo.model_path={mp!r} 在模型池中不存在"
                         f"（models/ 下可用: {sorted(p.name for p in MODELS_DIR.glob('*.pt'))}）")
+    elif mid == "video_embed":
+        # WO-0032：向量档语义干跑（对齐 det_filter/seq_filter 干跑先例——校验期即报，
+        # 不再拖到装配期 WEMMClient 才 fail fast；装配期检查保留，双保险）
+        from video_embed.wemm_client import check_dimension, resolve_wemm_cfg
+        for k in ("embed_dimension", "frame_dimension"):
+            v = params.get(k)
+            if v in (None, ""):   # 未填/空列回落默认档位，不算非法
+                continue
+            try:
+                check_dimension(v)
+            except ValueError as e:
+                errs.append(f"stages[{i}] video_embed.{k} {e}")
+        if _as_bool(params.get("use_real_embed")):
+            ep_spec = _s("embed_endpoint")
+            ep_env = resolve_wemm_cfg()[0]  # 显式参数 None → 读 env（BASE_URL/别名 ENDPOINT）
+            if not ep_spec and not ep_env:
+                errs.append(
+                    f"stages[{i}] video_embed.use_real_embed=true 但未配置嵌入端点"
+                    f"（spec embed_endpoint 为空且 env 无 WEMM_BASE_URL/WEMM_ENDPOINT）——"
+                    f"请导出 WEMM_BASE_URL（key 走 WEMM_API_KEY）或改 use_real_embed=false"
+                    f"（mock 档，无端点也能全流程）")
 
     for (m, k), (lo, hi) in _NUM_RULES.items():
         if m != mid or k not in params:
@@ -216,6 +255,108 @@ def _validate_stage_inputs(i: int, mid: str, st: dict, upstream_ids: list,
     return errs
 
 
+def _validate_seq_rule_extras(i: int, params: dict) -> list:
+    """seq_filter rules 的 source / detail_fields 静态校验（WO-0029 设计 §7）。
+
+    source: "first"（缺省）或 "max:<非空字段名>"（窗口内取最优承载事件）；
+    detail_fields: 字符串列表（支持嵌套点路径，如 "content.result"；宽容单字符串，
+    与 SeqRule 装配一致）。JSON 语法错不在此报（_seq_filter_of 干跑统一报，避免重复）。
+    """
+    errs: list = []
+    rj = str(params.get("rules", "") or "").strip()
+    if not rj:
+        return errs
+    try:
+        specs = json.loads(rj)
+    except json.JSONDecodeError:
+        return errs  # 干跑已报
+    if not isinstance(specs, list):
+        return errs
+    for ri, r in enumerate(specs):
+        if not isinstance(r, dict):
+            continue
+        if "source" in r:
+            src = str(r.get("source") or "").strip()
+            if not (src == "first"
+                    or (src.startswith("max:") and src[4:].strip())):
+                errs.append(
+                    f'stages[{i}] seq_filter rules[{ri}].source={r.get("source")!r} 非法'
+                    f'（须为 "first" 或 "max:<非空字段名>"）')
+        if "detail_fields" in r:
+            df = r.get("detail_fields")
+            if isinstance(df, str):  # SeqRule 宽容单字符串 → 视为单字段列表
+                df = [df]
+            if not isinstance(df, (list, tuple)) or not all(
+                    isinstance(x, str) and x.strip() for x in df):
+                errs.append(
+                    f"stages[{i}] seq_filter rules[{ri}].detail_fields="
+                    f"{r.get('detail_fields')!r} 须为字符串列表（支持点路径）")
+    return errs
+
+
+def _validate_output(spec: dict, ids: list, positions_by_module: dict) -> list:
+    """spec 顶层 output 段校验（链路尾输出声明，doc/design/chain_output.md §7）。
+
+    缺失 = 合法（行为与现状逐字一致）。规则：
+      - scope ∈ {events, records}；image_pick ∈ {first, all}；limit 正整数；
+      - from/image 产物名经 resolve_artifact 解析（歧义/未知报错），类型 ∈ {Image, Records}；
+      - from 缺省（末段阶段的 Records 产物）不可解析 → 报错要求显式声明（不猜）。
+    from 为 Image 时提炼块即单图（scope 按 records 单条语义处理），静态不拦。
+    """
+    out = (spec or {}).get("output")
+    if out is None:
+        return []
+    if not isinstance(out, dict):
+        return [f"顶层 output 应为对象（{{scope,from,image,image_pick,limit}}），"
+                f"得到 {type(out).__name__}"]
+    errs: list = []
+    if "scope" in out and out.get("scope") is not None \
+            and out.get("scope") not in ("events", "records"):
+        errs.append(f'output.scope={out.get("scope")!r} 非法（应为 "events" 或 "records"）')
+    if "image_pick" in out and out.get("image_pick") is not None \
+            and out.get("image_pick") not in ("first", "all"):
+        errs.append(f'output.image_pick={out.get("image_pick")!r} 非法'
+                    f'（应为 "first" 或 "all"）')
+    if "limit" in out and out.get("limit") is not None:
+        lim = out.get("limit")
+        if isinstance(lim, bool) or not isinstance(lim, int) or lim <= 0:
+            errs.append(f"output.limit={lim!r} 需为正整数")
+    decl = module_port_decls()
+    frm = out.get("from")
+    if frm is None or (isinstance(frm, str) and not frm.strip()):
+        # 缺省 from = 末段阶段的 Records 产物；末段无 Records 产物声明 → 要求显式声明
+        last = ids[-1] if ids else None
+        rec_outputs = [a for a, t in ((decl.get(last) or {}).get("outputs") or {}).items()
+                       if t == "Records"]
+        if not rec_outputs:
+            errs.append(f"output.from 缺省不可解析（末段 {last!r} 无 Records 产物），"
+                        f"请显式声明 from（如 seq_filter.dets / plate_recog.plates / "
+                        f"face_detect.faces）")
+    elif not isinstance(frm, str):
+        errs.append(f"output.from 需为产物名字符串，得到 {type(frm).__name__}")
+    else:
+        try:
+            full = resolve_artifact(frm, positions_by_module)
+            t = ARTIFACT_TYPES.get(artifact_short(full))
+            if t not in ("Image", "Records"):
+                errs.append(f"output.from={frm!r} 类型 {t} 非法（须为 Image/Records）")
+        except PortResolutionError as e:
+            errs.append(f"output.from={frm!r} 无法解析: {e}")
+    img = out.get("image")
+    if img is not None:
+        if not isinstance(img, str) or not img.strip():
+            errs.append(f"output.image 需为产物名字符串（不配图请省略），得到 {img!r}")
+        else:
+            try:
+                full = resolve_artifact(img, positions_by_module)
+                t = ARTIFACT_TYPES.get(artifact_short(full))
+                if t not in ("Image", "Records"):
+                    errs.append(f"output.image={img!r} 类型 {t} 非法（须为 Image/Records）")
+            except PortResolutionError as e:
+                errs.append(f"output.image={img!r} 无法解析: {e}")
+    return errs
+
+
 def validate(spec: dict, warnings: list | None = None) -> list[str]:
     """校验链路 spec。返回 error 列表（非空=不通过）。
 
@@ -293,6 +434,8 @@ def validate(spec: dict, warnings: list | None = None) -> list[str]:
             continue
         errs.extend(_validate_stage_inputs(i, mid, st, ids[:i], positions_by_module,
                                            decl, warns, anno_scope_by_idx))
+    # 8) spec 顶层 output 段（链路尾输出声明，WO-0029 设计 §7）：缺失=合法零回归
+    errs.extend(_validate_output(spec, ids, positions_by_module))
     # 7) vlm.image_source 与上游产物一致性（非致命警告）：
     #    显式声明 annotated 但链路上游无 annotate / 声明 crops 但上游无 target_crop 时，
     #    驱动层会静默回退到默认源（annotated→原帧），行为正确但非用户本意，故提示。
