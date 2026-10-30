@@ -525,6 +525,124 @@ def test_annotate_scope_omitted_old_spec_ok():
     assert errs == [] and w == [], (errs, w)
 
 
+# ---------------- spec 顶层 output 段 + seq rules source/detail_fields（WO-0029.2） ----------------
+
+def test_output_absent_ok():
+    # 缺失 = 合法（基线本就无 output 段，行为与现状逐字一致；显式断言防误拦）
+    assert validate(_stages(*BASE_PLATE)) == []
+
+
+def test_output_empty_dict_ok():
+    # 空 dict 视为未声明（与运行时 _output_decl_of 语义一致）
+    spec = _stages(*BASE_PLATE)
+    spec["output"] = {}
+    assert validate(spec) == []
+
+
+def test_output_valid_decl_ok():
+    # 合法声明：显式 from 全名/短名、Records 配图、image_pick/limit 均合法
+    spec = _stages(*BASE_PLATE)
+    spec["output"] = {"scope": "events", "from": "plate_recog.plates",
+                      "image": "target_crop.crops", "image_pick": "all", "limit": 50}
+    assert validate(spec) == [], validate(spec)
+    spec["output"] = {"image_pick": "first", "limit": 1}  # from 缺省=末段 seq_filter.dets
+    assert validate(spec) == [], validate(spec)
+
+
+def test_output_bad_values_rejected():
+    # scope / image_pick / limit 非法取值
+    spec = _stages(*BASE_PLATE)
+    spec["output"] = {"scope": "everything"}
+    assert any("output.scope" in e for e in validate(spec)), validate(spec)
+    spec["output"] = {"image_pick": "some"}
+    assert any("output.image_pick" in e for e in validate(spec)), validate(spec)
+    for bad in (0, -3, "x", 1.5, True):
+        spec["output"] = {"limit": bad}
+        errs = validate(spec)
+        assert any("output.limit" in e and "正整数" in e for e in errs), (bad, errs)
+
+
+def test_output_unknown_artifact_rejected():
+    # from / image 未知产物（未知模块、已知模块未知产物）均报错
+    spec = _stages(*BASE_PLATE)
+    spec["output"] = {"from": "nope.dets"}
+    errs = validate(spec)
+    assert any("output.from" in e and ("无法解析" in e or "未知产物" in e) for e in errs), errs
+    spec["output"] = {"image": "yolo.nonexist"}
+    errs = validate(spec)
+    assert any("output.image" in e for e in errs), errs
+
+
+def test_output_from_default_unresolvable_requires_explicit():
+    # face_embed 终段无 Records 产物声明 → 缺省 from 不可解析，报错要求显式声明
+    face = _stages(
+        ("frame_manager", {"frame_skip": 5}),
+        ("yolo", {"model_path": "models/yolov8n.pt", "classes": "0"}),
+        ("target_crop", {"classes": "0"}),
+        ("face_detect", {"det_thresh": 0.4}),
+        ("face_embed", {}))
+    spec = face
+    spec["output"] = {"scope": "records"}  # 非空声明（空 dict=未声明合法）
+    errs = validate(spec)
+    assert any("output.from" in e and "显式声明" in e for e in errs), errs
+    # 显式声明后合法（from 指 Image/Records 均可；face_detect.faces 为 Records）
+    spec["output"] = {"scope": "records", "from": "face_detect.faces"}
+    assert validate(spec) == [], validate(spec)
+
+
+def test_output_from_ambiguous_short_name_rejected():
+    # 同模块多实例：短名歧义必须写全名（复用 resolve_artifact，不猜）
+    stages = [
+        ("frame_manager", {"frame_skip": 5}),
+        ("yolo", {"model_path": "models/yolov8n.pt", "classes": "0"}),
+        ("det_filter", {"filter": ""}),
+        ("seq_filter", {"throttle": "", "change": "", "rules": ""}),
+        ("seq_filter", {"throttle": "", "change": "", "rules": ""}),
+    ]
+    spec = _stages(*stages)
+    spec["output"] = {"from": "seq_filter.dets"}
+    errs = validate(spec)
+    assert any("output.from" in e and "歧义" in e for e in errs), errs
+    spec["output"] = {"from": "seq_filter#4.dets"}  # 全名合法
+    assert validate(spec) == [], validate(spec)
+
+
+def test_output_non_dict_rejected():
+    spec = _stages(*BASE_PLATE)
+    spec["output"] = ["events"]
+    errs = validate(spec)
+    assert any("顶层 output 应为对象" in e for e in errs), errs
+
+
+def test_seq_rule_source_valid_and_invalid():
+    # source："first"（缺省）/ "max:<非空字段名>" 合法；"max:"（空字段）/其它值非法
+    # （match 须为合法 DSL，否则干跑另报装配错）
+    ok_rules = ('[{"match": "kind == plate", "event": "{label}", "key": "label",'
+                ' "cooldown": -1.0, "source": "max:score",'
+                ' "detail_fields": ["score", "content.result"]}]')
+    errs = validate(_stages(*_with("seq_filter", {"rules": ok_rules})))
+    assert errs == [], errs
+    for bad in ('[{"match": "kind == plate", "event": "e", "source": "highest"}]',
+                '[{"match": "kind == plate", "event": "e", "source": "max:"}]'):
+        errs = validate(_stages(*_with("seq_filter", {"rules": bad})))
+        assert any(".source" in e for e in errs), (bad, errs)
+
+
+def test_seq_rule_detail_fields_valid_and_invalid():
+    # detail_fields：字符串列表（支持点路径）合法；非字符串元素/非列表非法；单字符串宽容
+    ok1 = ('[{"match": "kind == plate", "event": "e",'
+           ' "detail_fields": ["score", "content.result"]}]')
+    assert validate(_stages(*_with("seq_filter", {"rules": ok1}))) == []
+    ok2 = '[{"match": "kind == plate", "event": "e", "detail_fields": "score"}]'  # 宽容单字符串
+    assert validate(_stages(*_with("seq_filter", {"rules": ok2}))) == []
+    bad1 = '[{"match": "kind == plate", "event": "e", "detail_fields": [1, 2]}]'
+    errs = validate(_stages(*_with("seq_filter", {"rules": bad1})))
+    assert any("detail_fields" in e for e in errs), errs
+    bad2 = '[{"match": "kind == plate", "event": "e", "detail_fields": {"a": 1}}]'
+    errs = validate(_stages(*_with("seq_filter", {"rules": bad2})))
+    assert any("detail_fields" in e for e in errs), errs
+
+
 def _with(mid, patch):
     """在基线中按 module_id 定位阶段并合并参数补丁（按 id 定位，结构演进不误改相邻阶段）。"""
     stages = list(BASE_PLATE)
@@ -533,6 +651,52 @@ def _with(mid, patch):
     params.update(patch)
     stages[idx] = (mid, params)
     return stages
+
+
+# ---- video_embed 向量档语义干跑（WO-0032：校验期 fail fast，
+#      对齐 det_filter/seq_filter 干跑先例；装配期 WEMMClient 检查保留双保险） ----
+
+def _vemb_spec(**patch):
+    """PIPE0004 播种形态 spec（video_embed 参数按 patch 覆盖）。"""
+    from server import _SEED_VEMB_STAGES
+    stages = [{"module_id": m, "params": dict(p)} for m, _s, p in _SEED_VEMB_STAGES[:-1]]
+    vemb = dict(_SEED_VEMB_STAGES[-1][2])
+    vemb.update(patch)
+    stages.append({"module_id": "video_embed", "params": vemb})
+    return {"stages": stages}
+
+
+def test_video_embed_dim_not_mrl_rejected_at_validate():
+    # 768 非档位：校验期即报（含原值与合法档位清单）；frame_dimension 同理；
+    # 合法档位（种子形态）零回归
+    errs = validate(_vemb_spec(embed_dimension=768))
+    assert any("embed_dimension" in e and "768" in e for e in errs), errs
+    assert any("64" in e and "2048" in e for e in errs), "报错应列出合法档位"
+    errs2 = validate(_vemb_spec(frame_dimension=100))
+    assert any("frame_dimension" in e and "100" in e for e in errs2), errs2
+    assert validate(_vemb_spec()) == [], "种子形态（1024/256）应保持全绿"
+
+
+def test_video_embed_real_without_endpoint_rejected_at_validate():
+    # use_real_embed=true 且 spec embed_endpoint 与 env 均无端点 → 校验报错提示 env 配置；
+    # spec 显式端点 / env 有端点（env 优先）两种真实联调形态 → 通过
+    import os
+    _keys = ("WEMM_BASE_URL", "WEMM_ENDPOINT", "WEMM_API_KEY", "WEMM_MODEL",
+             "WEMM_BASE_URL_FALLBACK")
+    backup = {k: os.environ.pop(k) for k in _keys if k in os.environ}
+    try:
+        errs = validate(_vemb_spec(use_real_embed=True, embed_endpoint=""))
+        assert any("use_real_embed" in e and "WEMM_BASE_URL" in e for e in errs), errs
+        ok_spec = _vemb_spec(use_real_embed=True,
+                             embed_endpoint="http://10.0.0.8:9100/v1/embeddings")
+        assert validate(ok_spec) == []
+        os.environ["WEMM_BASE_URL"] = "http://10.0.0.8:9100"
+        assert validate(_vemb_spec(use_real_embed=True)) == []
+    finally:
+        # 先删后还原：backup 只含进入前的旧值，set 新增的 key 需显式清除（防泄漏）
+        for k in _keys:
+            os.environ.pop(k, None)
+        os.environ.update(backup)
 
 
 if __name__ == "__main__":

@@ -186,6 +186,17 @@ def main() -> None:
     except ValueError:
         check("事件规格缺 name 报错", True)
 
+    # ---- 7.1 嵌套点路径（WO-0029.1：conditions._field_value 单一来源升级） ----
+    out = DetFilter("", events=[{"name": "警情",
+                                 "detail": ["content.alert", "content.missing.deep"]}]) \
+        .run([_rk(0, 1, "治安类")], ts=1.0)
+    d = out[0]["events"][0]["detail"]
+    check("事件 detail 点路径：嵌套取值 + 中途缺失跳过（顶层 detail 行为不变）",
+          d.get("content.alert") == "治安类" and "content.missing.deep" not in d)
+    keep = DetFilter("content.alert == 治安类").run([_rk(0, 1, "治安类"), _rk(0, 2, "交通类")], ts=0.0)
+    check("条件 DSL 点路径：match 引用嵌套字段自动受益",
+          len(keep) == 1 and keep[0]["track_id"] == 1)
+
     # ---- 8. dict/object 双形态等价（链路通用语回归；本层双形态安全应立即绿） ----
     pair = [det((10, 20, 60, 70), cls=0, tid=1, score=0.95),
             det((110, 20, 160, 70), cls=2, tid=5, score=0.60),

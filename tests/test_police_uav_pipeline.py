@@ -199,6 +199,40 @@ def test_police_uav_pipeline():
         new_events = pipe.publish([{"kind": "vlm", "label": vlm_result, "text": ""}], ts=0.0)
         print(f"  VLM 回填 track_key={submit.track_key} action={vlm_result} -> {len(new_events)} 个事件")
 
+    # publish 承载记录登记为产物 pipeline.tail（WO-0029.4：链路尾输出提炼按产物取记录流）
+    print("\n" + "-" * 40)
+    print("测试 publish → pipeline.tail 产物登记")
+    print("-" * 40)
+
+    # 无事件 publish（治安类在 ts=0.0 已触发、冷却 30s 内被事件尾扣留）→ 不登记
+    pipe.artifacts.pop("pipeline.tail", None)
+    evs_none = pipe.publish([{"kind": "vlm", "label": "治安类", "text": ""}], ts=0.0, frame_idx=7)
+    assert evs_none == [], f"冷却期内不应出事件，实际 {len(evs_none)} 个"
+    assert "pipeline.tail" not in pipe.artifacts, "无事件 publish 不应登记 pipeline.tail"
+    print("✓ 无事件 publish 不登记 pipeline.tail")
+
+    # 出事件 publish（治安类冷却 65.0 已过）→ 登记承载记录（含原字段 + events + 时间上下文）
+    evs_fire = pipe.publish([{"kind": "vlm", "label": "治安类", "text": ""}], ts=70.0, frame_idx=7)
+    assert len(evs_fire) == 1, f"冷却过后应出事件，实际 {len(evs_fire)} 个"
+    tail_art = pipe.artifacts.get("pipeline.tail")
+    assert isinstance(tail_art, list) and len(tail_art) == 1, \
+        f"pipeline.tail 应登记 1 条承载记录，实际 {tail_art!r}"
+    rec = tail_art[0]
+    assert isinstance(rec, dict) and rec.get("label") == "治安类", \
+        f"承载记录应保留原字段，实际 {rec!r}"
+    assert rec.get("events") and rec["events"][0]["name"] == "治安类", \
+        f"承载记录应携带事件，实际 events={rec.get('events')!r}"
+    assert rec.get("ts") == 70.0 and rec.get("frame_idx") == 7, \
+        f"承载记录应注入时间上下文，实际 ts={rec.get('ts')} frame_idx={rec.get('frame_idx')}"
+    print("✓ 出事件 publish 登记 pipeline.tail（承载记录 + events + ts/frame_idx）")
+
+    # 同帧多次出事件 publish 累计（如车牌事件尾逐牌 publish，互不覆盖）
+    pipe.publish([{"kind": "vlm", "label": "交警类", "text": ""}], ts=71.0, frame_idx=7)
+    tail_art = pipe.artifacts.get("pipeline.tail", [])
+    assert len(tail_art) == 2 and tail_art[1].get("label") == "交警类", \
+        f"同帧多次出事件 publish 应累计承载记录，实际 {len(tail_art)} 条"
+    print("✓ 同帧多次 publish 累计承载记录")
+
     print("\n✓ 链路集成测试通过")
     
     print("\n" + "=" * 60)

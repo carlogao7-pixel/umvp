@@ -376,6 +376,106 @@ def main() -> None:
     check("组合键: 对象/dict 双形态同结果（同 tid 收敛 1 条、后续扣留）",
           len(oo1) == len(rr1) == 1 and len(oo2) == len(rr2) == 0)
 
+    # ---- 9. 事件源选择 source + 字段投影 detail_fields（WO-0029.1，设计稿 chain_output.md §2） ----
+    print("== 9. source 事件源选择 + detail_fields 字段投影 ==")
+
+    # 9.1 source=first（默认）= 现状回归：达成时当前（最后）到达记录承载事件与放行
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=3)])
+    r1, r2, r3 = rec(tid=7, score=0.6, ts=0.0), rec(tid=7, score=0.95, ts=1.0), rec(tid=7, score=0.8, ts=2.0)
+    check("source=first：凑满前扣留", len(sf.run([r1], ts=0.0)) == 0 and len(sf.run([r2], ts=1.0)) == 0)
+    o = sf.run([r3], ts=2.0)
+    check("source=first（默认）：当前到达承载放行（现状逐字不变）",
+          len(o) == 1 and o[0] is r3 and r3["events"][0]["name"] == "驻留"
+          and "events" not in r1 and "events" not in r2)
+
+    # 9.2 source=max:score：窗口内最高分承载事件（最高分不是最后到达）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=3, source="max:score")])
+    s1, s2, s3 = rec(tid=7, score=0.6, ts=0.0), rec(tid=7, score=0.95, ts=1.0), rec(tid=7, score=0.8, ts=2.0)
+    check("source=max:score：凑满前扣留", len(sf.run([s1], ts=0.0)) == 0 and len(sf.run([s2], ts=1.0)) == 0)
+    o = sf.run([s3], ts=2.0)
+    check("source=max:score：窗口内最高分记录承载事件与放行（边沿仍只放一条）",
+          len(o) == 1 and o[0] is s2 and s2["score"] == 0.95
+          and s2["events"][0]["name"] == "驻留")
+    check("source=max:score：触发到达（最后一条）不再放行、无事件",
+          "events" not in s3 and s3 not in o)
+
+    # 9.3 max 同批到达 + 并列取先到（严格 >，先到达者胜）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=2, source="max:score")])
+    t1, t2 = rec(tid=7, score=0.9, ts=0.0), rec(tid=7, score=0.9, ts=1.0)
+    o = sf.run([t1, t2], ts=1.0)
+    check("source=max:score：同批到达生效 + 并列最高分取先到",
+          len(o) == 1 and o[0] is t1 and "events" in t1 and "events" not in t2)
+
+    # 9.4 max 缺字段/非数值候选不参与，全缺失回退 first
+    # （注：score 按 DSL 数值规整——缺失视作 0.0 仍参与；「缺字段」指经 _field_value 取 None 的字段）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=2, source="max:conf2")])
+    u1 = {"cls_id": 0, "track_id": 7, "bbox": (0, 0, 9, 9), "ts": 0.0}   # 无 conf2 字段
+    u2 = {"cls_id": 0, "track_id": 7, "bbox": (0, 0, 9, 9), "ts": 1.0}
+    o = sf.run([u1, u2], ts=1.0)
+    check("source=max:conf2：全候选缺字段 → 回退 first（当前到达承载）",
+          len(o) == 1 and o[0] is u2 and "events" in u2)
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=3, source="max:label")])
+    v1 = {"cls_id": 0, "track_id": 7, "bbox": (0, 0, 9, 9), "label": "9", "ts": 0.0}
+    v2 = {"cls_id": 0, "track_id": 7, "bbox": (0, 0, 9, 9), "label": "abc", "ts": 1.0}  # 非数值
+    v3 = {"cls_id": 0, "track_id": 7, "bbox": (0, 0, 9, 9), "label": "5", "ts": 2.0}
+    o = sf.run([v1, v2, v3], ts=2.0)
+    check("source=max:label：非数值候选跳过、数值字符串可比（'9' > '5' 胜出，非最后到达）",
+          len(o) == 1 and o[0] is v1 and v1["label"] == "9")
+
+    # 9.5 单条规则 source 忽略（只有一条候选）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="E", source="max:score")])
+    w1, w2 = rec(tid=7, score=0.5, ts=0.0), rec(tid=8, score=0.9, ts=1.0)
+    o = sf.run([w1, w2], ts=1.0)
+    check("source=max:score 单条规则：忽略 source，逐条命中即放行",
+          len(o) == 2 and "events" in w1 and "events" in w2)
+
+    # 9.6 max 达成即重臂（放行语义不变：仍边沿一条）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="驻留", span=5.0, min_n=2, source="max:score")])
+    check("source=max:score：同批达成放行（最优者=高分首批记录承载）",
+          len(sf.run([rec(tid=7, score=0.9, ts=0.0), rec(tid=7, score=0.5, ts=1.0)], ts=1.0)) == 1)
+    check("source=max:score：达成即重臂（后续到达重新凑窗）",
+          len(sf.run([rec(tid=7, score=0.8, ts=2.0)], ts=2.0)) == 0)
+
+    # 9.7 detail_fields：与固定统计并存（既有 preset 行为逐字不变的前提是缺省 ()）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="E", detail_fields=("label",))])
+    o = sf.run([{"cls_id": 0, "label": "治安类", "bbox": (0, 0, 9, 9)}], ts=0.0)
+    d = o[0]["events"][0]["detail"]
+    check("detail_fields：与固定统计并存（key/count/span/window_n 原样 + 追加 label）",
+          d["key"] == "*" and d["count"] == 1 and d["span"] == 0.0 and d["window_n"] == 0
+          and d["label"] == "治安类")
+
+    # 9.8 detail_fields：嵌套点路径 + 派生量 + 缺字段跳过
+    sf = SeqFilter([SeqRule(match="kind == vlm", event="E",
+                            detail_fields=("content.result", "area", "text"))])
+    o = sf.run([{"kind": "vlm", "content": {"result": "斗殴"}, "bbox": (0, 0, 30, 20)}], ts=0.0)
+    d = o[0]["events"][0]["detail"]
+    check("detail_fields：嵌套点路径取值 + 派生量 area + 缺字段 text 跳过",
+          d.get("content.result") == "斗殴" and d.get("area") == 600 and "text" not in d)
+    sf = SeqFilter([SeqRule(match="kind == vlm", event="E",
+                            detail_fields=("content.missing.deep",))])
+    o = sf.run([{"kind": "vlm", "content": {"result": "x"}}], ts=0.0)
+    check("detail_fields：中途缺失的点路径跳过（不抛错）",
+          "content.missing.deep" not in o[0]["events"][0]["detail"])
+
+    # 9.9 detail_fields 与固定统计同名：固定统计优先（并存语义）
+    sf = SeqFilter([SeqRule(match="cls_id == 0", event="E", detail_fields=("count",))])
+    o = sf.run([{"cls_id": 0, "count": 999, "bbox": (0, 0, 9, 9)}], ts=0.0)
+    check("detail_fields：字段名与固定统计同名时固定统计优先（count=1 非 999）",
+          o[0]["events"][0]["detail"]["count"] == 1)
+
+    # 9.10 非法 source 装配期报错 + 合法写法规整
+    for bad_src in ["highest", "max:", "MAX:score"]:
+        try:
+            SeqRule(match="cls_id == 0", event="E", source=bad_src)
+            check(f"非法 source 报错：{bad_src!r}", False)
+        except ValueError:
+            check(f"非法 source 报错：{bad_src!r}", True)
+    check("source 合法写法规整：'max: score' ≡ 'max:score'",
+          SeqRule(match="cls_id == 0", event="E", source="max: score").source == "max:score")
+    check("detail_fields 宽容：list/str 均归一为 tuple",
+          SeqRule(match="cls_id == 0", event="E", detail_fields=["a", "b"]).detail_fields == ("a", "b")
+          and SeqRule(match="cls_id == 0", event="E", detail_fields="a").detail_fields == ("a",))
+
     print(f"\n全部通过: {PASS} 项断言")
 
 

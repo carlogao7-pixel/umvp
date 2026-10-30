@@ -70,10 +70,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def decl_checks() -> None:
     decl = server.module_port_decls()
 
-    check("decl: 10 个产品模块均有端口声明（WO-0023 增 gate_filter）",
+    check("decl: 11 个产品模块均有端口声明（WO-0033 增 video_embed）",
           set(decl) == {"frame_manager", "yolo", "vlm", "det_filter", "seq_filter",
                         "gate_filter", "target_crop", "annotate", "face_detect",
-                        "plate_recog"},
+                        "plate_recog", "video_embed"},
           str(sorted(decl)))
     check("decl: frame_manager 是源头（无输入，出 frame:Image）",
           decl["frame_manager"]["inputs"] == {}
@@ -100,12 +100,17 @@ def decl_checks() -> None:
     check("decl: plate_recog 吃 frame:Image+crops:Records 出 plates:Records",
           decl["plate_recog"]["inputs"] == {"frame": "Image", "crops": "Records"}
           and decl["plate_recog"]["outputs"] == {"plates": "Records"})
+    check("decl: video_embed 吃 frame:Image+dets:Records（可缺省观察端口）出 clips:Records",
+          decl["video_embed"]["inputs"] == {"frame": "Image", "dets": "Records"}
+          and decl["video_embed"]["outputs"] == {"clips": "Records"})
     # 本期已纳入解析的端口集合（设计器开放连线 / 校验硬校验的依据）——**单一来源**：
-    # 推导自 pipe.composer.RESOLVED_PORTS（step 解析）+ 驱动层 vlm.dets，不再硬编码。
+    # 推导自 pipe.composer.RESOLVED_PORTS（step 解析）+ 驱动层 _CHAIN_DRIVER_PORTS
+    # （vlm.dets + video_embed frame/dets，WO-0033.4⑥），不再硬编码。
     from pipe.composer import RESOLVED_PORTS as _COMPOSER_PORTS
-    check("decl: CHAIN_RESOLVED_PORTS 推导自 composer.RESOLVED_PORTS + 驱动层 vlm.dets",
+    check("decl: CHAIN_RESOLVED_PORTS 推导自 composer.RESOLVED_PORTS + 驱动层端口（vlm.dets、video_embed frame/dets）",
           server.CHAIN_RESOLVED_PORTS == {**{m: tuple(p) for m, p in _COMPOSER_PORTS.items()},
-                                          "vlm": ("dets",)},
+                                          "vlm": ("dets",),
+                                          "video_embed": ("frame", "dets")},
           str(server.CHAIN_RESOLVED_PORTS))
     check("decl: plate_recog/face_detect 已纳入解析端口",
           server.CHAIN_RESOLVED_PORTS.get("plate_recog") == ("frame", "crops")

@@ -133,15 +133,19 @@ def run_police_uav_video_test(video_path: str, max_frames: int = 300):
 
     yolo = YOLODetector(
         model_path=str(ROOT / "models/yolov8n.pt"),
-        conf=0.35,
-        iou=0.7,
-        imgsz=640,
+        conf=0.25,
+        iou=0.6,
+        imgsz=1280,
         max_det=300,
         classes=[0, 2],
         device=None,
     )
-    det_filter = DetFilter(filter="score >= 0.35",
-                           group_limits=_class_limits("0:2,300;2:2,300"))
+    # WO-0033.13：imgsz 640→1280 / conf 0.35→0.25 / 成组下限 2→1——
+    #violent1.mp4 为远景小目标，640+高置信度阈值几乎零检出，偶发单检出又被
+    # 下限 2 整类剔除 → dets 恒空、0 报送，冒烟从未真正覆盖报送/VLM/事件尾路径；
+    # 参数对齐 PIPE0004 种子档推理档（imgsz=1280/conf=0.25）+ 警用语义下限 1。
+    det_filter = DetFilter(filter="score >= 0.25",
+                           group_limits=_class_limits("0:1,300;2:1,300"))
     
     vlm = VLMAnalyzer(
         max_resolution=(1280, 720),
