@@ -2,8 +2,8 @@
 
 > 本文件是 `doc/` 的总入口：**业务架构 → 技术结构 → 目录分类与文件索引**。
 > 找文档先看这里；发现索引与实际不符时以文件为准，并顺手更新本页。
-> 最后更新：2026-10-28（新增 PIPE0004 向量索引链路与 video_embed 模块、链路尾输出提炼、
-> 回顾检索查询层；新增设计稿 chain_output / hybrid_retrieval；wemm_integration 联调回填）。
+> 最后更新：2026-10-29（混合检索标签体系落地：标签 schema 冻结 / 事件归档 / review_index
+> 落表 / 过滤式查询 / frame_dets 原始留存，WO-0033 四轮定案；chain_output 落地）。
 
 ---
 
@@ -20,7 +20,7 @@
 | PIPE0001 警用无人机链路 | 无人机画面警情监测 | 帧管理 → YOLO 识人车 → **检测筛选** → 标注 → VLM 研判警情 → **时序判定事件尾** | `chains/pipe0001_police_uav.md` |
 | PIPE0002 车牌识别链路 | 车辆车牌识别与存证 | 帧管理 → YOLO 识车 → **检测筛选** → **门控** → **目标裁剪(裁车)** → 车牌识别（裁车牌→识别→坐标还原→原分辨率提取车牌小图）→ **时序判定事件尾** | `chains/pipe0002_plate.md` |
 | PIPE0003 人脸截取链路 | 原分辨率人脸截取归档 | 帧管理 → YOLO 识人 → **检测筛选** → **目标裁剪(裁人)** → 人脸检测（检脸+原图出脸）（无嵌入/检索/事件，截取落盘即目的） | `chains/pipe0003_face_capture.md` |
-| PIPE0004 视频向量化链路 | 视频片段/帧向量化入库（文搜视频的索引层） | 帧管理 → 视频嵌入 video_embed（6 帧/片段聚合 → WeMM 远端嵌入 → clip+frame 两级向量入 EmbedStore 库，入库即目的；mock/real 双档） | 专篇待补；见 `design/video_review_search.md` §3 + `design/wemm_integration.md` |
+| PIPE0004 视频向量化链路 | 视频片段/帧向量化入库（文搜视频的索引层） | 帧管理 → 视频嵌入 video_embed（6 帧/片段聚合 → WeMM 远端嵌入 → clip+frame 两级向量入 EmbedStore 库，入库即目的；mock/real 双档） | `chains/pipe0004_video_embed.md` |
 
 ### 1.2 平台通用能力
 
@@ -153,7 +153,7 @@ doc/
 入口 `modules/INDEX.md`，按**数据流角色**分组（与链路/业务域无关）：**通用语先读**
 （JSON 主干 + 图像/向量旁路契约，records.py）→ **主干生产者**（frame_manager / yolo）→
 **旁路加工与识别**（target_crop / annotate / vlm / face_detect / plate_recog）→
-**主干筛选与事件**（det_filter / seq_filter）→ **向量旁路**（face_embed / face_store）→
+**主干筛选与事件**（det_filter / seq_filter）→ **向量旁路**（face_embed / face_store / video_embed）→
 **通用契约与工具**（records / conditions / cropper）。INDEX 附「两平面角色表」
 （每模块对 JSON 主干 / 图像旁路 / 向量旁路的接·产·改）。
 
@@ -164,7 +164,7 @@ doc/
 | `chains/pipe0001_police_uav.md` | PIPE0001 警用无人机（YOLO→筛选→标注→VLM→事件尾） |
 | `chains/pipe0002_plate.md` | PIPE0002 车牌识别（裁车→识牌→坐标还原→出牌→事件尾） |
 | `chains/pipe0003_face_capture.md` | PIPE0003 人脸截取（裁人→检脸→原图出原分辨率人脸） |
-| （PIPE0004 视频向量化专篇待补） | PIPE0004 视频向量化（帧管理→video_embed 两级向量入库；暂见 `design/video_review_search.md` §3 + `design/wemm_integration.md`） |
+| `chains/pipe0004_video_embed.md` | PIPE0004 视频向量化（帧管理→YOLO观察→检测筛选→video_embed；两级向量入库+观察标签落表，入库即目的） |
 
 ### 3.5 手册与专题设计（guides/ design/）
 
@@ -182,7 +182,7 @@ doc/
 | `design/gate_filter.md` | 门控阶段模块 GateFilter（设计稿，WO-0023）：「按 key + 时间间隔放行」语义收敛为独立可组合阶段（module_id `gate_filter`）；匿名桶修 tid=0 缺口（INB-0089）、物理过滤+统计旁路（`last_gate` / `gate_filter.stats`）、三处既有门控（PlateStage 内置 / check_interval / seq_filter.throttle）收编路线、PIPE0002 灰度对跑方案 |
 | `design/event_dedup_key.md` | 事件尾去重键升级：组合/回退键（设计稿，WO-0025）：`SeqRule.key` 支持逗号组合字段按序回退（`"track_id,label"`）修 INB-0089 缺口②同车异号重复事件；PlateResult/composer 发布记录 track_id 透传；单字段零回归 + 匿名桶归一化不动 + PIPE0001 VLM 记录兼容（试金石）；PIPE0002 换装 rules 与对跑验收 |
 | `design/chain_output.md` | 链路尾输出提炼声明（**已过审 v2**，WO-0029）：职责划分「收敛归筛选模块、配图出场归 output」——筛选侧扩展 `SeqRule.source`（max:字段 取高分选源）+ `SeqRule.detail_fields`（嵌套点路径投影进事件 detail）+ `_field_value` 点路径升级；spec 顶层 `output` 段只管配图与出场（scope events/records、from 产物名、image+image_pick 图集全输出、limit）；不推翻「链路输出=事件」，图以落盘引用进提炼块；报告导出（WO-0028）优先按声明取数 |
-| `design/hybrid_retrieval.md` | 混合检索：标签数据与融合查询（设计稿待评审，WO-0033）：模块结果（车牌/警情/VLM 研判/YOLO 统计）→ 片段标签四类模型；采集路径 A 本期（分析收尾事件留存 jsonl→片段窗口对齐入 meta）+ 路径 B 后置（回顾索引链路轻/语义档）；查询两级——过滤式（pre-filter+向量排序，MVP）→ 融合式（RRF 排名融合，进阶）；帧向量层成本开关；对齐 video_review_search.md §3/§5 不重写 |
+| `design/hybrid_retrieval.md` | 混合检索：标签数据与融合查询（**标签体系已落地，WO-0033 四轮定案；语义档/hybrid RRF 后置**）：双层标签模型（观察层=过闸原始记录流 `frame_dets`+可再生聚合缓存 det_stats；判断层=链路尾事件）；采集路径 A（分析收尾事件归档 jsonl→窗口对齐落 `review_index`/`review_video` 表，无 DB JSON 降级）；回填只重对齐不重嵌入；查询过滤式已实现（时间窗/事件名精确/视频，why 可解释，`mode` 预留）→ RRF 融合进阶；采集时间上提视频级（文件名>标签，解析不出留空）；对齐 video_review_search.md §3/§5 不重写 |
 
 ### 3.6 挂载 agent（agent/ 与 .claude/agents/）
 

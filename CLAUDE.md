@@ -136,7 +136,7 @@ tests/            链路测试 + YOLO 参数对比 + 测试素材
   `doc/chains/`（保留链路专篇；PIPE0004 专篇待补）、
   `doc/guides/`（runbook 端口与启停 / database_schema 数据库结构）、
   `doc/design/`（storage_design / live_overlay / chain_output 已落地；video_review_search / wemm_integration
-  向量档已落地、其余部分待实施；hybrid_retrieval 待评审）、
+  向量档与混合检索标签体系已落地（WO-0033 四轮定案）、语义档/hybrid RRF 待实施）、
   `doc/agent/`（static_prompts / full_run_record，挂载 agent 生成物）、
   `doc/research/`（历史选型调研）。
 - 完整安装 / 移植步骤见 `INSTALL.md`；部署台账见 `DEPLOYMENT.md`。
@@ -166,6 +166,7 @@ $PY umvp/video_embed/test_video_embed.py  # WeMM 客户端/底库/嵌入阶段�
 $PY tests/test_video_embed_e2e.py         # video_embed 注册/播种/链路级 e2e（mock；--live 同上）
 $PY tests/test_review_search.py           # 回顾检索 API（mock；--live 同上）
 $PY tests/test_review_search_e2e.py       # 检索端到端验收（mock+HTTP）
+$PY tests/test_hybrid_retrieval.py        # 混合检索全链路（归档/落表/relabel/过滤/frame_dets；mock+JSON 降级）
 $PY tests/test_chain_output.py            # 链路尾提炼纯逻辑（collect_output）
 $PY tests/test_output_block.py            # output 提炼块（web 驱动/报告侧）
 $PY tests/test_export_report.py           # 链路尾 HTML 报告构建

@@ -2,7 +2,7 @@
 
 > 本目录每模块一篇，**按「记录数据流」角色分组**（不按业务域/链路）。
 > **模块篇**体例：模块定位 → 参数 → 输入 → 输出 → 上下游衔接 → 验证（可选附录：调参速查 / 注意事项 / 边界与路线）。
-> 参数以本目录为准；三条保留链路专篇见 [`../chains/`](../chains/)；项目总览见 [`doc/README.md`](../README.md)。
+> 参数以本目录为准；四条保留链路专篇见 [`../chains/`](../chains/)；项目总览见 [`doc/README.md`](../README.md)。
 
 ## 〇、通用语（先读）
 
@@ -44,10 +44,12 @@
 | [VLM 研判](vlm.md) | `image` → Image；`dets` → Records | —（研判内容回写主干 `label`/`content`） | 送审在驱动层消费 |
 | [人脸检测](face_detect.md) | `frame` → Image；`crops` → Records | `face_detect.faces` → Records（元素含 `image`） | 接裁剪产人脸记录＋人脸图 |
 | [车牌识别](plate_recog.md) | `frame` → Image；`crops` → Records | `plate_recog.plates` → Records（元素含 `image`） | 接裁剪产车牌记录＋原分辨率车牌图 |
+| [视频嵌入](video_embed.md) | `frame` → Image；`dets` → Records（可缺省，观察源） | `video_embed.clips` → Records（向量 `embedding` / 标签 `observation` 旁路） | 聚帧出片段向量入库（入库即目的；驱动层逐帧喂入） |
 | [人脸嵌入](face_embed.md) | 人脸图 | 512d 向量 → Vector | 向量旁路 |
 | [向量底库](face_store.md) | 查询向量 | MatchResult 记录 | 检索产出 |
 
-> 上表前 9 行为**已声明 `INPUTS`/`OUTPUTS` 的逐帧阶段**（端口/产物名即代码里的类属性，权威来源）；
+> 上表除末两行外均为**已声明 `INPUTS`/`OUTPUTS` 的阶段**（端口/产物名即代码里的类属性，
+> 权威来源；视频嵌入为片段级阶段——逐帧喂入、满窗产出）；
 > 末两行（人脸嵌入 / 向量底库）为向量旁路模块，**未声明端口、不登记产物**，表中仅为语义说明。
 
 **基数约定（2026-10-16）**：记录数不随图片数膨胀——识别模块一条记录可含多个识别对象；图像生产
@@ -58,10 +60,13 @@
 [拼接层端口协议设计稿](../design/assembly_ports.md) §3⑥。
 
 **本期连线范围**（唯一来源 `web_lab/server.py` 的 `CHAIN_RESOLVED_PORTS` ＝
-`pipe.composer.RESOLVED_PORTS` ＋ 驱动层额外解析的 `vlm.dets`）：`yolo.image`、`det_filter.dets`、
+`pipe.composer.RESOLVED_PORTS` ＋ 驱动层额外解析的 `vlm.dets` / `video_embed.frame/dets`）：
+`yolo.image`、`det_filter.dets`、
 `seq_filter.dets`、`gate_filter.dets`、`target_crop.frame/dets`、`annotate.image/dets`、
 `plate_recog.frame/crops`、
-`face_detect.frame/crops`；**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
+`face_detect.frame/crops`、`video_embed.dets`（观察源 Records，可缺省；
+`video_embed.frame` 由驱动层逐帧喂入，spec 实际只声明 `dets` 连观察源）；
+**`vlm` 仅 `dets`**（报送哪些检测；图片源用 `image_source`，
 `inputs.image` 不支持）。校验：未知产物 / 非法端口 / 非上游引用 /
 类型不符 / 值非字符串 → 报错；同一产物被多个下游引用 → 允许（分支留路）。
 
@@ -100,14 +105,16 @@
 > （[检测筛选](det_filter.md) `events` 规格 / [时序判定](seq_filter.md) `rules`），
 > 不再有"另造告警对象"的物化阶段。链路终段允许 `det_filter`/`seq_filter` 收尾。
 
-## 四、向量旁路（人脸图 → 向量 → 检索结论）
+## 四、向量旁路（人脸图 / 视频帧 → 向量 → 检索结论）
 
-> 什么时候读：做"人脸向量注册 / 检索"（截取之外的识别链路）时。
+> 什么时候读：做"人脸向量注册 / 检索"（截取之外的识别链路）或"视频向量化索引 /
+> 回顾检索"（PIPE0004，入库即目的）时。
 
 | 文档 | 模块 | 代码 | 主要 preset |
 |---|---|---|---|
 | [人脸嵌入](face_embed.md) | ArcFace 512d 嵌入（人脸图 → 向量旁路） | `FaceEmbedder` | FEMB0001 |
 | [向量底库](face_store.md) | numpy 线性检索底库（向量 → MatchResult 记录） | `FaceStore` | FSTO0001 |
+| [视频嵌入](video_embed.md) | 片段聚帧 → WeMM 嵌入（clip+frame 双层向量入 EmbedStore）+ 观察标签聚合（`dets` 端口泛化）；mock/real 双档 | `VideoEmbedStage` / `WEMMClient` / `EmbedStore` / `label_align` | VEMB0001 |
 
 ## 五、通用契约与工具（跨链路共用，无独立 preset）
 
@@ -121,8 +128,8 @@
 
 ## 保留链路
 
-三条保留链路专篇见 [`../chains/`](../chains/)：PIPE0001 警用无人机 /
-PIPE0002 车牌识别 / PIPE0003 人脸截取。
+四条保留链路专篇见 [`../chains/`](../chains/)：PIPE0001 警用无人机 /
+PIPE0002 车牌识别 / PIPE0003 人脸截取 / PIPE0004 视频向量化。
 
 ## 相关文档
 
