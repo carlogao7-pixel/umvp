@@ -177,7 +177,7 @@ class WEMMClient:
                  frame_dimension: int = DEFAULT_FRAME_DIM,
                  max_resolution: str = "896,896", jpeg_quality: int = 85,
                  concurrency: int = 2, use_real_embed: Optional[bool] = None,
-                 retry_delays: Sequence[float] = (1.0, 2.0),
+                 retry_delays: Sequence[float] = (1.0, 2.0, 4.0),
                  fallback_endpoint=None, probe_timeout: float = PROBE_TIMEOUT_S):
         endpoint, fallback, model, api_key = resolve_wemm_cfg(
             endpoint, model, api_key, fallback_endpoint)
@@ -347,21 +347,28 @@ class WEMMClient:
     def _ensure_reachable(self) -> None:
         """TCP 快速探测（≤ probe_timeout，默认 4s）：不可达快速报错并含端点地址。
         主端点不可达且有备用 → 自动切换备用（实测 §6：域名/IP 双通备用位）。
-        探测通过后缓存跳过（服务中途下线由 HTTP 网络错误路径兜底）。"""
+        探测通过后缓存跳过（服务中途下线由 HTTP 网络错误路径兜底）。
+        2026-11-02 增补：探测自身也按 retry_delays 退避重试——Tailscale 路径实测
+        每数秒抖动一次（连续探测 200/200/000），单次探测即判死会把整场运行
+        打死在门口（WA-0033 真机演练：预探测失败 → 29 clips 一条未嵌即中止）。"""
         if self._reachable_ok:
             return
         with self._lock:
             if self._reachable_ok:
                 return
-            for ep in (self.endpoint, self.fallback_endpoint):
-                if not ep:
-                    continue
-                if endpoint_reachable(ep, timeout=self.probe_timeout):
-                    self._active_endpoint = ep
-                    self._reachable_ok = True
-                    if ep != self.endpoint:
-                        print(f"[WEMMClient] 主端点不可达，切换备用端点: {ep}")
-                    return
+            attempts = len(self.retry_delays) + 1
+            for attempt in range(attempts):
+                for ep in (self.endpoint, self.fallback_endpoint):
+                    if not ep:
+                        continue
+                    if endpoint_reachable(ep, timeout=self.probe_timeout):
+                        self._active_endpoint = ep
+                        self._reachable_ok = True
+                        if ep != self.endpoint:
+                            print(f"[WEMMClient] 主端点不可达，切换备用端点: {ep}")
+                        return
+                if attempt < len(self.retry_delays):
+                    time.sleep(self.retry_delays[attempt])
             raise RuntimeError(f"嵌入端点不可达: {self.endpoint or '(未配置)'}")
 
     def _post(self, body: dict) -> List[np.ndarray]:
